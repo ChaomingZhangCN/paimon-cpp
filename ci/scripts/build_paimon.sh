@@ -18,6 +18,7 @@ set -eux
 
 source_dir=${1}
 enable_sanitizer=${2:-false}
+check_clang_tidy=${3:-false}
 build_dir=${1}/build
 
 mkdir ${build_dir}
@@ -41,6 +42,10 @@ fi
 cmake "${CMAKE_ARGS[@]}" ${source_dir}
 cmake --build . -- -j$(nproc)
 ctest --output-on-failure -j $(nproc)
+
+if [[ "${check_clang_tidy}" == "true" ]]; then
+    cmake --build . --target check-clang-tidy
+fi
 
 popd
 

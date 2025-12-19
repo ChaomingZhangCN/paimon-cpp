@@ -149,6 +149,7 @@ TEST_F(FileIndexFormatTest, TestSimple) {
     }
 }
 
+// NOLINTNEXTLINE(google-readability-function-size)
 TEST_F(FileIndexFormatTest, TestBitmapIndexWithTimestamp) {
     auto schema = arrow::schema({
         arrow::field("ts_sec", arrow::timestamp(arrow::TimeUnit::SECOND)),

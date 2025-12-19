@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "paimon/core/schema/table_schema.h"
+#include "paimon/schema/schema.h"
 
 namespace paimon {
 

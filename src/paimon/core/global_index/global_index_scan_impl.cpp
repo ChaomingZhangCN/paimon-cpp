@@ -72,8 +72,8 @@ Result<std::vector<Range>> GlobalIndexScanImpl::GetRowRangeList() {
         const auto& global_index_meta = entry.index_file->GetGlobalIndexMeta();
         assert(global_index_meta);
         const auto& index_meta = global_index_meta.value();
-        index_ranges[entry.index_file->IndexType()].push_back(
-            Range(index_meta.row_range_start, index_meta.row_range_end));
+        index_ranges[entry.index_file->IndexType()].emplace_back(index_meta.row_range_start,
+                                                                 index_meta.row_range_end);
     }
     std::string check_index_type;
     std::vector<Range> check_ranges;

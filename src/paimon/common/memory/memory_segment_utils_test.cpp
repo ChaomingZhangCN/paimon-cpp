@@ -71,8 +71,8 @@ TEST(MemorySegmentUtilsTest, TestCopyFromBytesAndGetBytes) {
     test_string1.reserve(str_size);
     test_string2.reserve(str_size);
     for (int32_t j = 0; j < str_size; j++) {
-        test_string1 += paimon::test::RandomNumber(0, 25) + 'a';
-        test_string2 += paimon::test::RandomNumber(0, 25) + 'a';
+        test_string1 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
+        test_string2 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
     }
     test_string2 += test_string1;
     std::shared_ptr<Bytes> bytes1 = Bytes::AllocateBytes(test_string1, pool.get());
@@ -110,8 +110,8 @@ TEST(MemorySegmentUtilsTest, TestCopyToUnsafe) {
     test_string1.reserve(str_size);
     test_string2.reserve(str_size);
     for (int32_t j = 0; j < str_size; j++) {
-        test_string1 += paimon::test::RandomNumber(0, 25) + 'a';
-        test_string2 += paimon::test::RandomNumber(0, 25) + 'a';
+        test_string1 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
+        test_string2 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
     }
     test_string2 += test_string1;
     std::shared_ptr<Bytes> bytes1 = Bytes::AllocateBytes(test_string1, pool.get());
@@ -140,8 +140,8 @@ TEST(MemorySegmentUtilsTest, TestSetAndUnSet) {
     test_string1.reserve(str_size);
     test_string2.reserve(str_size);
     for (int32_t j = 0; j < str_size; j++) {
-        test_string1 += paimon::test::RandomNumber(0, 25) + 'a';
-        test_string2 += paimon::test::RandomNumber(0, 25) + 'a';
+        test_string1 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
+        test_string2 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
     }
     test_string2 += test_string1;
     std::shared_ptr<Bytes> bytes2 = Bytes::AllocateBytes(test_string2, pool.get());

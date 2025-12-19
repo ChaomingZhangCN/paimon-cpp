@@ -31,7 +31,7 @@ class TimezoneGuard {
             original_tz_.clear();
         }
 
-        setenv("TZ", tz.c_str(), /*overwrite=*/1);
+        setenv("TZ", tz.c_str(), /*replace=*/1);
         tzset();
     }
 
@@ -39,7 +39,7 @@ class TimezoneGuard {
         if (original_tz_.empty()) {
             unsetenv("TZ");
         } else {
-            setenv("TZ", original_tz_.c_str(), /*overwrite=*/1);
+            setenv("TZ", original_tz_.c_str(), /*replace=*/1);
         }
         tzset();
     }

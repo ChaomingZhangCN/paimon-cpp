@@ -37,13 +37,14 @@ class PAIMON_MUST_USE_TYPE PAIMON_EXPORT Result {
         status_.~Status();
     }
 
+    // NOLINTBEGIN(google-explicit-constructor, runtime/explicit)
     /// Construct a successful result with a copy of the given value.
     /// @param data The value to store in result.
-    Result(const T& data) : status_(), data_(data) {}  // NOLINT(runtime/explicit)
+    Result(const T& data) : status_(), data_(data) {}
 
     /// Construct a successful result by moving the given value.
     /// @param data The value to move into result.
-    Result(T&& data) : status_(), data_(std::move(data)) {}  // NOLINT(runtime/explicit)
+    Result(T&& data) : status_(), data_(std::move(data)) {}
 
     /// Template constructor for converting compatible pointer types.
     /// Support T = std::unique_ptr<B> and U = std::unique_ptr<D> convert, where D is derived class
@@ -53,11 +54,12 @@ class PAIMON_MUST_USE_TYPE PAIMON_EXPORT Result {
               std::enable_if_t<
                   is_pointer<U>::value && is_pointer<T>::value &&
                   std::is_convertible_v<value_type_traits_t<U>, value_type_traits_t<T>>>* = nullptr>
-    Result(U&& data) : status_(), data_(std::move(data)) {}  // NOLINT(runtime/explicit)
+    Result(U&& data) : status_(), data_(std::move(data)) {}
 
     /// Construct a failed result with the given status.
     /// @param status The status object describing the error.
-    Result(const Status& status) : status_(status) {}  // NOLINT(runtime/explicit)
+    Result(const Status& status) : status_(status) {}
+    // NOLINTEND(google-explicit-constructor, runtime/explicit)
 
     /// Copy constructor.
     /// @param other The result to copy from.
@@ -79,13 +81,14 @@ class PAIMON_MUST_USE_TYPE PAIMON_EXPORT Result {
         MakeStatus(other.status_);
     }
 
+    // NOLINTBEGIN(google-explicit-constructor, runtime/explicit)
     /// Template move constructor for converting compatible `Result` types.
     /// @param other The result to move from.
     template <typename U,
               std::enable_if_t<
                   is_pointer<U>::value && is_pointer<T>::value &&
                   std::is_convertible_v<value_type_traits_t<U>, value_type_traits_t<T>>>* = nullptr>
-    Result(Result<U>&& other) noexcept {  // NOLINT(runtime/explicit)
+    Result(Result<U>&& other) noexcept {
         if (other.ok()) {
             MakeValue(std::move(other).value());
         }
@@ -93,6 +96,7 @@ class PAIMON_MUST_USE_TYPE PAIMON_EXPORT Result {
         // value hasn't been constructed => crash on other destructor.
         MakeStatus(other.status());
     }
+    // NOLINTEND(google-explicit-constructor, runtime/explicit)
 
     /// Copy assignment operator.
     /// @param other The result to copy from.

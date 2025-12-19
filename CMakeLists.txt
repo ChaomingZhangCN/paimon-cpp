@@ -118,7 +118,7 @@ if(PAIMON_LINT_GIT_DIFF_MODE)
     set(GIT_DIFF_FILE_PATH ${CMAKE_BINARY_DIR}/git_diff_files.txt)
     add_custom_target(update_diff_files
                       # get git-diff file list
-                      COMMAND git diff-index --name-only --diff-filter=a --cached
+                      COMMAND git diff-index --name-only --diff-filter=d --cached
                               ${PAIMON_LINT_GIT_TARGET_COMMIT} > ${GIT_DIFF_FILE_PATH}
                       # convert to absolute path
                       COMMAND sed -i \"s|^|${CMAKE_SOURCE_DIR}/|\" ${GIT_DIFF_FILE_PATH}

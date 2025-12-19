@@ -74,7 +74,7 @@ TEST_F(BinaryRowTest, TestBasic) {
     row.SetInt(0, 5);
     row.SetDouble(1, 5.8);
     ASSERT_EQ(5, row.GetInt(0));
-    ASSERT_EQ((double)5.8, row.GetDouble(1));
+    ASSERT_EQ(static_cast<double>(5.8), row.GetDouble(1));
 
     row.Clear();
     std::shared_ptr<Bytes> bytes1 = Bytes::AllocateBytes(100, pool.get());
@@ -405,10 +405,10 @@ TEST_F(BinaryRowTest, TestCompatibleWithJava) {
         int32_t arity = 1;
         BinaryRow row(arity);
         BinaryRowWriter writer(&row, 0, pool.get());
-        writer.WriteInt(0, static_cast<int32_t>(18));
+        writer.WriteInt(0, 18);
         writer.Complete();
 
-        ASSERT_EQ(row.GetInt(0), (int32_t)18);
+        ASSERT_EQ(row.GetInt(0), 18);
 
         auto bytes = SerializationUtils::SerializeBinaryRow(row, pool.get());
         std::string bytes_view(bytes->data(), bytes->size());
@@ -418,7 +418,7 @@ TEST_F(BinaryRowTest, TestCompatibleWithJava) {
         ASSERT_EQ(bytes_view, expect_view);
         ASSERT_OK_AND_ASSIGN(auto de_row, SerializationUtils::DeserializeBinaryRow(bytes));
         ASSERT_EQ(1, de_row.GetFieldCount());
-        ASSERT_EQ(de_row.GetInt(0), (int32_t)18);
+        ASSERT_EQ(de_row.GetInt(0), 18);
     }
 }
 
@@ -564,8 +564,8 @@ TEST_F(BinaryRowTest, TestBinaryRowSerializer) {
     test_string1.reserve(str_size);
     test_string2.reserve(str_size);
     for (int32_t j = 0; j < str_size; j++) {
-        test_string1 += paimon::test::RandomNumber(0, 25) + 'a';
-        test_string2 += paimon::test::RandomNumber(0, 25) + 'a';
+        test_string1 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
+        test_string2 += static_cast<char>(paimon::test::RandomNumber(0, 25) + 'a');
     }
     std::shared_ptr<Bytes> bytes1 = Bytes::AllocateBytes(test_string1, pool.get());
     std::shared_ptr<Bytes> bytes2 = Bytes::AllocateBytes(test_string2, pool.get());

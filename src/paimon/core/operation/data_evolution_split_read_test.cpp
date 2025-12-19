@@ -435,7 +435,7 @@ TEST_F(DataEvolutionSplitReadTest, TestComplexBlobBunchScenario2) {
     };
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataEvolutionSplitRead::FieldBunch>> bunch,
                          DataEvolutionSplitRead::SplitFieldBunches(
-                             batch, blob_field_to_field_id, /*has_row_ids_selection=*/false));
+                             batch, blob_field_to_field_id, /*has_row_ranges_selection=*/false));
 
     ASSERT_EQ(bunch.size(), 2);
     auto blob_bunch = std::dynamic_pointer_cast<DataEvolutionSplitRead::BlobBunch>(bunch[1]);
@@ -557,7 +557,7 @@ TEST_F(DataEvolutionSplitReadTest, TestComplexBlobBunchScenario3) {
     };
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataEvolutionSplitRead::FieldBunch>> bunch,
                          DataEvolutionSplitRead::SplitFieldBunches(
-                             batch, blob_field_to_field_id, /*has_row_ids_selection=*/false));
+                             batch, blob_field_to_field_id, /*has_row_ranges_selection=*/false));
 
     ASSERT_EQ(bunch.size(), 3);
     auto blob_bunch = std::dynamic_pointer_cast<DataEvolutionSplitRead::BlobBunch>(bunch[1]);

@@ -114,7 +114,8 @@ TEST_F(DataEvolutionFileStoreScanTest, TestEvolutionStatsSingleFile) {
 
     ASSERT_OK_AND_ASSIGN(auto result_stats, DataEvolutionFileStoreScan::EvolutionStats(
                                                 {entry}, table_schema, schema_fetcher));
-    ASSERT_EQ(result_stats.first, /*row_count=*/100);
+    auto result_row_count = result_stats.first;
+    ASSERT_EQ(result_row_count, 100);
     auto min_row = std::dynamic_pointer_cast<DataEvolutionRow>(result_stats.second.min_values);
     ASSERT_TRUE(min_row);
     auto max_row = std::dynamic_pointer_cast<DataEvolutionRow>(result_stats.second.max_values);
@@ -501,7 +502,8 @@ TEST_F(DataEvolutionFileStoreScanTest, TestEvolutionStatsWithBlob) {
                                                 {blob_entry0, blob_entry1, entry0, entry1},
                                                 table_schema, schema_fetcher));
 
-    ASSERT_EQ(result_stats.first, /*row_count=*/100);
+    auto result_row_count = result_stats.first;
+    ASSERT_EQ(result_row_count, 100);
     auto min_row = std::dynamic_pointer_cast<DataEvolutionRow>(result_stats.second.min_values);
     ASSERT_TRUE(min_row);
     auto max_row = std::dynamic_pointer_cast<DataEvolutionRow>(result_stats.second.max_values);

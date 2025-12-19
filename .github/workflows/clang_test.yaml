@@ -46,4 +46,4 @@ jobs:
         env:
           CC: clang
           CXX: clang++
-        run: ci/scripts/build_paimon.sh $(pwd)
+        run: ci/scripts/build_paimon.sh $(pwd) false true
