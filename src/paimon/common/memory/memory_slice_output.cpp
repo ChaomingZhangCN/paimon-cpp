@@ -95,8 +95,9 @@ void MemorySliceOutput::EnsureSize(int size) {
         capacity <<= 1;
     }
 
-    MemorySegment new_segment =
-        MemorySegment::Wrap(std::move(Bytes::AllocateBytes(capacity, pool_)));
+    auto bytes = std::make_shared<Bytes>(capacity, pool_);
+    MemorySegment new_segment = MemorySegment::Wrap(bytes);
+
     segment_.CopyTo(0, &new_segment, 0, segment_.Size());
     segment_ = new_segment;
 }
