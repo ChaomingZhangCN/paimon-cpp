@@ -35,16 +35,13 @@
 #include "rapidjson/writer.h"
 
 namespace paimon {
+
 class RapidJsonUtil {
  public:
     RapidJsonUtil() = delete;
     ~RapidJsonUtil() = delete;
 
-    // supports vector and map and optional, if T is custom type, T must have ToJson()
-    // noted that rapidjson does not support map with non string key (will
-    // trigger assert in rapidjson: Assertion `name.IsString()' failed)
-    // therefore, RapidJsonUtil convert key to string in serialize and convert string to key type in
-    // deserialize
+    // if T is custom type, T must have ToJson()
     template <typename T>
     static inline Status ToJsonString(const T& obj, std::string* json_str) {
         rapidjson::Document doc;
@@ -53,6 +50,9 @@ class RapidJsonUtil {
         try {
             if constexpr (is_pointer<T>::value) {
                 value = obj->ToJson(&allocator);
+            } else if constexpr (std::is_same_v<T, std::map<std::string, std::string>>) {
+                *json_str = MapToJsonString(obj);
+                return Status::OK();
             } else {
                 value = obj.ToJson(&allocator);
             }
@@ -67,19 +67,27 @@ class RapidJsonUtil {
         return Status::OK();
     }
 
-    // supports vector and map, if T is custom type, T must have FromJson()
+    // if T is custom type, T must have FromJson()
     template <typename T>
     static inline Status FromJsonString(const std::string& json_str, T* obj) {
-        rapidjson::Document doc;
-        if (!obj || !FromJson(json_str, &doc)) {
-            return Status::Invalid("deserialize failed: ", json_str);
+        if (!obj) {
+            return Status::Invalid("deserialize failed: obj is nullptr");
         }
-        try {
-            obj->FromJson(doc);
-        } catch (const std::invalid_argument& e) {
-            return Status::Invalid("deserialize failed, possibly type incompatible: ", e.what());
-        } catch (...) {
-            return Status::Invalid("deserialize failed, reason unknown: ", json_str);
+        if constexpr (std::is_same_v<T, std::map<std::string, std::string>>) {
+            PAIMON_ASSIGN_OR_RAISE(*obj, MapFromJsonString(json_str));
+        } else {
+            rapidjson::Document doc;
+            if (!FromJson(json_str, &doc)) {
+                return Status::Invalid("deserialize failed: ", json_str);
+            }
+            try {
+                obj->FromJson(doc);
+            } catch (const std::invalid_argument& e) {
+                return Status::Invalid("deserialize failed, possibly type incompatible: ",
+                                       e.what());
+            } catch (...) {
+                return Status::Invalid("deserialize failed, reason unknown: ", json_str);
+            }
         }
         return Status::OK();
     }
@@ -140,6 +148,42 @@ class RapidJsonUtil {
 
     template <typename T>
     static T GetValue(const rapidjson::Value& value);
+
+    static std::string MapToJsonString(const std::map<std::string, std::string>& map) {
+        rapidjson::Document d;
+        d.SetObject();
+        rapidjson::Document::AllocatorType& allocator = d.GetAllocator();
+
+        for (const auto& kv : map) {
+            d.AddMember(rapidjson::Value(kv.first.c_str(), allocator),
+                        rapidjson::Value(kv.second.c_str(), allocator), allocator);
+        }
+
+        rapidjson::StringBuffer buffer;
+        rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+        d.Accept(writer);
+
+        return buffer.GetString();
+    }
+    static Result<std::map<std::string, std::string>> MapFromJsonString(
+        const std::string& json_str) {
+        rapidjson::Document doc;
+        doc.Parse(json_str.c_str());
+        if (doc.HasParseError() || !doc.IsObject()) {
+            return Status::Invalid("deserialize failed: parse error or not JSON object: ",
+                                   json_str);
+        }
+
+        std::map<std::string, std::string> result;
+        for (auto it = doc.MemberBegin(); it != doc.MemberEnd(); ++it) {
+            if (!it->name.IsString() || !it->value.IsString()) {
+                return Status::Invalid(
+                    "deserialize failed: non-string key or value in JSON object: ", json_str);
+            }
+            result[it->name.GetString()] = it->value.GetString();
+        }
+        return result;
+    }
 };
 
 template <typename T>
