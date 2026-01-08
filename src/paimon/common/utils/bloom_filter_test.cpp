@@ -136,7 +136,7 @@ TEST(BloomFilterTest, TestBloomFilter) {
         ASSERT_TRUE(bloom_filter->TestHash(value));
     }
     // switch to segment1
-    bloom_filter->SetMemorySegment(ptr1);
+    ASSERT_OK(bloom_filter->SetMemorySegment(ptr1));
     for (const auto& value : test_data1) {
         ASSERT_TRUE(bloom_filter->TestHash(value));
     }
