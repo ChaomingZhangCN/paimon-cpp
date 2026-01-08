@@ -34,9 +34,9 @@ TEST(BitSetTest, TestBitSet) {
     auto pool = GetDefaultPool();
     auto seg = MemorySegment::AllocateHeapMemory(1024, pool.get());
     auto ptr = std::make_shared<MemorySegment>(seg);
-    bit_set->SetMemorySegment(ptr);
+    ASSERT_OK(bit_set->SetMemorySegment(ptr));
     for (int i = 0; i < 100; i++) {
-        bit_set->Set(i * 2 + 1);
+        ASSERT_OK(bit_set->Set(i * 2 + 1));
     }
     for (int i = 0; i < 100; i++) {
         ASSERT_TRUE(bit_set->Get(i * 2 + 1));

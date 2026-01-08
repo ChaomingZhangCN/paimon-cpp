@@ -52,7 +52,7 @@ class SstFileIOTest : public ::testing::Test {
     }
 
     void TearDown() override {
-        fs_->Delete(dir_->Str());
+        ASSERT_OK(fs_->Delete(dir_->Str()));
     }
 
  protected:
@@ -71,7 +71,7 @@ TEST_F(SstFileIOTest, TestSimple) {
     auto bf = BloomFilter::Create(30, 0.01);
     auto seg_for_bf = MemorySegment::AllocateHeapMemory(bf->ByteLength(), pool_.get());
     auto seg_ptr = std::make_shared<MemorySegment>(seg_for_bf);
-    bf->SetMemorySegment(seg_ptr);
+    ASSERT_OK(bf->SetMemorySegment(seg_ptr));
     auto writer = std::make_shared<SstFileWriter>(out, pool_, bf, 50);
     std::set<int32_t> value_hash;
     for (size_t i = 1; i <= 5; i++) {
@@ -120,13 +120,13 @@ TEST_F(SstFileIOTest, TestSimple) {
     auto entries = bloom_filter_handle->ExpectedEntries();
     auto offset = bloom_filter_handle->Offset();
     auto size = bloom_filter_handle->Size();
-    in->Seek(offset, SeekOrigin::FS_SEEK_SET);
+    ASSERT_OK(in->Seek(offset, SeekOrigin::FS_SEEK_SET));
     auto bloom_filer_bytes = Bytes::AllocateBytes(size, pool_.get());
-    in->Read(bloom_filer_bytes->data(), bloom_filer_bytes->size());
+    ASSERT_OK(in->Read(bloom_filer_bytes->data(), bloom_filer_bytes->size()));
     auto seg = MemorySegment::Wrap(std::move(bloom_filer_bytes));
     auto ptr = std::make_shared<MemorySegment>(seg);
     auto bloom_filter = std::make_shared<BloomFilter>(entries, size);
-    bloom_filter->SetMemorySegment(ptr);
+    ASSERT_OK(bloom_filter->SetMemorySegment(ptr));
     for (const auto& value : value_hash) {
         ASSERT_TRUE(bloom_filter->TestHash(value));
     }

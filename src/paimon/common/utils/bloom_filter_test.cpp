@@ -35,7 +35,7 @@ TEST(BloomFilterTest, TestOneSegmentBuilder) {
     auto bloom_filter = BloomFilter::Create(items, 0.01);
     auto seg = MemorySegment::AllocateHeapMemory(1024, pool.get());
     auto ptr = std::make_shared<MemorySegment>(seg);
-    bloom_filter->SetMemorySegment(ptr);
+    ASSERT_OK(bloom_filter->SetMemorySegment(ptr));
 
     std::mt19937_64 engine(std::random_device{}());  // NOLINT(whitespace/braces)
     std::uniform_int_distribution<int32_t> distribution(0, items);
@@ -43,7 +43,7 @@ TEST(BloomFilterTest, TestOneSegmentBuilder) {
     for (int32_t i = 0; i < items; i++) {
         int32_t random = distribution(engine);
         test_data.insert(random);
-        bloom_filter->AddHash(random);
+        ASSERT_OK(bloom_filter->AddHash(random));
     }
 
     for (const auto& value : test_data) {
@@ -109,13 +109,13 @@ TEST(BloomFilterTest, TestBloomFilter) {
     // segments 1
     auto seg1 = MemorySegment::AllocateHeapMemory(1024, pool.get());
     auto ptr1 = std::make_shared<MemorySegment>(seg1);
-    bloom_filter->SetMemorySegment(ptr1);
+    ASSERT_OK(bloom_filter->SetMemorySegment(ptr1));
 
     std::set<int32_t> test_data1;
     for (int32_t i = 0; i < items; i++) {
         int32_t random = distribution(engine);
         test_data1.insert(random);
-        bloom_filter->AddHash(random);
+        ASSERT_OK(bloom_filter->AddHash(random));
     }
     for (const auto& value : test_data1) {
         ASSERT_TRUE(bloom_filter->TestHash(value));
@@ -125,11 +125,11 @@ TEST(BloomFilterTest, TestBloomFilter) {
     std::set<int32_t> test_data2;
     auto seg2 = MemorySegment::AllocateHeapMemory(1024, pool.get());
     auto ptr2 = std::make_shared<MemorySegment>(seg2);
-    bloom_filter->SetMemorySegment(ptr2);
+    ASSERT_OK(bloom_filter->SetMemorySegment(ptr2));
     for (int32_t i = 0; i < items; i++) {
         int32_t random = distribution(engine);
         test_data2.insert(random);
-        bloom_filter->AddHash(random);
+        ASSERT_OK(bloom_filter->AddHash(random));
     }
     for (const auto& value : test_data2) {
         ASSERT_TRUE(bloom_filter->TestHash(value));
@@ -147,7 +147,7 @@ TEST(BloomFilterTest, TestBloomFilter) {
     }
 
     // switch to segment2 and clear
-    bloom_filter->SetMemorySegment(ptr2);
+    ASSERT_OK(bloom_filter->SetMemorySegment(ptr2));
     bloom_filter->Reset();
     for (const auto& value : test_data2) {
         ASSERT_FALSE(bloom_filter->TestHash(value));
