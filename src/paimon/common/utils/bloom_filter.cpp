@@ -64,7 +64,7 @@ Status BloomFilter::AddHash(int32_t hash1) {
             combined_hash = ~combined_hash;
         }
         int32_t pos = combined_hash % bit_set_->BitSize();
-        bit_set_->Set(pos);
+        PAIMON_RETURN_NOT_OK(bit_set_->Set(pos));
     }
     return Status::OK();
 }
