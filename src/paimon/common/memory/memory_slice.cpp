@@ -105,8 +105,8 @@ std::shared_ptr<MemorySliceInput> MemorySlice::ToInput() {
 int32_t MemorySlice::Compare(const MemorySlice& other) const {
     int32_t len = std::min(length_, other.length_);
     for (int32_t i = 0; i < len; ++i) {
-        unsigned char byte1 = static_cast<unsigned char>(segment_->Get(offset_ + i));
-        unsigned char byte2 = static_cast<unsigned char>(other.segment_->Get(other.offset_ + i));
+        auto byte1 = static_cast<unsigned char>(segment_->Get(offset_ + i));
+        auto byte2 = static_cast<unsigned char>(other.segment_->Get(other.offset_ + i));
         if (byte1 != byte2) {
             return static_cast<int>(byte1) - static_cast<int>(byte2);
         }

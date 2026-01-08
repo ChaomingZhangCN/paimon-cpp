@@ -54,8 +54,8 @@ Result<std::unique_ptr<paimon::MemorySlice>> BlockWriter::Finish() {
     if (aligned_) {
         block_->WriteInt(aligned_size_);
     } else {
-        for (size_t i = 0; i < positions_.size(); i++) {
-            block_->WriteInt(positions_[i]);
+        for (auto& position : positions_) {
+            block_->WriteInt(position);
         }
         block_->WriteInt(positions_.size());
     }
