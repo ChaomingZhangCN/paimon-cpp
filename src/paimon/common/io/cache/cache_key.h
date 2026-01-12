@@ -49,8 +49,8 @@ class PositionCacheKey : public CacheKey {
     size_t HashCode() const;
 
  private:
-    static const uint64_t HASH_CONSTANT = 0x9e3779b97f4a7c15ULL;
-    
+    static constexpr uint64_t HASH_CONSTANT = 0x9e3779b97f4a7c15ULL;
+
     const std::string file_path_;
     const int64_t position_;
     const int32_t length_;
