@@ -29,8 +29,9 @@ namespace paimon {
 
 class BlockCache {
  public:
-    BlockCache(std::string& file_path, std::shared_ptr<InputStream>& in,
-               std::shared_ptr<MemoryPool>& pool, std::unique_ptr<CacheManager>& cache_manager)
+    BlockCache(std::string& file_path, const std::shared_ptr<InputStream>& in,
+               const std::shared_ptr<MemoryPool>& pool,
+               std::unique_ptr<CacheManager>&& cache_manager)
         : file_path_(file_path), in_(in), pool_(pool), cache_manager_(std::move(cache_manager)) {}
 
     ~BlockCache() = default;
@@ -44,7 +45,9 @@ class BlockCache {
                 key, [&](const std::shared_ptr<paimon::CacheKey>&) -> Result<MemorySegment> {
                     return ReadFrom(position, length);
                 });
-            blocks_.insert({key, std::make_shared<CacheValue>(segment)});
+            if (!segment.get()) {
+                blocks_.insert({key, std::make_shared<CacheValue>(segment)});
+            }
             return segment;
         }
         return it->second->GetSegment();
@@ -55,7 +58,7 @@ class BlockCache {
         PAIMON_RETURN_NOT_OK(in_->Seek(offset, SeekOrigin::FS_SEEK_SET));
         auto segment = MemorySegment::AllocateHeapMemory(length, pool_.get());
         PAIMON_RETURN_NOT_OK(in_->Read(segment.GetHeapMemory()->data(), length));
-        return std::move(segment);
+        return segment;
     }
 
  public:

@@ -41,6 +41,7 @@ class BlockHandle {
     std::shared_ptr<MemorySlice> WriteBlockHandle(MemoryPool* pool);
 
  public:
+    // max len for varlong is 9 bytes, max len for varint is 5 bytes
     static constexpr int32_t MAX_ENCODED_LENGTH = 9 + 5;
 
  private:

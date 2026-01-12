@@ -27,9 +27,9 @@ bool BlockIterator::HasNext() const {
     return polled_.get() || input_->IsReadable();
 }
 
-std::unique_ptr<BlockEntry> BlockIterator::Next() {
+Result<std::unique_ptr<BlockEntry>> BlockIterator::Next() {
     if (!HasNext()) {
-        throw std::invalid_argument("no such element");
+        return Status::Invalid("no such element");
     }
     if (polled_.get()) {
         return std::move(polled_);
@@ -52,9 +52,12 @@ bool BlockIterator::SeekTo(std::shared_ptr<paimon::MemorySlice> target_key) {
     while (left <= right) {
         int mid = left + (right - left) / 2;
 
-        input_->SetPosition(reader_->SeekTo(mid));
+        auto status = input_->SetPosition(reader_->SeekTo(mid));
+        if (!status.ok()) {
+            return false;
+        }
         auto mid_entry = ReadEntry();
-        int compare = reader_->Comparator()(mid_entry->Key(), target_key);
+        int compare = reader_->Comparator()(mid_entry->key_, target_key);
 
         if (compare == 0) {
             polled_ = std::move(mid_entry);

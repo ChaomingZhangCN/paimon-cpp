@@ -27,11 +27,11 @@ bool PositionCacheKey::IsIndex() {
     return is_index_;
 }
 
-int64_t PositionCacheKey::Position() {
+int64_t PositionCacheKey::Position() const {
     return position_;
 }
 
-int32_t PositionCacheKey::Length() {
+int32_t PositionCacheKey::Length() const {
     return length_;
 }
 
@@ -43,11 +43,11 @@ bool PositionCacheKey::operator==(const PositionCacheKey& other) const {
 
 size_t PositionCacheKey::HashCode() const {
     size_t seed = 0;
-    seed ^=
-        std::hash<std::string>{}(file_path_) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    seed ^= std::hash<int64_t>{}(position_) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    seed ^= std::hash<int32_t>{}(length_) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
-    seed ^= std::hash<bool>{}(is_index_) + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<std::string>{}(file_path_) + HASH_CONSTANT + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<int64_t>{}(position_) + HASH_CONSTANT + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<int32_t>{}(length_) + HASH_CONSTANT + (seed << 6) + (seed >> 2);
+    seed ^= std::hash<bool>{}(is_index_) + HASH_CONSTANT + (seed << 6) + (seed >> 2);
     return seed;
 }
+
 }  // namespace paimon

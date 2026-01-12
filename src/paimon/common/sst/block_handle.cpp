@@ -49,7 +49,7 @@ std::string BlockHandle::ToString() const {
 std::shared_ptr<MemorySlice> BlockHandle::WriteBlockHandle(MemoryPool* pool) {
     auto output = std::make_shared<MemorySliceOutput>(MAX_ENCODED_LENGTH, pool);
     output->WriteVarLenLong(offset_);
-    output->WriteVarLenLong(size_);
+    output->WriteVarLenInt(size_);
     return output->ToSlice();
 }
 }  // namespace paimon

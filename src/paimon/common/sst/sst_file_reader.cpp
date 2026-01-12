@@ -44,8 +44,15 @@ std::shared_ptr<Bytes> SstFileReader::Lookup(std::shared_ptr<Bytes> key) {
     if (index_block_iterator->HasNext()) {
         // seek the current iterator to the key
         auto current = GetNextBlock(index_block_iterator);
+        if (!current.get()) {
+            return nullptr;
+        }
         if (current->SeekTo(key_slice)) {
-            return current->Next()->Value()->CopyBytes(pool_.get());
+            auto ret = current->Next();
+            if (!ret.ok()) {
+                return nullptr;
+            }
+            return ret.value()->value_->CopyBytes(pool_.get());
         }
     }
     return nullptr;
@@ -53,7 +60,11 @@ std::shared_ptr<Bytes> SstFileReader::Lookup(std::shared_ptr<Bytes> key) {
 
 std::unique_ptr<BlockIterator> SstFileReader::GetNextBlock(
     std::unique_ptr<BlockIterator>& index_iterator) {
-    auto slice = index_iterator->Next()->Value();
+        auto ret = index_iterator->Next();
+            if (!ret.ok()) {
+                return nullptr;
+            }
+    auto& slice = ret.value()->value_;
     auto input = slice->ToInput();
     return ReadBlock(BlockHandle::ReadBlockHandle(input), false)->Iterator();
 }

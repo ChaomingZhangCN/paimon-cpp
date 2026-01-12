@@ -40,8 +40,8 @@ class MemoryPool;
  */
 class SstFileWriter {
  public:
-    SstFileWriter(std::shared_ptr<OutputStream> out, std::shared_ptr<MemoryPool>& pool,
-                  std::shared_ptr<BloomFilter> bloom_filter, int32_t block_size)
+    SstFileWriter(const std::shared_ptr<OutputStream>& out, const std::shared_ptr<MemoryPool>& pool,
+                  const std::shared_ptr<BloomFilter>& bloom_filter, int32_t block_size)
         : out_(out), pool_(pool), bloom_filter_(bloom_filter), block_size_(block_size) {
         data_block_writer_ =
             std::make_unique<BlockWriter>(static_cast<int32_t>(block_size * 1.1), pool);
@@ -61,24 +61,24 @@ class SstFileWriter {
 
     Result<std::shared_ptr<BloomFilterHandle>> WriteBloomFilter();
 
+ private:
+    Result<std::shared_ptr<BlockHandle>> FlushBlockWriter(std::unique_ptr<BlockWriter>& writer);
+
+    Status WriteBytes(const char* data, size_t size);
+
     // For testing
     BlockWriter* IndexWriter() const {
         return index_block_writer_.get();
     }
 
  private:
-    Result<std::shared_ptr<BlockHandle>> FlushBlockWriter(std::unique_ptr<BlockWriter>& writer);
-
-    Status WriteBytes(const char* data, size_t size);
-
- private:
     const std::shared_ptr<OutputStream> out_;
 
-    std::shared_ptr<Bytes> last_key_;
-
-    const std::shared_ptr<MemoryPool>& pool_;
+    const std::shared_ptr<MemoryPool> pool_;
 
     std::shared_ptr<BloomFilter> bloom_filter_;
+
+    std::shared_ptr<Bytes> last_key_;
 
     int32_t block_size_;
     std::unique_ptr<BlockWriter> data_block_writer_;

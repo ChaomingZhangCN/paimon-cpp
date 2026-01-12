@@ -23,7 +23,7 @@ std::shared_ptr<CacheValue> NoCache::Get(
     return supplier(key);
 }
 
-void NoCache::Put(const std::shared_ptr<CacheKey>& key, std::shared_ptr<CacheValue>& value) {
+void NoCache::Put(const std::shared_ptr<CacheKey>& key, const std::shared_ptr<CacheValue>& value) {
     // do nothing
 }
 

@@ -32,7 +32,7 @@ class BlockIterator {
 
     bool HasNext() const;
 
-    std::unique_ptr<BlockEntry> Next();
+    Result<std::unique_ptr<BlockEntry>> Next();
 
     std::unique_ptr<BlockEntry> ReadEntry();
 

@@ -25,12 +25,12 @@ int32_t MemorySliceInput::Position() const {
     return position_;
 }
 
-void MemorySliceInput::SetPosition(int32_t position) {
+Status MemorySliceInput::SetPosition(int32_t position) {
     if (position < 0 || position > slice_->Length()) {
-        throw std::invalid_argument("position " + std::to_string(position) +
-                                    " index out of bounds");
+        return Status::IndexError("position " + std::to_string(position) + " index out of bounds");
     }
     position_ = position;
+    return Status::OK();
 }
 
 bool MemorySliceInput::IsReadable() {
@@ -42,10 +42,6 @@ int32_t MemorySliceInput::Available() {
 }
 
 int8_t MemorySliceInput::ReadByte() {
-    if (position_ == slice_->Length()) {
-        throw std::invalid_argument("position " + std::to_string(position_) +
-                                    " index out of bounds");
-    }
     return slice_->ReadByte(position_++);
 }
 

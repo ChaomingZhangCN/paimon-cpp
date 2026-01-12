@@ -51,19 +51,19 @@ std::shared_ptr<Bytes> MemorySlice::GetHeapMemory() {
     return segment_->GetHeapMemory();
 }
 
-int8_t MemorySlice::ReadByte(int position) {
+int8_t MemorySlice::ReadByte(int32_t position) {
     return segment_->GetValue<int8_t>(offset_ + position);
 }
 
-int32_t MemorySlice::ReadInt(int position) {
+int32_t MemorySlice::ReadInt(int32_t position) {
     return segment_->GetValue<int32_t>(offset_ + position);
 }
 
-int16_t MemorySlice::ReadShort(int position) {
+int16_t MemorySlice::ReadShort(int32_t position) {
     return segment_->GetValue<int16_t>(offset_ + position);
 }
 
-int64_t MemorySlice::ReadLong(int position) {
+int64_t MemorySlice::ReadLong(int32_t position) {
     return segment_->GetValue<int64_t>(offset_ + position);
 }
 

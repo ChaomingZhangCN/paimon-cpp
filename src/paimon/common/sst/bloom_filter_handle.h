@@ -29,6 +29,7 @@ class BloomFilterHandle {
     BloomFilterHandle(int64_t offset, int32_t size, int64_t expected_entries)
         : offset_(offset), size_(size), expected_entries_(expected_entries) {}
 
+    BloomFilterHandle() = default;
     ~BloomFilterHandle() = default;
 
     int64_t Offset() const {

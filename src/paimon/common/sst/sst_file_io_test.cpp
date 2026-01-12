@@ -103,8 +103,7 @@ TEST_F(SstFileIOTest, TestSimple) {
     ASSERT_OK(out->Close());
 
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(index_path_));
-    auto cache_manager = std::make_unique<CacheManager>();
-    auto block_cache = std::make_unique<BlockCache>(index_path_, in, pool_, cache_manager);
+    auto block_cache = std::make_unique<BlockCache>(index_path_, in, pool_, std::make_unique<CacheManager>());
     auto comparator = [](const std::shared_ptr<MemorySlice>& a,
                          const std::shared_ptr<MemorySlice>& b) -> int32_t {
         std::string_view va = a->ReadStringView();

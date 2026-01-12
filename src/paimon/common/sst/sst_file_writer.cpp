@@ -26,10 +26,7 @@ Status SstFileWriter::Write(std::shared_ptr<Bytes>&& key, std::shared_ptr<Bytes>
     data_block_writer_->Write(key, value);
     last_key_ = key;
     if (data_block_writer_->Memory() > block_size_) {
-        auto res = Flush();
-        if (!res.ok()) {
-            return res;
-        }
+        PAIMON_RETURN_NOT_OK(Flush());
     }
     if (bloom_filter_.get()) {
         PAIMON_RETURN_NOT_OK(bloom_filter_->AddHash(MurmurHashUtils::HashBytes(key)));
@@ -63,7 +60,7 @@ Result<std::shared_ptr<BlockHandle>> SstFileWriter::WriteIndexBlock() {
 
 Result<std::shared_ptr<BloomFilterHandle>> SstFileWriter::WriteBloomFilter() {
     if (!bloom_filter_.get()) {
-        return Status::OK();
+        return Status::Invalid("bloom_filter_ should be set before writing");
     }
 
     auto data = bloom_filter_->GetBitSet()->ToSlice()->ReadStringView();

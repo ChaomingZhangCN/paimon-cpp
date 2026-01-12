@@ -1,18 +1,18 @@
-/*
- * Copyright 2024-present Alibaba Inc.
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+////
+/// Copyright 2024-present Alibaba Inc.
+///
+/// Licensed under the Apache License, Version 2.0 (the "License");
+/// you may not use this file except in compliance with the License.
+/// You may obtain a copy of the License at
+///
+///   http://www.apache.org/licenses/LICENSE-2.0
+///
+/// Unless required by applicable law or agreed to in writing, software
+/// distributed under the License is distributed on an "AS IS" BASIS,
+/// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+/// See the License for the specific language governing permissions and
+/// limitations under the License.
+////
 
 #pragma once
 
@@ -25,34 +25,34 @@
 
 namespace paimon {
 
-/**
- * Writer to build a Block. A block is designed for storing and random-accessing k-v pairs. The
- * layout is as below:
- *
- * <pre>
- *     +---------------+
- *     | Block Trailer |
- *     +------------------------------------------------+
- *     |       Block CRC23C      |     Compression      |
- *     +------------------------------------------------+
- *     +---------------+
- *     |  Block Data   |
- *     +---------------+--------------------------------+----+
- *     | key len | key bytes | value len | value bytes  |    |
- *     +------------------------------------------------+    |
- *     | key len | key bytes | value len | value bytes  |    +-> Key-Value pairs
- *     +------------------------------------------------+    |
- *     |                  ... ...                       |    |
- *     +------------------------------------------------+----+
- *     | entry pos | entry pos |     ...    | entry pos |    +-> optional, for unaligned block
- *     +------------------------------------------------+----+
- *     |   entry num  /  entry size   |   aligned type  |
- *     +------------------------------------------------+
- * </pre>
- */
+///
+/// Writer to build a Block. A block is designed for storing and random-accessing k-v pairs. The
+/// layout is as below:
+///
+/// <pre>
+///     +---------------+
+///     | Block Trailer |
+///     +------------------------------------------------+
+///     |       Block CRC32C      |     Compression      |
+///     +------------------------------------------------+
+///     +---------------+
+///     |  Block Data   |
+///     +---------------+--------------------------------+----+
+///     | key len | key bytes | value len | value bytes  |    |
+///     +------------------------------------------------+    |
+///     | key len | key bytes | value len | value bytes  |    +-> Key-Value pairs
+///     +------------------------------------------------+    |
+///     |                  ... ...                       |    |
+///     +------------------------------------------------+----+
+///     | entry pos | entry pos |     ...    | entry pos |    +-> optional, for unaligned block
+///     +------------------------------------------------+----+
+///     |   entry num  /  entry size   |   aligned type  |
+///     +------------------------------------------------+
+/// </pre>
+///
 class BlockWriter {
  public:
-    BlockWriter(int32_t size, std::shared_ptr<MemoryPool>& pool, bool aligned = true)
+    BlockWriter(int32_t size, const std::shared_ptr<MemoryPool>& pool, bool aligned = true)
         : size_(size), pool_(pool), aligned_(aligned) {
         block_ = std::make_shared<MemorySliceOutput>(size, pool_.get());
         aligned_size_ = 0;
@@ -79,8 +79,8 @@ class BlockWriter {
     Result<std::unique_ptr<paimon::MemorySlice>> Finish();
 
  private:
-    int32_t size_;
-    std::shared_ptr<MemoryPool> pool_;
+    const int32_t size_;
+    const std::shared_ptr<MemoryPool> pool_;
 
     std::vector<int32_t> positions_;
     std::shared_ptr<MemorySliceOutput> block_;

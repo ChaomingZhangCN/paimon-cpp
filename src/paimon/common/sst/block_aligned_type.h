@@ -31,13 +31,13 @@ namespace paimon {
 /// Enumeration for stream seek origin positions.
 enum class PAIMON_EXPORT BlockAlignedType { ALIGNED = 0, UNALIGNED = 1 };
 
-inline BlockAlignedType From(int8_t v) {
+inline Result<BlockAlignedType> From(int8_t v) {
     if (v == 0) {
         return BlockAlignedType::ALIGNED;
     } else if (v == 1) {
         return BlockAlignedType::UNALIGNED;
     } else {
-        throw std::invalid_argument("Invalid block aligned type: " + std::to_string(v));
+        return Status::Invalid("Invalid block aligned type: " + std::to_string(v));
     }
 }
 

@@ -25,6 +25,7 @@
 
 #include "paimon/common/memory/memory_slice.h"
 #include "paimon/visibility.h"
+#include "paimon/status.h"
 
 namespace paimon {
 class MemoryPool;
@@ -37,7 +38,7 @@ class PAIMON_EXPORT MemorySliceInput {
     explicit MemorySliceInput(std::shared_ptr<MemorySlice>& slice);
 
     int32_t Position() const;
-    void SetPosition(int32_t position);
+    Status SetPosition(int32_t position);
 
     bool IsReadable();
     int32_t Available();

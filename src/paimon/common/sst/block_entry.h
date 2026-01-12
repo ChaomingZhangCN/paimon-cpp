@@ -23,22 +23,13 @@
 
 namespace paimon {
 
-class BlockEntry {
+struct BlockEntry {
  public:
     BlockEntry(std::shared_ptr<MemorySlice>& key, std::shared_ptr<MemorySlice>& value)
         : key_(key), value_(value) {}
 
     ~BlockEntry() = default;
 
-    std::shared_ptr<MemorySlice> Key() const {
-        return key_;
-    }
-
-    std::shared_ptr<MemorySlice> Value() const {
-        return value_;
-    }
-
- private:
     std::shared_ptr<MemorySlice> key_;
     std::shared_ptr<MemorySlice> value_;
 };

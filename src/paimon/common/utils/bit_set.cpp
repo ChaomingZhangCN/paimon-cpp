@@ -40,10 +40,10 @@ Status BitSet::Set(unsigned int index) {
     if (index >= bit_size_) {
         return Status::IndexError("Index out of bound");
     }
-    unsigned int byteIndex = index >> 3;
-    auto val = segment_->Get(offset_ + byteIndex);
+    unsigned int byte_index = index >> 3;
+    auto val = segment_->Get(offset_ + byte_index);
     val |= (1 << (index & BYTE_INDEX_MASK));
-    segment_->PutValue(offset_ + byteIndex, val);
+    segment_->PutValue(offset_ + byte_index, val);
     return Status::OK();
 }
 
@@ -51,8 +51,8 @@ bool BitSet::Get(unsigned int index) {
     if (index >= bit_size_) {
         return false;
     }
-    unsigned int byteIndex = index >> 3;
-    auto val = segment_->Get(offset_ + byteIndex);
+    unsigned int byte_index = index >> 3;
+    auto val = segment_->Get(offset_ + byte_index);
     return (val & (1 << (index & BYTE_INDEX_MASK))) != 0;
 }
 

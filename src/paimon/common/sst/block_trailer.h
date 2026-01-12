@@ -25,7 +25,7 @@
 
 namespace paimon {
 
-/** Trailer of a block. */
+/// Trailer of a block.
 class BlockTrailer {
  public:
     static std::unique_ptr<BlockTrailer> ReadBlockTrailer(std::shared_ptr<MemorySliceInput>& input);
