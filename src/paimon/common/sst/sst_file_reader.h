@@ -33,12 +33,9 @@
 namespace paimon {
 class SstFileIterator;
 
-/**
- * An SST File Reader which serves point queries and range queries. Users can call {@code
- * createIterator} to create a file iterator and then use seek and read methods to do range queries.
- *
- * <p>Note that this class is NOT thread-safe.
- */
+/// An SST File Reader which serves point queries and range queries. Users can call
+/// CreateIterator() to create a file iterator and then use seek and read methods to do range
+/// queries. Note that this class is NOT thread-safe.
 class SstFileReader {
  public:
     SstFileReader(const std::shared_ptr<MemoryPool>& pool, std::shared_ptr<BlockCache> block_cache,

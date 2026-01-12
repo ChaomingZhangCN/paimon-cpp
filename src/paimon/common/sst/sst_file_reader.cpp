@@ -60,10 +60,10 @@ std::shared_ptr<Bytes> SstFileReader::Lookup(std::shared_ptr<Bytes> key) {
 
 std::unique_ptr<BlockIterator> SstFileReader::GetNextBlock(
     std::unique_ptr<BlockIterator>& index_iterator) {
-        auto ret = index_iterator->Next();
-            if (!ret.ok()) {
-                return nullptr;
-            }
+    auto ret = index_iterator->Next();
+    if (!ret.ok()) {
+        return nullptr;
+    }
     auto& slice = ret.value()->value_;
     auto input = slice->ToInput();
     return ReadBlock(BlockHandle::ReadBlockHandle(input), false)->Iterator();

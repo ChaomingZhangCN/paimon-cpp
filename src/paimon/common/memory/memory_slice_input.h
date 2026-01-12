@@ -24,8 +24,8 @@
 #include <type_traits>
 
 #include "paimon/common/memory/memory_slice.h"
-#include "paimon/visibility.h"
 #include "paimon/status.h"
+#include "paimon/visibility.h"
 
 namespace paimon {
 class MemoryPool;

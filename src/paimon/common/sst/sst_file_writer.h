@@ -34,10 +34,8 @@ class Array;
 namespace paimon {
 class MemoryPool;
 
-/**
- * The writer for writing SST Files. SST Files are row-oriented and designed to serve frequent point
- * queries and range queries by key.
- */
+/// The writer for writing SST Files. SST Files are row-oriented and designed to serve frequent
+/// point queries and range queries by key.
 class SstFileWriter {
  public:
     SstFileWriter(const std::shared_ptr<OutputStream>& out, const std::shared_ptr<MemoryPool>& pool,
