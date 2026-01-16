@@ -16,6 +16,8 @@
 
 #include "paimon/common/memory/memory_slice_input.h"
 
+#include "paimon/common/utils/math.h"
+
 namespace paimon {
 
 MemorySliceInput::MemorySliceInput(std::shared_ptr<MemorySlice>& slice)
@@ -52,6 +54,18 @@ int8_t MemorySliceInput::ReadUnsignedByte() {
 int32_t MemorySliceInput::ReadInt() {
     int v = slice_->ReadInt(position_);
     position_ += 4;
+    if (NeedSwap()) {
+        return EndianSwapValue(v);
+    }
+    return v;
+}
+
+int64_t MemorySliceInput::ReadLong() {
+    int64_t v = slice_->ReadLong(position_);
+    position_ += 8;
+    if (NeedSwap()) {
+        return EndianSwapValue(v);
+    }
     return v;
 }
 
@@ -66,12 +80,6 @@ int32_t MemorySliceInput::ReadVarLenInt() {
     throw std::invalid_argument("Malformed integer.");
 }
 
-int64_t MemorySliceInput::ReadLong() {
-    int64_t v = slice_->ReadLong(position_);
-    position_ += 8;
-    return v;
-}
-
 int64_t MemorySliceInput::ReadVarLenLong() {
     int64_t result = 0;
     for (int offset = 0; offset < 64; offset += 7) {
@@ -82,6 +90,14 @@ int64_t MemorySliceInput::ReadVarLenLong() {
         }
     }
     throw std::invalid_argument("Malformed long.");
+}
+
+void MemorySliceInput::SetOrder(ByteOrder order) {
+    byte_order_ = order;
+}
+
+bool MemorySliceInput::NeedSwap() const {
+    return SystemByteOrder() != byte_order_;
 }
 
 std::shared_ptr<MemorySlice> MemorySliceInput::ReadSlice(int length) {

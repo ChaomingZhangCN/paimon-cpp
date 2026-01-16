@@ -42,8 +42,8 @@ std::string BlockTrailer::ToString() const {
 
 std::shared_ptr<MemorySlice> BlockTrailer::WriteBlockTrailer(MemoryPool* pool) {
     auto output = std::make_shared<MemorySliceOutput>(ENCODED_LENGTH, pool);
-    output->WriteByte(compression_type_);
-    output->WriteInt(crc32c_);
+    output->WriteValue(compression_type_);
+    output->WriteValue(crc32c_);
     return output->ToSlice();
 }
 }  // namespace paimon

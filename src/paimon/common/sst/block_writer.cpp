@@ -52,15 +52,15 @@ Result<std::unique_ptr<paimon::MemorySlice>> BlockWriter::Finish() {
         aligned_ = false;
     }
     if (aligned_) {
-        block_->WriteInt(aligned_size_);
+        block_->WriteValue(aligned_size_);
     } else {
         for (auto& position : positions_) {
-            block_->WriteInt(position);
+            block_->WriteValue(position);
         }
-        block_->WriteInt(positions_.size());
+        block_->WriteValue(static_cast<int32_t>(positions_.size()));
     }
-    block_->WriteByte(aligned_ ? static_cast<int8_t>(BlockAlignedType::ALIGNED)
-                               : static_cast<int8_t>(BlockAlignedType::UNALIGNED));
+    block_->WriteValue(aligned_ ? static_cast<char>(BlockAlignedType::ALIGNED)
+                                : static_cast<char>(BlockAlignedType::UNALIGNED));
     return block_->ToSlice();
 }
 

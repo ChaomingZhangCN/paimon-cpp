@@ -24,6 +24,7 @@
 #include <type_traits>
 
 #include "paimon/common/memory/memory_slice.h"
+#include "paimon/io/byte_order.h"
 #include "paimon/visibility.h"
 
 namespace paimon {
@@ -40,22 +41,27 @@ class PAIMON_EXPORT MemorySliceOutput {
     void Reset();
     std::unique_ptr<MemorySlice> ToSlice();
 
-    void WriteByte(int8_t value);
-    void WriteShort(int16_t value);
-    void WriteInt(int32_t value);
+    template <typename T>
+    void WriteValue(T value);
+
     void WriteVarLenInt(int32_t value);
-    void WriteLong(int64_t value);
     void WriteVarLenLong(int64_t value);
+
     void WriteBytes(const std::shared_ptr<Bytes>& source);
     void WriteBytes(const std::shared_ptr<Bytes>& source, int source_index, int length);
 
+    void SetOrder(ByteOrder order);
+
  private:
     void EnsureSize(int bytes);
+    bool NeedSwap() const;
 
  private:
     MemoryPool* pool_;
     MemorySegment segment_;
     int32_t size_;
+
+    ByteOrder byte_order_ = ByteOrder::PAIMON_BIG_ENDIAN;
 };
 
 }  // namespace paimon

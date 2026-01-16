@@ -65,7 +65,7 @@ class CacheValue {
         return segment_;
     }
 
- public:
+ private:
     std::shared_ptr<MemorySegment> segment_;
 };
 }  // namespace paimon

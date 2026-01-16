@@ -16,6 +16,7 @@
 
 #include "paimon/common/memory/memory_slice_output.h"
 
+#include "paimon/common/utils/math.h"
 namespace paimon {
 
 MemorySliceOutput::MemorySliceOutput(int32_t estimated_size, MemoryPool* pool) {
@@ -37,27 +38,16 @@ std::unique_ptr<MemorySlice> MemorySliceOutput::ToSlice() {
     return std::make_unique<MemorySlice>(segment, 0, size_);
 }
 
-void MemorySliceOutput::WriteByte(int8_t value) {
-    EnsureSize(size_ + 1);
-    segment_.Put(size_++, static_cast<char>(value));
-}
-
-void MemorySliceOutput::WriteShort(int16_t value) {
-    EnsureSize(size_ + 2);
-    segment_.PutValue(size_, value);
-    size_ += 2;
-}
-
-void MemorySliceOutput::WriteInt(int32_t value) {
-    EnsureSize(size_ + 4);
-    segment_.PutValue(size_, value);
-    size_ += 4;
-}
-
-void MemorySliceOutput::WriteLong(int64_t value) {
-    EnsureSize(size_ + 8);
-    segment_.PutValue(size_, value);
-    size_ += 8;
+template <typename T>
+void MemorySliceOutput::WriteValue(T value) {
+    int32_t write_length = sizeof(T);
+    EnsureSize(size_ + write_length);
+    T write_value = value;
+    if (NeedSwap()) {
+        write_value = EndianSwapValue(value);
+    }
+    segment_.PutValue(size_, write_value);
+    size_ += write_length;
 }
 
 void MemorySliceOutput::WriteVarLenInt(int32_t value) {
@@ -65,10 +55,10 @@ void MemorySliceOutput::WriteVarLenInt(int32_t value) {
         throw std::invalid_argument("negative value: v=" + std::to_string(value));
     }
     while ((value & ~0x7F) != 0) {
-        WriteByte(((value & 0x7F) | 0x80));
+        WriteValue(static_cast<char>((value & 0x7F) | 0x80));
         value >>= 7;
     }
-    WriteByte(static_cast<int8_t>(value));
+    WriteValue(static_cast<char>(value));
 }
 
 void MemorySliceOutput::WriteVarLenLong(int64_t value) {
@@ -76,10 +66,10 @@ void MemorySliceOutput::WriteVarLenLong(int64_t value) {
         throw std::invalid_argument("negative value: v=" + std::to_string(value));
     }
     while ((value & ~0x7F) != 0) {
-        WriteByte(((value & 0x7F) | 0x80));
+        WriteValue(static_cast<char>((value & 0x7F) | 0x80));
         value >>= 7;
     }
-    WriteByte(static_cast<int8_t>(value));
+    WriteValue(static_cast<char>(value));
 }
 
 void MemorySliceOutput::WriteBytes(const std::shared_ptr<Bytes>& source) {
@@ -92,6 +82,14 @@ void MemorySliceOutput::WriteBytes(const std::shared_ptr<Bytes>& source, int sou
     std::string_view sv{source->data(), source->size()};
     segment_.Put(size_, sv, source_index, length);
     size_ += length;
+}
+
+void MemorySliceOutput::SetOrder(ByteOrder order) {
+    byte_order_ = order;
+}
+
+bool MemorySliceOutput::NeedSwap() const {
+    return SystemByteOrder() != byte_order_;
 }
 
 void MemorySliceOutput::EnsureSize(int size) {
@@ -110,5 +108,12 @@ void MemorySliceOutput::EnsureSize(int size) {
     segment_.CopyTo(0, &new_segment, 0, segment_.Size());
     segment_ = new_segment;
 }
+
+template void MemorySliceOutput::WriteValue(bool);
+template void MemorySliceOutput::WriteValue(char);
+template void MemorySliceOutput::WriteValue(int8_t);
+template void MemorySliceOutput::WriteValue(int16_t);
+template void MemorySliceOutput::WriteValue(int32_t);
+template void MemorySliceOutput::WriteValue(int64_t);
 
 }  // namespace paimon

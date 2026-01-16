@@ -61,7 +61,7 @@ class BlockCache {
         return segment;
     }
 
- public:
+ private:
     std::string file_path_;
     std::shared_ptr<InputStream> in_;
     std::shared_ptr<MemoryPool> pool_;
