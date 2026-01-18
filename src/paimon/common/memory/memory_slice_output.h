@@ -61,7 +61,7 @@ class PAIMON_EXPORT MemorySliceOutput {
     MemorySegment segment_;
     int32_t size_;
 
-    ByteOrder byte_order_ = ByteOrder::PAIMON_BIG_ENDIAN;
+    ByteOrder byte_order_ = SystemByteOrder();
 };
 
 }  // namespace paimon

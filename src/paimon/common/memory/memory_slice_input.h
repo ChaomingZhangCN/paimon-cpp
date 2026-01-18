@@ -61,7 +61,7 @@ class PAIMON_EXPORT MemorySliceInput {
     std::shared_ptr<MemorySlice> slice_;
     int32_t position_;
 
-    ByteOrder byte_order_ = ByteOrder::PAIMON_BIG_ENDIAN;
+    ByteOrder byte_order_ = SystemByteOrder();
 };
 
 }  // namespace paimon
