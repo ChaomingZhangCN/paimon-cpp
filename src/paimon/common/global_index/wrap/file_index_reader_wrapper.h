@@ -1,0 +1,169 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#pragma once
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include "paimon/file_index/bitmap_index_result.h"
+#include "paimon/file_index/file_index_reader.h"
+#include "paimon/global_index/bitmap_global_index_result.h"
+#include "paimon/global_index/global_index_reader.h"
+#include "paimon/utils/roaring_bitmap64.h"
+
+namespace paimon {
+///  A `GlobalIndexReader` wrapper for `FileIndexReader`.
+class FileIndexReaderWrapper : public GlobalIndexReader {
+ public:
+    FileIndexReaderWrapper(const std::shared_ptr<FileIndexReader>& reader,
+                           const std::function<Result<std::shared_ptr<GlobalIndexResult>>(
+                               const std::shared_ptr<FileIndexResult>&)>& transform)
+        : reader_(reader), transform_(transform) {}
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitIsNotNull() override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitIsNotNull());
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitIsNull() override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitIsNull());
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitEqual(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitEqual(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitNotEqual(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitNotEqual(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitLessThan(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitLessThan(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitLessOrEqual(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitLessOrEqual(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitGreaterThan(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitGreaterThan(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitGreaterOrEqual(
+        const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitGreaterOrEqual(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitIn(
+        const std::vector<Literal>& literals) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitIn(literals));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitNotIn(
+        const std::vector<Literal>& literals) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitNotIn(literals));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitStartsWith(const Literal& prefix) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitStartsWith(prefix));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitEndsWith(const Literal& suffix) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitEndsWith(suffix));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitContains(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitContains(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitLike(const Literal& literal) override {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FileIndexResult> file_index_result,
+                               reader_->VisitLike(literal));
+        return transform_(file_index_result);
+    }
+
+    Result<std::shared_ptr<ScoredGlobalIndexResult>> VisitVectorSearch(
+        const std::shared_ptr<VectorSearch>& vector_search) override {
+        return Status::Invalid(
+            "FileIndexReaderWrapper is not supposed to handle vector search query");
+    }
+
+    Result<std::shared_ptr<GlobalIndexResult>> VisitFullTextSearch(
+        const std::shared_ptr<FullTextSearch>& full_text_search) override {
+        std::shared_ptr<FileIndexResult> remain = FileIndexResult::Remain();
+        return transform_(remain);
+    }
+
+    /// Converts a `FileIndexResult` to a `GlobalIndexResult` by mapping 32-bit row IDs
+    /// to 64-bit global row IDs.
+    static Result<std::shared_ptr<GlobalIndexResult>> ToGlobalIndexResult(
+        const std::shared_ptr<FileIndexResult>& result) {
+        if (auto remain = std::dynamic_pointer_cast<Remain>(result)) {
+            return std::shared_ptr<GlobalIndexResult>();
+        } else if (auto skip = std::dynamic_pointer_cast<Skip>(result)) {
+            return std::make_shared<BitmapGlobalIndexResult>(
+                []() -> Result<RoaringBitmap64> { return RoaringBitmap64(); });
+        } else if (auto bitmap_result = std::dynamic_pointer_cast<BitmapIndexResult>(result)) {
+            return std::make_shared<BitmapGlobalIndexResult>(
+                [bitmap_result]() -> Result<RoaringBitmap64> {
+                    PAIMON_ASSIGN_OR_RAISE(const RoaringBitmap32* bitmap,
+                                           bitmap_result->GetBitmap());
+                    return RoaringBitmap64(*bitmap);
+                });
+        }
+        return Status::Invalid(
+            "invalid FileIndexResult, supposed to be Remain or Skip or BitmapIndexResult");
+    }
+
+ private:
+    std::shared_ptr<FileIndexReader> reader_;
+    std::function<Result<std::shared_ptr<GlobalIndexResult>>(
+        const std::shared_ptr<FileIndexResult>&)>
+        transform_;
+};
+
+}  // namespace paimon
