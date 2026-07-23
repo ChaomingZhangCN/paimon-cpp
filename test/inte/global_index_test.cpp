@@ -294,6 +294,41 @@ TEST_P(GlobalIndexTest, TestWriteLuminaIndex) {
     ASSERT_TRUE(expected_commit_message->TEST_Equal(*index_commit_msg_impl));
 }
 
+TEST_P(GlobalIndexTest, TestWriteLuminaIndexWithMismatchedDimension) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
+                                 arrow::field("f1", arrow::list(arrow::float32()))};
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> lumina_options = {{"lumina.index.dimension", "3"},
+                                                         {"lumina.index.type", "bruteforce"},
+                                                         {"lumina.distance.metric", "l2"},
+                                                         {"lumina.encoding.type", "rawf32"},
+                                                         {"lumina.search.parallel_number", "10"}};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, file_format_},
+        {Options::FILE_SYSTEM, "local"},           {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"}, {Options::READ_BATCH_SIZE, "1"}};
+
+    CreateTable(/*partition_keys=*/{}, schema, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    std::vector<std::string> write_cols = schema->field_names();
+    auto src_array = arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        ["a", [0.0, 0.0, 0.0]],
+        ["b", [0.0, 0.0, 0.0, 0.0]]
+    ])")
+                         .ValueOrDie();
+
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs, WriteArray(table_path, write_cols, src_array));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    ASSERT_NOK_WITH_MSG(
+        WriteIndex(table_path, /*partition_filters=*/{}, "f1", "lumina",
+                   /*options=*/lumina_options, Range(0, 1)),
+        "invalid input array in LuminaIndexWriter, length of field array [1] multiplied "
+        "dimension [3] must match length of field value array [4]");
+}
+
 TEST_P(GlobalIndexTest, TestWriteIndex) {
     CreateTable();
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
@@ -428,7 +463,7 @@ TEST_P(GlobalIndexTest, TestWriteIndexWithPartition) {
 #endif
 
 TEST_P(GlobalIndexTest, TestScanIndex) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
 
@@ -597,7 +632,7 @@ TEST_P(GlobalIndexTest, TestScanIndex) {
 }
 
 TEST_P(GlobalIndexTest, TestScanIndexWithSpecificSnapshot) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
 
@@ -646,7 +681,7 @@ TEST_P(GlobalIndexTest, TestScanIndexWithSpecificSnapshot) {
 }
 
 TEST_P(GlobalIndexTest, TestScanIndexWithSpecificSnapshotWithNoIndex) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
 
@@ -671,7 +706,7 @@ TEST_P(GlobalIndexTest, TestScanIndexWithSpecificSnapshotWithNoIndex) {
 }
 
 TEST_P(GlobalIndexTest, TestScanIndexWithRange) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
 
@@ -707,7 +742,7 @@ TEST_P(GlobalIndexTest, TestScanIndexWithRange) {
 }
 
 TEST_P(GlobalIndexTest, TestScanIndexWithPartition) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
 
@@ -762,7 +797,7 @@ TEST_P(GlobalIndexTest, TestScanIndexWithPartition) {
 }
 
 TEST_P(GlobalIndexTest, TestScanUnregisteredIndex) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
     auto factory_creator = FactoryCreator::GetInstance();
@@ -991,8 +1026,10 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
 ["Bob", [0.0, 1.0, 0.0, 1.0], 10, 12.1],
 ["Emily", [1.0, 0.0, 1.0, 0.0], 10, 13.1],
 ["Tony", [1.0, 1.0, 1.0, 1.0], 10, 14.1],
+["NullGuy1", null, 10, 20.0],
 ["Lucy", [10.0, 10.0, 10.0, 10.0], 20, 15.1],
 ["Bob", [10.0, 11.0, 10.0, 11.0], 20, 16.1],
+["NullGuy2", null, 20, 21.0],
 ["Tony", [11.0, 10.0, 11.0, 10.0], 20, 17.1],
 ["Alice", [11.0, 11.0, 11.0, 11.0], 20, 18.1],
 ["Paul", [10.0, 10.0, 10.0, 10.0], 20, 19.1]
@@ -1004,7 +1041,7 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
 
     // write and commit lumina index
     ASSERT_OK(WriteIndex(table_path, /*partition_filters=*/{}, "f1", "lumina",
-                         /*options=*/lumina_options, Range(0, 8)));
+                         /*options=*/lumina_options, Range(0, 10)));
 
     auto scan_and_check_result = [&](const std::vector<Range>& read_row_ranges,
                                      const std::shared_ptr<arrow::Array>& expected_array,
@@ -1022,8 +1059,8 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
     result_fields.insert(result_fields.begin(), SpecialFields::ValueKind().ArrowField());
     result_fields.push_back(SpecialFields::IndexScore().ArrowField());
     std::map<int64_t, float> id_to_score = {{0, 4.21f},   {1, 2.01f},   {2, 2.21f},
-                                            {3, 0.01f},   {4, 322.21f}, {5, 360.01f},
-                                            {6, 360.21f}, {7, 398.01},  {8, 322.21f}};
+                                            {3, 0.01f},   {5, 322.21f}, {6, 360.01f},
+                                            {8, 360.21f}, {9, 398.01f}, {10, 322.21f}};
     {
         auto expected_array =
             arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(result_fields), R"([
@@ -1038,7 +1075,8 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
 [0, "Paul", [10.0, 10.0, 10.0, 10.0], 20, 19.1, 322.21]
     ])")
                 .ValueOrDie();
-        scan_and_check_result({Range(0, 8)}, expected_array, id_to_score);
+        scan_and_check_result({Range(0, 3), Range(5, 6), Range(8, 10)}, expected_array,
+                              id_to_score);
     }
     {
         auto expected_array =
@@ -1049,7 +1087,7 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
 [0, "Paul", [10.0, 10.0, 10.0, 10.0], 20, 19.1, 322.21]
     ])")
                 .ValueOrDie();
-        scan_and_check_result({Range(2, 3), Range(7, 8)}, expected_array, id_to_score);
+        scan_and_check_result({Range(2, 3), Range(9, 10)}, expected_array, id_to_score);
     }
     {
         auto expected_array =
@@ -1057,7 +1095,7 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
 [0, "Bob", [10.0, 11.0, 10.0, 11.0], 20, 16.1, 360.01]
     ])")
                 .ValueOrDie();
-        scan_and_check_result({Range(5, 5)}, expected_array, id_to_score);
+        scan_and_check_result({Range(6, 6)}, expected_array, id_to_score);
     }
     {
         auto expected_array =
@@ -1068,7 +1106,31 @@ TEST_P(GlobalIndexTest, TestWriteCommitScanReadIndexWithScore) {
 [0, "Paul", [10.0, 10.0, 10.0, 10.0], 20, 19.1, null]
     ])")
                 .ValueOrDie();
-        scan_and_check_result({Range(2, 3), Range(7, 8)}, expected_array, /*id_to_score=*/{});
+        scan_and_check_result({Range(2, 3), Range(9, 10)}, expected_array, /*id_to_score=*/{});
+    }
+    {
+        // Verify null rows (id 4 and 7) are never recalled by vector search
+        ASSERT_OK_AND_ASSIGN(
+            std::shared_ptr<GlobalIndexScan> global_index_scan,
+            GlobalIndexScan::Create(table_path, /*snapshot_id=*/std::nullopt,
+                                    /*partitions=*/std::nullopt, lumina_options, fs_,
+                                    /*executor=*/nullptr, pool_));
+        ASSERT_OK_AND_ASSIGN(auto lumina_readers,
+                             global_index_scan->CreateReaders("f1", std::nullopt));
+        ASSERT_EQ(lumina_readers.size(), 1u);
+        std::vector<float> query = {1.0f, 1.0f, 1.0f, 1.1f};
+        auto vector_search = std::make_shared<VectorSearch>(
+            "f1", /*limit=*/20, query, /*filter=*/nullptr,
+            /*predicate=*/nullptr, /*distance_type=*/std::nullopt, /*options=*/lumina_options);
+        ASSERT_OK_AND_ASSIGN(auto scored_result,
+                             lumina_readers[0]->VisitVectorSearch(vector_search));
+        auto typed_result = std::dynamic_pointer_cast<BitmapScoredGlobalIndexResult>(scored_result);
+        ASSERT_TRUE(typed_result);
+        // Should recall 9 vectors (11 total rows - 2 null rows)
+        ASSERT_EQ(typed_result->bitmap_.Cardinality(), 9u);
+        // Null row ids 4 and 7 must not be in the result
+        ASSERT_FALSE(typed_result->bitmap_.Contains(4));
+        ASSERT_FALSE(typed_result->bitmap_.Contains(7));
     }
 }
 #endif
@@ -1672,9 +1734,6 @@ TEST_P(GlobalIndexTest, TestDataEvolutionBatchScanWithExternalPath) {
 }
 
 TEST_P(GlobalIndexTest, TestIOException) {
-    if (file_format_ == "lance") {
-        return;
-    }
     arrow::FieldVector fields = {
         arrow::field("f0", arrow::utf8()), arrow::field("f1", arrow::list(arrow::float32())),
         arrow::field("f2", arrow::int32()), arrow::field("f3", arrow::float64())};
@@ -2633,6 +2692,33 @@ TEST_P(GlobalIndexTest, TestBTreeAndBitmapCoexist) {
     ASSERT_OK_AND_ASSIGN(auto index_readers, global_index_scan->CreateReaders("f0", std::nullopt));
     ASSERT_EQ(index_readers.size(), 2u);
 
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> btree_reader,
+                         global_index_scan->CreateReader("f0", "btree", std::nullopt));
+    ASSERT_TRUE(btree_reader);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> btree_result,
+                         btree_reader->VisitEqual(Literal(FieldType::STRING, "Bob", 3)));
+    ASSERT_TRUE(btree_result);
+    ASSERT_EQ(btree_result->ToString(), "{1,2}");
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> btree_less_than_result,
+                         btree_reader->VisitLessThan(Literal(FieldType::STRING, "Emily", 5)));
+    ASSERT_TRUE(btree_less_than_result);
+    ASSERT_EQ(btree_less_than_result->ToString(), "{0,1,2}");
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> bitmap_reader,
+                         global_index_scan->CreateReader("f0", "bitmap", std::nullopt));
+    ASSERT_TRUE(bitmap_reader);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> bitmap_result,
+                         bitmap_reader->VisitEqual(Literal(FieldType::STRING, "Bob", 3)));
+    ASSERT_TRUE(bitmap_result);
+    ASSERT_EQ(bitmap_result->ToString(), "{1,2}");
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexResult> bitmap_less_than_result,
+                         bitmap_reader->VisitLessThan(Literal(FieldType::STRING, "Emily", 5)));
+    ASSERT_FALSE(bitmap_less_than_result);
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<GlobalIndexReader> missing_reader,
+                         global_index_scan->CreateReader("f0", "lucene", std::nullopt));
+    ASSERT_FALSE(missing_reader);
+
     // Each reader individually should return the same result for Equal("Bob")
     for (const auto& index_reader : index_readers) {
         ASSERT_OK_AND_ASSIGN(auto result,
@@ -2722,7 +2808,7 @@ TEST_P(GlobalIndexTest, TestBTreeAndBitmapCoexist) {
 }
 
 TEST_P(GlobalIndexTest, TestBTreeScanWithPartitionWithMultiMeta) {
-    if (file_format_ == "lance" || file_format_ == "avro") {
+    if (file_format_ == "avro") {
         return;
     }
     std::string table_path =
@@ -3023,10 +3109,6 @@ std::vector<ParamType> GetTestValuesForGlobalIndexTest() {
 #ifdef PAIMON_ENABLE_ORC
     values.emplace_back("orc", false);
     values.emplace_back("orc", true);
-#endif
-#ifdef PAIMON_ENABLE_LANCE
-    values.emplace_back("lance", false);
-    values.emplace_back("lance", true);
 #endif
 #ifdef PAIMON_ENABLE_AVRO
     values.emplace_back("avro", false);
