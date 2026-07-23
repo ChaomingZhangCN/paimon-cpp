@@ -49,14 +49,9 @@ The current implementation supports the `x86_64` architecture.
 
 ## Building
 
-> **Note:** The build system and source files are being migrated incrementally. The instructions below will work once the CMake build files and source code are available in this repository.
-
-If you do not have `git-lfs` installed, install it first.
-
 ```bash
 git clone https://github.com/apache/paimon-cpp.git
 cd paimon-cpp
-git lfs pull
 ```
 
 Build with CMake:
@@ -80,7 +75,7 @@ cp devcontainer.json.template devcontainer.json
 ## Collaboration
 
 Paimon-cpp is an active open-source project and we welcome people who want to contribute or share good ideas!
-Before contributing, please read the [Contributing Guide](CONTRIBUTING.md) and the [Code Style Guide](docs/code-style.md). You are encouraged to check out our [documentation](https://alibaba.github.io/paimon-cpp/).
+Before contributing, please read the [Contributing Guide](CONTRIBUTING.md) and the [Code Style Guide](docs/code-style.md). You are encouraged to check out our [documentation](https://paimon.apache.org/docs/cpp/).
 
 ## License
 
