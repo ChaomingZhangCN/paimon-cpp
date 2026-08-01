@@ -26,6 +26,7 @@
 #include <utility>
 
 #include "arrow/api.h"
+#include "paimon/common/data/blob_defs.h"
 #include "paimon/common/utils/options_utils.h"
 #include "paimon/defs.h"
 #include "paimon/format/blob/blob_format_writer.h"
@@ -69,10 +70,17 @@ class BlobWriterBuilder : public SpecificFSWriterBuilder {
         if (fs_ == nullptr) {
             return Status::Invalid("File system is nullptr. Please call WithFileSystem() first.");
         }
+        PAIMON_ASSIGN_OR_RAISE(bool write_null_on_missing_file,
+                               OptionsUtils::GetValueFromMap<bool>(
+                                   options_, Options::BLOB_WRITE_NULL_ON_MISSING_FILE, false));
+        PAIMON_ASSIGN_OR_RAISE(bool write_null_on_fetch_failure,
+                               OptionsUtils::GetValueFromMap<bool>(
+                                   options_, Options::BLOB_WRITE_NULL_ON_FETCH_FAILURE, false));
         PAIMON_ASSIGN_OR_RAISE(
-            bool blob_as_descriptor,
-            OptionsUtils::GetValueFromMap<bool>(options_, Options::BLOB_AS_DESCRIPTOR, false));
-        return BlobFormatWriter::Create(blob_as_descriptor, out, data_type_, fs_, pool_);
+            bool write_placeholder,
+            OptionsUtils::GetValueFromMap<bool>(options_, BlobDefs::kWritePlaceholderKey, false));
+        return BlobFormatWriter::Create(out, data_type_, write_null_on_missing_file,
+                                        write_null_on_fetch_failure, write_placeholder, fs_, pool_);
     }
 
  private:

@@ -18,13 +18,16 @@ set(PAIMON_PARQUET_FILE_FORMAT
     parquet_field_id_converter.cpp
     predicate_converter.cpp
     file_reader_wrapper.cpp
+    page_filtered_row_group_reader.cpp
     parquet_timestamp_converter.cpp
     parquet_file_batch_reader.cpp
     parquet_file_format_factory.cpp
     parquet_format_writer.cpp
     parquet_schema_util.cpp
     parquet_stats_extractor.cpp
-    parquet_writer_builder.cpp)
+    parquet_writer_builder.cpp
+    row_ranges.cpp
+    column_index_filter.cpp)
 
 add_paimon_lib(paimon_parquet_file_format
                SOURCES
@@ -37,17 +40,20 @@ add_paimon_lib(paimon_parquet_file_format
                arrow
                glog
                fmt
-               dl
                Threads::Threads
                SHARED_LINK_LIBS
                paimon_shared
                SHARED_LINK_FLAGS
                ${PAIMON_VERSION_SCRIPT_FLAGS})
 
+target_include_directories(paimon_parquet_file_format_objlib SYSTEM
+                           PRIVATE "${ARROW_SOURCE_DIR}/cpp/src")
+
 if(PAIMON_BUILD_TESTS)
     add_paimon_test(parquet_format_test
                     SOURCES
                     file_reader_wrapper_test.cpp
+                    page_filtered_row_group_reader_test.cpp
                     parquet_timestamp_converter_test.cpp
                     parquet_field_id_converter_test.cpp
                     parquet_file_batch_reader_test.cpp
@@ -56,13 +62,13 @@ if(PAIMON_BUILD_TESTS)
                     parquet_writer_builder_test.cpp
                     predicate_converter_test.cpp
                     predicate_pushdown_test.cpp
+                    column_index_filter_test.cpp
+                    variant_parquet_test.cpp
                     STATIC_LINK_LIBS
                     paimon_shared
                     test_utils_static
-                    "-Wl,--whole-archive"
-                    paimon_local_file_system_static
-                    paimon_parquet_file_format_static
-                    "-Wl,--no-whole-archive"
+                    ${PAIMON_PARQUET_FILE_FORMAT_STATIC_LINK_LIBS}
+                    ${PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS}
                     parquet
                     ${GTEST_LINK_TOOLCHAIN})
 endif()

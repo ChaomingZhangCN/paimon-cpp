@@ -25,6 +25,7 @@
 #include <string>
 #include <vector>
 
+#include "paimon/cache/cache.h"
 #include "paimon/global_index/global_index_result.h"
 #include "paimon/predicate/predicate.h"
 #include "paimon/result.h"
@@ -50,7 +51,9 @@ class PAIMON_EXPORT ScanContext {
                 const std::shared_ptr<MemoryPool>& memory_pool,
                 const std::shared_ptr<Executor>& executor,
                 const std::shared_ptr<FileSystem>& specific_file_system,
-                const std::map<std::string, std::string>& options);
+                const std::optional<std::string>& table_schema,
+                const std::map<std::string, std::string>& options,
+                const std::shared_ptr<Cache>& cache);
 
     ~ScanContext();
 
@@ -88,6 +91,14 @@ class PAIMON_EXPORT ScanContext {
         return specific_file_system_;
     }
 
+    const std::optional<std::string>& GetSpecificTableSchema() const {
+        return table_schema_;
+    }
+
+    std::shared_ptr<Cache> GetCache() const {
+        return cache_;
+    }
+
  private:
     std::string path_;
     bool is_streaming_mode_;
@@ -97,7 +108,9 @@ class PAIMON_EXPORT ScanContext {
     std::shared_ptr<MemoryPool> memory_pool_;
     std::shared_ptr<Executor> executor_;
     std::shared_ptr<FileSystem> specific_file_system_;
+    std::optional<std::string> table_schema_;
     std::map<std::string, std::string> options_;
+    std::shared_ptr<Cache> cache_;
 };
 
 /// Filter configuration for table scan operations
@@ -179,6 +192,22 @@ class PAIMON_EXPORT ScanContextBuilder {
     /// @return Reference to this builder for method chaining.
     /// @note If not set, use default file system (configured in `Options::FILE_SYSTEM`)
     ScanContextBuilder& WithFileSystem(const std::shared_ptr<FileSystem>& file_system);
+
+    /// Set the table schema as a string to avoid schema loading I/O operations.
+    ///
+    /// This optimization allows the scanner to use a pre-loaded schema instead of
+    /// reading it from the table metadata, which can improve performance especially
+    /// in scenarios with many small scan operations.
+    ///
+    /// @param table_schema String representation of the table schema.
+    /// @return Reference to this builder for method chaining.
+    /// @note The user must ensure that the schema string is valid and matches the table.
+    /// @note If not set, the schema will be loaded from the table path.
+    ScanContextBuilder& SetTableSchema(const std::string& table_schema);
+
+    /// Inject a cache for scan operations. Passing nullptr disables cache.
+    /// @return Reference to this builder for method chaining.
+    ScanContextBuilder& WithCache(const std::shared_ptr<Cache>& cache);
 
     /// Build and return a `ScanContext` instance with input validation.
     /// @return Result containing the constructed `ScanContext` or an error status.

@@ -97,7 +97,7 @@ class MergeTreeWriter : public BatchWriter {
     Status FlushWriteBuffer(bool wait_for_latest_compaction, bool forced_full_compaction);
     Result<CommitIncrement> DrainIncrement();
 
-    std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>
+    Result<std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>>
     CreateRollingRowWriter() const;
 
     Status TrySyncLatestCompaction(bool blocking);
@@ -105,8 +105,7 @@ class MergeTreeWriter : public BatchWriter {
     Status UpdateCompactDeletionFile(const std::shared_ptr<CompactDeletionFile>& new_deletion_file);
 
  private:
-    MergeTreeWriter(const std::shared_ptr<MemoryPool>& pool,
-                    const std::vector<std::string>& trimmed_primary_keys,
+    MergeTreeWriter(const std::vector<std::string>& trimmed_primary_keys,
                     const CoreOptions& options,
                     const std::shared_ptr<DataFilePathFactory>& path_factory,
                     const std::shared_ptr<FieldsComparator>& key_comparator,
@@ -114,7 +113,8 @@ class MergeTreeWriter : public BatchWriter {
                     const std::shared_ptr<MergeFunctionWrapper<KeyValue>>& merge_function_wrapper,
                     int64_t schema_id, const std::shared_ptr<arrow::Schema>& write_schema,
                     const std::shared_ptr<CompactManager>& compact_manager,
-                    std::unique_ptr<WriteBuffer>&& write_buffer);
+                    std::unique_ptr<WriteBuffer>&& write_buffer,
+                    const std::shared_ptr<MemoryPool>& pool);
 
     std::shared_ptr<MemoryPool> pool_;
     std::vector<std::string> trimmed_primary_keys_;

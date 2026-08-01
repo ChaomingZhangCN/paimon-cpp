@@ -235,8 +235,10 @@ Result<std::unique_ptr<FileBatchReader>> MergeFileSplitRead::ApplyIndexAndDvRead
 Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateMergeReader(
     const std::shared_ptr<DataSplitImpl>& data_split,
     const std::shared_ptr<DataFilePathFactory>& data_file_path_factory) {
-    auto dv_factory = DeletionVector::CreateFactory(options_.GetFileSystem(),
-                                                    CreateDeletionFileMap(*data_split), pool_);
+    auto dv_factory = DeletionVector::CreateFactory(
+        options_.GetFileSystem(),
+        DeletionVector::CreateDeletionFileMap(data_split->DataFiles(), data_split->DeletionFiles()),
+        pool_);
 
     std::vector<std::vector<SortedRun>> sections =
         IntervalPartition(data_split->DataFiles(), key_comparator_).Partition();
@@ -257,19 +259,23 @@ Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateMergeReader(
 Result<std::unique_ptr<BatchReader>> MergeFileSplitRead::CreateNoMergeReader(
     const std::shared_ptr<DataSplitImpl>& data_split, bool only_filter_key,
     const std::shared_ptr<DataFilePathFactory>& data_file_path_factory) const {
-    auto dv_factory = DeletionVector::CreateFactory(options_.GetFileSystem(),
-                                                    CreateDeletionFileMap(*data_split), pool_);
+    auto dv_factory = DeletionVector::CreateFactory(
+        options_.GetFileSystem(),
+        DeletionVector::CreateDeletionFileMap(data_split->DataFiles(), data_split->DeletionFiles()),
+        pool_);
 
     // create read schema without extra fields (e.g., completed key, sequence fields)
-    auto row_kind_field = DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind());
-
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> read_schema,
-                                      raw_read_schema_->AddField(0, row_kind_field));
+    std::shared_ptr<arrow::Schema> read_schema = raw_read_schema_;
+    if (read_schema->GetFieldIndex(SpecialFields::ValueKind().Name()) < 0) {
+        auto row_kind_field = DataField::ConvertDataFieldToArrowField(SpecialFields::ValueKind());
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(read_schema, read_schema->AddField(0, row_kind_field));
+    }
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<std::unique_ptr<FileBatchReader>> raw_file_readers,
         CreateRawFileReaders(data_split->Partition(), data_split->DataFiles(), read_schema,
                              only_filter_key ? predicate_for_keys_ : context_->GetPredicate(),
-                             dv_factory, /*row_ranges=*/{}, data_file_path_factory));
+                             dv_factory, /*row_ranges=*/{}, data_file_path_factory,
+                             /*extra_format_options=*/{}));
 
     auto raw_readers =
         ObjectUtils::MoveVector<std::unique_ptr<BatchReader>>(std::move(raw_file_readers));
@@ -493,7 +499,8 @@ Result<std::unique_ptr<KeyValueRecordReader>> MergeFileSplitRead::CreateReaderFo
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<std::unique_ptr<FileBatchReader>> raw_file_readers,
         CreateRawFileReaders(partition, data_files, read_schema_, predicate, dv_factory,
-                             /*row_ranges=*/{}, data_file_path_factory));
+                             /*row_ranges=*/{}, data_file_path_factory,
+                             /*extra_format_options=*/{}));
 
     assert(data_files.size() == raw_file_readers.size());
     // KeyValueDataFileRecordReader converts arrow array from format reader to KeyValue objects

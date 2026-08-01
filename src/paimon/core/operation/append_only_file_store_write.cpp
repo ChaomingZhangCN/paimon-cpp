@@ -18,19 +18,25 @@
 
 #include "paimon/core/operation/append_only_file_store_write.h"
 
+#include <functional>
+#include <limits>
 #include <vector>
 
+#include "arrow/c/bridge.h"
+#include "arrow/c/helpers.h"
 #include "paimon/common/data/binary_row.h"
+#include "paimon/common/data/shredding/shredding_write_plan_factories.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/core/append/append_only_writer.h"
 #include "paimon/core/append/bucketed_append_compact_manager.h"
 #include "paimon/core/compact/noop_compact_manager.h"
 #include "paimon/core/core_options.h"
+#include "paimon/core/io/append_data_file_writer_factory.h"
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/io/data_file_path_factory.h"
-#include "paimon/core/io/data_file_writer.h"
 #include "paimon/core/io/rolling_file_writer.h"
+#include "paimon/core/io/shredding_append_data_file_writer_factory.h"
 #include "paimon/core/manifest/manifest_file.h"
 #include "paimon/core/manifest/manifest_list.h"
 #include "paimon/core/operation/append_only_file_store_scan.h"
@@ -73,10 +79,6 @@ AppendOnlyFileStoreWrite::AppendOnlyFileStoreWrite(
                              is_streaming_mode, ignore_num_bucket_check, executor, pool),
       logger_(Logger::GetLogger("AppendOnlyFileStoreWrite")) {
     write_cols_ = write_schema->field_names();
-    auto schemas = BlobUtils::SeparateBlobSchema(schema_);
-    if (schemas.blob_schema && schemas.blob_schema->num_fields() > 0) {
-        with_blob_ = true;
-    }
     // optimize write_cols to null in following cases:
     // 1. write_schema contains all columns
     // 2. TODO(xinyu.lxy) write_schema contains all columns and append _ROW_ID & _SEQUENCE_NUMBER
@@ -93,7 +95,8 @@ Result<std::unique_ptr<FileStoreScan>> AppendOnlyFileStoreWrite::CreateFileStore
     PAIMON_ASSIGN_OR_RAISE(
         std::shared_ptr<ManifestList> manifest_list,
         ManifestList::Create(options_.GetFileSystem(), options_.GetManifestFormat(),
-                             options_.GetManifestCompression(), file_store_path_factory_, pool_));
+                             options_.GetManifestCompression(), file_store_path_factory_,
+                             options_.GetCache(), pool_));
     PAIMON_ASSIGN_OR_RAISE(
         std::shared_ptr<ManifestFile> manifest_file,
         ManifestFile::Create(options_.GetFileSystem(), options_.GetManifestFormat(),
@@ -117,10 +120,15 @@ Result<std::vector<std::shared_ptr<DataFileMeta>>> AppendOnlyFileStoreWrite::Com
 
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> reader,
                            CreateFilesReader(partition, bucket, dv_factory, to_compact));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFilePathFactory> data_file_path_factory,
+                           file_store_path_factory_->CreateDataFilePathFactory(partition, bucket));
+    PAIMON_ASSIGN_OR_RAISE(
+        WriterFactory writer_factory,
+        GetDataFileWriterFactory(data_file_path_factory, write_schema_, write_cols_, to_compact));
     auto rewriter =
         std::make_unique<RollingFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>>>(
             options_.GetTargetFileSize(/*has_primary_key=*/false),
-            GetDataFileWriterCreator(partition, bucket, write_schema_, write_cols_, to_compact));
+            /*target_file_row_num=*/std::numeric_limits<int64_t>::max(), writer_factory);
 
     ScopeGuard reader_guard([&]() {
         if (reader) {
@@ -174,9 +182,7 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
                            file_store_path_factory_->CreateDataFilePathFactory(partition, bucket));
 
     std::shared_ptr<CompactManager> compact_manager;
-    auto schemas = BlobUtils::SeparateBlobSchema(write_schema_);
-    if (options_.WriteOnly() || options_.DataEvolutionEnabled() || options_.GetBucket() == -1 ||
-        with_blob_) {
+    if (options_.WriteOnly() || options_.DataEvolutionEnabled() || options_.GetBucket() == -1) {
         compact_manager = std::make_shared<NoopCompactManager>();
     } else {
         auto dv_factory =
@@ -206,46 +212,28 @@ Result<std::shared_ptr<BatchWriter>> AppendOnlyFileStoreWrite::CreateWriter(
             compaction_metrics_->CreateReporter(partition, bucket), cancellation_controller);
     }
 
-    auto writer = std::make_shared<AppendOnlyWriter>(
+    auto writer = std::make_unique<AppendOnlyWriter>(
         options_, table_schema_->Id(), write_schema_, write_cols_, restore_max_seq_number,
         data_file_path_factory, compact_manager, pool_);
-    return std::shared_ptr<BatchWriter>(writer);
+    return std::shared_ptr<BatchWriter>(std::move(writer));
 }
 
-AppendOnlyFileStoreWrite::SingleFileWriterCreator
-AppendOnlyFileStoreWrite::GetDataFileWriterCreator(
-    const BinaryRow& partition, int32_t bucket, const std::shared_ptr<arrow::Schema>& schema,
+Result<AppendOnlyFileStoreWrite::WriterFactory> AppendOnlyFileStoreWrite::GetDataFileWriterFactory(
+    const std::shared_ptr<DataFilePathFactory>& data_file_path_factory,
+    const std::shared_ptr<arrow::Schema>& schema,
     const std::optional<std::vector<std::string>>& write_cols,
     const std::vector<std::shared_ptr<DataFileMeta>>& to_compact) const {
-    return
-        [this, partition, bucket, schema, write_cols, to_compact]()
-            -> Result<
-                std::unique_ptr<SingleFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>>>> {
-            ::ArrowSchema arrow_schema;
-            ScopeGuard guard([&arrow_schema]() { ArrowSchemaRelease(&arrow_schema); });
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema, &arrow_schema));
-            auto format = options_.GetFileFormat();
-            PAIMON_ASSIGN_OR_RAISE(
-                std::shared_ptr<WriterBuilder> writer_builder,
-                format->CreateWriterBuilder(&arrow_schema, options_.GetWriteBatchSize()));
-            writer_builder->WithMemoryPool(pool_);
-
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema, &arrow_schema));
-            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<FormatStatsExtractor> stats_extractor,
-                                   format->CreateStatsExtractor(&arrow_schema));
-            PAIMON_ASSIGN_OR_RAISE(
-                std::shared_ptr<DataFilePathFactory> data_file_path_factory,
-                file_store_path_factory_->CreateDataFilePathFactory(partition, bucket));
-            auto writer = std::make_unique<DataFileWriter>(
-                options_.GetFileCompression(), std::function<Status(ArrowArray*, ArrowArray*)>(),
-                table_schema_->Id(),
-                std::make_shared<LongCounter>(to_compact[0]->min_sequence_number),
-                FileSource::Compact(), stats_extractor, data_file_path_factory->IsExternalPath(),
-                write_cols, pool_);
-            PAIMON_RETURN_NOT_OK(writer->Init(options_.GetFileSystem(),
-                                              data_file_path_factory->NewPath(), writer_builder));
-            return writer;
-        };
+    auto seq_num_counter = std::make_shared<LongCounter>(to_compact[0]->min_sequence_number);
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<ShreddingWritePlanFactory> plan_factory,
+                           ShreddingWritePlanFactories::SelectActive(options_, schema, pool_));
+    if (plan_factory != nullptr) {
+        return std::make_shared<ShreddingAppendDataFileWriterFactory>(
+            options_, table_schema_->Id(), schema, write_cols, seq_num_counter,
+            FileSource::Compact(), data_file_path_factory, plan_factory, pool_);
+    }
+    return std::make_shared<AppendDataFileWriterFactory>(
+        options_, table_schema_->Id(), schema, write_cols, seq_num_counter, FileSource::Compact(),
+        data_file_path_factory, pool_);
 }
 
 Result<std::unique_ptr<BatchReader>> AppendOnlyFileStoreWrite::CreateFilesReader(

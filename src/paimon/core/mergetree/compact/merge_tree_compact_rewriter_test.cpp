@@ -112,6 +112,14 @@ TEST_F(MergeTreeCompactRewriterTest, TestSimple) {
     // load table schema
     SchemaManager schema_manager(fs, table_path);
     ASSERT_OK_AND_ASSIGN(auto table_schema, schema_manager.ReadSchema(0));
+    auto options = table_schema->Options();
+    options[Options::TARGET_FILE_ROW_NUM] = "1";
+    auto logical_schema = DataField::ConvertDataFieldsToArrowSchema(table_schema->Fields());
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<TableSchema> configured_schema,
+        TableSchema::Create(table_schema->Id(), logical_schema, table_schema->PartitionKeys(),
+                            table_schema->PrimaryKeys(), options));
+    table_schema = std::shared_ptr<TableSchema>(std::move(configured_schema));
     ASSERT_OK_AND_ASSIGN(
         auto rewriter,
         CreateCompactRewriter(table_path, table_schema, /*bucket=*/1,
@@ -119,11 +127,12 @@ TEST_F(MergeTreeCompactRewriterTest, TestSimple) {
 
     // generate sorted runs and rewrite
     ASSERT_OK_AND_ASSIGN(auto runs, GenerateSortedRuns(table_path, table_schema, /*bucket=*/1,
-                                                       /*partition=*/{{"f1", "10"}}))
+                                                       /*partition=*/{{"f1", "10"}}));
     ASSERT_OK_AND_ASSIGN(auto compact_result, rewriter->Rewrite(
                                                   /*output_level=*/5, /*drop_delete=*/true, runs));
     // check compact result
     ASSERT_EQ(4, compact_result.Before().size());
+    // Compaction must not honor target-file-row-num; all seven rows stay in one output file.
     ASSERT_EQ(1, compact_result.After().size());
     const auto& compact_file_meta = compact_result.After()[0];
     auto expected_file_meta = std::make_shared<DataFileMeta>(
@@ -216,7 +225,7 @@ TEST_F(MergeTreeCompactRewriterTest, TestNotDropDelete) {
 
     // generate sorted runs and rewrite
     ASSERT_OK_AND_ASSIGN(auto runs, GenerateSortedRuns(table_path, table_schema, /*bucket=*/1,
-                                                       /*partition=*/{{"f1", "10"}}))
+                                                       /*partition=*/{{"f1", "10"}}));
     ASSERT_OK_AND_ASSIGN(auto compact_result, rewriter->Rewrite(
                                                   /*output_level=*/5, /*drop_delete=*/false, runs));
     // check compact result
@@ -287,7 +296,7 @@ TEST_F(MergeTreeCompactRewriterTest, TestIOException) {
 
         // generate sorted runs and rewrite
         ASSERT_OK_AND_ASSIGN(auto runs, GenerateSortedRuns(table_path, table_schema, /*bucket=*/1,
-                                                           /*partition=*/{{"f1", "10"}}))
+                                                           /*partition=*/{{"f1", "10"}}));
         // rewrite may trigger I/O exception
         ScopeGuard guard([&io_hook]() { io_hook->Clear(); });
         io_hook->Reset(i, IOHook::Mode::RETURN_ERROR);

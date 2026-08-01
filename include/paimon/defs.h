@@ -49,6 +49,7 @@ enum class FieldType {
     MAP = 14,
     STRUCT = 15,
     BLOB = 16,
+    VARIANT = 17,
     UNKNOWN = 128,
 };
 
@@ -119,8 +120,18 @@ struct PAIMON_EXPORT Options {
     /// append table: the default value is 256 MB.
     static const char TARGET_FILE_SIZE[];
 
+    /// "target-file-row-num" - Target number of rows per newly written data file. Disabled by
+    /// default. A file rolls when this or target-file-size is reached, whichever comes first.
+    /// This limit is enforced at write-batch granularity, so a file may exceed the target by up
+    /// to one batch.
+    static const char TARGET_FILE_ROW_NUM[];
+
     /// "blob.target-file-size" - Target size of a blob file. Default is TARGET_FILE_SIZE.
     static const char BLOB_TARGET_FILE_SIZE[];
+
+    /// "blob.split-by-file-size" - Whether to consider blob file size as a factor when performing
+    /// scan splitting. When unset, defaults to the negation of BLOB_AS_DESCRIPTOR.
+    static const char BLOB_SPLIT_BY_FILE_SIZE[];
 
     /// "partition.default-name" - The default partition name in case the dynamic partition column
     /// value is null/empty string. Default is "__DEFAULT_PARTITION__".
@@ -169,6 +180,11 @@ struct PAIMON_EXPORT Options {
     /// "scan.mode" - Specify the scanning behavior of the source. Values can be: "default",
     /// "latest-full", "latest", "from-snapshot", "from-snapshot-full". Default value is "default".
     static const char SCAN_MODE[];
+
+    /// "scan.manifest-entry-cache.max-snapshots" - Maximum number of snapshot live manifest entry
+    /// results retained per table, branch, and bucket. Setting it to 0 disables manifest entry
+    /// cache. Default value is 0.
+    static const char SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS[];
 
     /// "read.batch-size" - Read batch size for any file format if it supports.
     /// The default value is 1024.
@@ -234,6 +250,16 @@ struct PAIMON_EXPORT Options {
     /// "commit.max-retries" - Maximum number of retries when commit failed. Default value is 10.
     static const char COMMIT_MAX_RETRIES[];
 
+    /// "commit.min-retry-wait" - Min retry wait time when commit failed. Default value is 10ms.
+    static const char COMMIT_MIN_RETRY_WAIT[];
+
+    /// "commit.max-retry-wait" - Max retry wait time when commit failed. Default value is 10s.
+    static const char COMMIT_MAX_RETRY_WAIT[];
+
+    /// "commit.discard-duplicate-files" - Whether to discard duplicate files in commit.
+    /// Default value is "false".
+    static const char COMMIT_DISCARD_DUPLICATE_FILES[];
+
     /// "compaction.max-size-amplification-percent" - The size amplification is defined as the
     /// amount (in percentage) of additional storage needed to store a single byte of data in the
     /// merge tree for changelog mode table. Default value is 200.
@@ -269,6 +295,15 @@ struct PAIMON_EXPORT Options {
     /// level 0 files in candidates. Default value is false.
     static const char COMPACTION_FORCE_UP_LEVEL_0[];
 
+    /// "overwrite-upgrade" - Whether to try upgrading the data files after overwriting a
+    /// primary key table. Default value is true.
+    static const char OVERWRITE_UPGRADE[];
+
+    /// "dynamic-partition-overwrite" - Whether only overwrite dynamic partition when
+    /// overwriting a partitioned table with dynamic partition columns. Works only when
+    /// the table has partition keys. Default value is true.
+    static const char DYNAMIC_PARTITION_OVERWRITE[];
+
     /// "lookup-compact.max-interval" - The max interval for a gentle mode lookup compaction to be
     /// triggered. For every interval, a forced lookup compaction will be performed to flush L0
     /// files to higher level. This option is only valid when lookup-compact mode is gentle. No
@@ -293,6 +328,15 @@ struct PAIMON_EXPORT Options {
 
     /// "ignore-delete" - Whether to ignore delete records. Default value is "false".
     static const char IGNORE_DELETE[];
+
+    /// "first-row.ignore-delete" deprecated as a fallback for `IGNORE_DELETE`.
+    static const char FALLBACK_FIRST_ROW_IGNORE_DELETE[];
+
+    /// "deduplicate.ignore-delete" deprecated as a fallback for `IGNORE_DELETE`.
+    static const char FALLBACK_DEDUPLICATE_IGNORE_DELETE[];
+
+    /// "partial-update.ignore-delete" deprecated as a fallback for `IGNORE_DELETE`.
+    static const char FALLBACK_PARTIAL_UPDATE_IGNORE_DELETE[];
 
     /// "fields.default-aggregate-function" - Default aggregate function of all fields for
     /// partial-update and aggregate merge function.
@@ -369,7 +413,58 @@ struct PAIMON_EXPORT Options {
     /// "partition.legacy-name" - The legacy partition name is using `ToString` for all types. If
     /// false, using casting to string for all types. Default value is "true".
     static const char PARTITION_GENERATE_LEGACY_NAME[];
-    /// "blob-as-descriptor" - Read and write blob field using blob descriptor rather than blob
+    /// "map.storage-layout" - Suffix for per-column MAP storage layout configuration.
+    /// Used as `fields.<column>.map.storage-layout`. Values: "default" (standard KV arrays)
+    /// or "shared-shredding" (columnar shredding with column reuse). Default is "default".
+    /// If set "shared-shredding", the column must be of type MAP<STRING, T>. Each column must be
+    /// configured individually. For example, to enable shared-shredding layout for two columns
+    /// "metrics" and "tags":
+    ///   fields.metrics.map.storage-layout = shared-shredding
+    ///   fields.tags.map.storage-layout = shared-shredding
+    static const char MAP_STORAGE_LAYOUT[];
+    /// "map.shared-shredding.max-columns" - Suffix for per-column upper bound K_max configuration.
+    /// Used as `fields.<column>.map.shared-shredding.max-columns`. Only effective when
+    /// map.storage-layout = shared-shredding. Rows with more fields than K_max spill to
+    /// __overflow. Default value is 256. Each column can have its own max-columns setting.
+    static const char MAP_SHARED_SHREDDING_MAX_COLUMNS[];
+    /// "map.shared-shredding.column-placement-policy" - Suffix for per-column shared-shredding
+    /// physical column placement policy.
+    /// Used as `fields.<column>.map.shared-shredding.column-placement-policy`.
+    /// Values: "plain", "sequential" and "lru". Default value is "lru".
+    /// Only effective when map.storage-layout = shared-shredding.
+    static const char MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY[];
+
+    /// "variant.shreddingSchema" - The Variant shredding schema for writing: a ROW type JSON
+    /// whose fields map variant column names to their shredding types. No default value.
+    static const char VARIANT_SHREDDING_SCHEMA[];
+    /// "parquet.variant.shreddingSchema" - Fallback key of "variant.shreddingSchema".
+    static const char PARQUET_VARIANT_SHREDDING_SCHEMA[];
+    /// "variant.inferShreddingSchema" - Whether to automatically infer the shredding schema when
+    /// writing Variant columns. Default value is "false".
+    static const char VARIANT_INFER_SHREDDING_SCHEMA[];
+    /// "variant.shredding.inferenceMode" - "per-file" or "adaptive". Default is "per-file".
+    static const char VARIANT_SHREDDING_INFERENCE_MODE[];
+    /// "variant.shredding.maxSchemaWidth" - Maximum number of shredded fields allowed in an
+    /// inferred schema. Default value is 300.
+    static const char VARIANT_SHREDDING_MAX_SCHEMA_WIDTH[];
+    /// "variant.shredding.maxSchemaDepth" - Maximum traversal depth in Variant values during
+    /// schema inference. Default value is 50.
+    static const char VARIANT_SHREDDING_MAX_SCHEMA_DEPTH[];
+    /// "variant.shredding.minFieldCardinalityRatio" - Minimum fraction of rows that must contain
+    /// a field for it to be shredded. Fields below this threshold stay in the un-shredded
+    /// Variant binary. Default value is 0.1.
+    static const char VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO[];
+    /// "variant.shredding.maxInferBufferRow" - Maximum number of rows to buffer for schema
+    /// inference. Default value is 4096.
+    static const char VARIANT_SHREDDING_MAX_INFER_BUFFER_ROW[];
+    /// "variant.shredding.adaptive.maxInferBufferRow" - Maximum prefix rows sampled after the
+    /// first file in an adaptive session. Default value is 256.
+    static const char VARIANT_SHREDDING_ADAPTIVE_MAX_INFER_BUFFER_ROW[];
+    /// "variant.shredding.adaptive.retentionRatio" - Minimum combined ratio for retaining a
+    /// previously selected path. Default value is 0.05.
+    static const char VARIANT_SHREDDING_ADAPTIVE_RETENTION_RATIO[];
+
+    /// "blob-as-descriptor" - Read blob field using blob descriptor rather than blob
     /// bytes. Default value is "false".
     static const char BLOB_AS_DESCRIPTOR[];
     /// "blob-field" - Specifies column names that should be stored as blob type. This is used
@@ -386,15 +481,24 @@ struct PAIMON_EXPORT Options {
     /// serialized BlobViewStruct bytes inline in data files and resolve from upstream tables at
     /// read time. No default value.
     static const char BLOB_VIEW_FIELD[];
-    /// "blob-external-storage-field" - Comma-separated BLOB field names (must be a subset of
-    /// blob-descriptor-field ) whose raw data will be written to external storage at write time.
-    /// The external storage path is configured via blob-external-storage-path. Orphan file cleanup
-    /// is not applied to that path. No default value.
-    static const char BLOB_EXTERNAL_STORAGE_FIELD[];
-    /// "blob-external-storage-path" - The external storage path where raw BLOB data from fields
-    /// configured by 'blob-external-storage-field' is written at write time. Orphan file cleanup is
-    /// not applied to this path. No default value.
-    static const char BLOB_EXTERNAL_STORAGE_PATH[];
+    /// "blob-view.resolve.enabled" - Whether to resolve blob-view-field values from upstream
+    /// tables at read time. Set to false to preserve serialized BlobViewStruct bytes when
+    /// forwarding blob view values to another blob-view table. Default value is "true".
+    static const char BLOB_VIEW_RESOLVE_ENABLED[];
+    /// "blob-view-upstream-warehouse" - Since the catalog capabilities are partially missing, when
+    /// Blob View is enabled, cpp paimon cannot automatically obtain the upstream table warehouse
+    /// path and requires manual configuration by the user. No default value.
+    static const char BLOB_VIEW_UPSTREAM_WAREHOUSE[];
+    /// "blob-write-null-on-missing-file" - Whether to write NULL for a descriptor BLOB value when
+    /// the referenced file does not exist at write time. When false, a missing file is treated
+    /// like any other fetch failure, following "blob-write-null-on-fetch-failure". Default value
+    /// is "false".
+    static const char BLOB_WRITE_NULL_ON_MISSING_FILE[];
+    /// "blob-write-null-on-fetch-failure" - Whether to write NULL for a descriptor BLOB value when
+    /// the referenced data cannot be fetched at write time (e.g. invalid descriptor or invalid
+    /// offset). A missing file is handled by "blob-write-null-on-missing-file" when that option is
+    /// enabled. When false, the write fails when the descriptor is read. Default value is "false".
+    static const char BLOB_WRITE_NULL_ON_FETCH_FAILURE[];
     /// "global-index.enabled" - Whether to enable global index for scan. Default value is "true".
     static const char GLOBAL_INDEX_ENABLED[];
     /// "global-index.thread-num" - The maximum number of concurrent scanner for global index. No
@@ -432,6 +536,12 @@ struct PAIMON_EXPORT Options {
     /// "write-only" - If set to "true", compactions and snapshot expiration will be skipped. This
     /// option is used along with dedicated compact jobs. Default value is "false".
     static const char WRITE_ONLY[];
+    /// "bucket-append-ordered" - Whether append writes in fixed bucket mode are ordered. This
+    /// option is used by commit conflict checks. Default value is "false".
+    static const char BUCKET_APPEND_ORDERED[];
+    /// "write.sequence-number-init-mode" - Specify how to initialize the next sequence number for
+    /// primary key table writers. Values can be: "scan", "snapshot". Default value is "scan".
+    static const char WRITE_SEQUENCE_NUMBER_INIT_MODE[];
     /// "compaction.min.file-num" - For file set [f_0,...,f_N], the minimum file number to trigger a
     /// compaction for append-only table. Default value is 5.
     static const char COMPACTION_MIN_FILE_NUM[];

@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "arrow/array/array_nested.h"
@@ -39,7 +40,8 @@ namespace paimon {
 /// between them.
 ///
 /// Multiple blob fields are supported. Each blob field is written to its own set of blob files
-/// independently via MultipleBlobFileWriter.
+/// independently via MultipleBlobFileWriter. For blob-only writes, the main writer factory may be
+/// nullptr and only blob files are produced.
 ///
 /// <pre>
 /// For example,
@@ -59,12 +61,14 @@ class RollingBlobFileWriter
     : public RollingFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>> {
  public:
     using MainWriter = SingleFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>>;
+    using MainWriterFactory = SingleFileWriterFactory<::ArrowArray*, std::shared_ptr<DataFileMeta>>;
 
-    RollingBlobFileWriter(int64_t target_file_size,
-                          std::function<Result<std::unique_ptr<MainWriter>>()> create_file_writer,
+    RollingBlobFileWriter(int64_t target_file_size, int64_t target_file_row_num,
+                          const std::shared_ptr<MainWriterFactory>& writer_factory,
                           const std::shared_ptr<arrow::Schema>& blob_schema,
                           MultipleBlobFileWriter::BlobWriterCreator blob_writer_creator,
-                          const std::shared_ptr<arrow::DataType>& data_type);
+                          const std::shared_ptr<arrow::DataType>& data_type,
+                          const std::set<std::string>& inline_fields);
     ~RollingBlobFileWriter() override = default;
 
     Status Write(::ArrowArray* record) override;
@@ -75,8 +79,7 @@ class RollingBlobFileWriter
  private:
     static Status ValidateFileConsistency(
         const std::shared_ptr<DataFileMeta>& main_data_file_meta,
-        const std::vector<std::shared_ptr<DataFileMeta>>& blob_tagged_metas,
-        int32_t blob_field_count);
+        const std::vector<std::shared_ptr<DataFileMeta>>& blob_tagged_metas);
 
     Status CloseCurrentWriter();
 
@@ -87,6 +90,7 @@ class RollingBlobFileWriter
     MultipleBlobFileWriter::BlobWriterCreator blob_writer_creator_;
     std::unique_ptr<MultipleBlobFileWriter> blob_writer_;
     std::shared_ptr<arrow::DataType> data_type_;
+    std::set<std::string> inline_fields_;
 
     std::unique_ptr<Logger> logger_;
 };

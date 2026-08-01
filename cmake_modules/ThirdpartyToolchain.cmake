@@ -23,6 +23,8 @@ set(THIRDPARTY_LOG_OPTIONS
     LOG_INSTALL
     1
     LOG_DOWNLOAD
+    1
+    LOG_OUTPUT_ON_FAILURE
     1)
 set(THIRDPARTY_CONFIGURE_COMMAND "${CMAKE_COMMAND}" -G "${CMAKE_GENERATOR}")
 if(CMAKE_GENERATOR_TOOLSET)
@@ -245,6 +247,18 @@ else()
     endif()
 endif()
 
+if(DEFINED ENV{PAIMON_BENCHMARK_URL})
+    set(BENCHMARK_SOURCE_URL "$ENV{PAIMON_BENCHMARK_URL}")
+else()
+    if(EXISTS "${THIRDPARTY_DIR}/${PAIMON_BENCHMARK_PKG_NAME}")
+        set_urls(BENCHMARK_SOURCE_URL "${THIRDPARTY_DIR}/${PAIMON_BENCHMARK_PKG_NAME}")
+    else()
+        set_urls(BENCHMARK_SOURCE_URL
+                 "${THIRDPARTY_MIRROR_URL}https://github.com/google/benchmark/archive/refs/tags/v${PAIMON_BENCHMARK_BUILD_VERSION}.tar.gz"
+        )
+    endif()
+endif()
+
 if(DEFINED ENV{PAIMON_TBB_URL})
     set(TBB_SOURCE_URL "$ENV{PAIMON_TBB_URL}")
 else()
@@ -364,7 +378,7 @@ if(NOT MSVC_TOOLCHAIN)
     # Set -fPIC on all external projects
     string(APPEND EP_CXX_FLAGS
            " -fPIC -Wno-error -Wno-sign-compare -Wno-ignored-attributes")
-    string(APPEND EP_C_FLAGS " -fPIC")
+    string(APPEND EP_C_FLAGS " -fPIC -Wno-error")
 endif()
 
 if(PAIMON_USE_CXX11_ABI)
@@ -557,6 +571,8 @@ function(paimon_get_dependency_compat_target DEPENDENCY_NAME OUT_VAR)
         set(_target libprotobuf)
     elseif("${DEPENDENCY_NAME}" STREQUAL "GTest")
         set(_target GTest::gtest)
+    elseif("${DEPENDENCY_NAME}" STREQUAL "benchmark")
+        set(_target benchmark::benchmark)
     elseif("${DEPENDENCY_NAME}" STREQUAL "RE2")
         set(_target re2::re2)
     elseif("${DEPENDENCY_NAME}" STREQUAL "Snappy")
@@ -643,6 +659,8 @@ macro(paimon_build_dependency DEPENDENCY_NAME)
         build_avro()
     elseif("${DEPENDENCY_NAME}" STREQUAL "GTest")
         build_gtest()
+    elseif("${DEPENDENCY_NAME}" STREQUAL "benchmark")
+        build_benchmark()
     else()
         message(FATAL_ERROR "No bundled build rule for ${DEPENDENCY_NAME}")
     endif()
@@ -753,19 +771,12 @@ macro(build_lucene)
 
     set(LUCENE_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/lucene_ep-install")
 
-    set(LUCENE_CMAKE_CXX_FLAGS "-pthread")
-    if(PAIMON_USE_CXX11_ABI)
-        string(APPEND LUCENE_CMAKE_CXX_FLAGS " -D_GLIBCXX_USE_CXX11_ABI=1")
-    else()
-        string(APPEND LUCENE_CMAKE_CXX_FLAGS " -D_GLIBCXX_USE_CXX11_ABI=0")
-    endif()
-
     set(LUCENE_CMAKE_ARGS
         ${EP_COMMON_CMAKE_ARGS}
         "-DLUCENE_BUILD_SHARED=OFF"
         "-DENABLE_TEST=OFF"
-        "-DCMAKE_C_FLAGS=-pthread"
-        "-DCMAKE_CXX_FLAGS=${LUCENE_CMAKE_CXX_FLAGS}"
+        "-DCMAKE_C_FLAGS=${EP_C_FLAGS} -pthread"
+        "-DCMAKE_CXX_FLAGS=${EP_CXX_FLAGS} -pthread"
         "-DCMAKE_EXE_LINKER_FLAGS=-pthread"
         "-DBoost_NO_BOOST_CMAKE=ON"
         "-DBoost_NO_SYSTEM_PATHS=ON"
@@ -773,6 +784,11 @@ macro(build_lucene)
         "-DBoost_INCLUDE_DIR=${BOOST_INCLUDE_DIR}"
         "-DBoost_LIBRARY_DIR=${BOOST_LIBRARY_DIR}"
         "-DBOOST_ROOT=${BOOST_INSTALL}"
+        # Force FindBoost module mode only; ignore system BoostConfig.cmake and
+        # system library paths so lucene_ep links against our vendored boost 1.66,
+        # not a system-installed newer version (e.g. 1.83) with ABI differences.
+        "-DBoost_NO_BOOST_CMAKE=ON"
+        "-DBoost_NO_SYSTEM_PATHS=ON"
         "-DBoost_CHRONO_FOUND=TRUE"
         "-DBoost_THREAD_FOUND=TRUE"
         "-DZLIB_INCLUDE_DIRS=${ZLIB_INCLUDE_DIR}"
@@ -818,7 +834,7 @@ macro(build_lucene)
                                     boost_chrono
                                     boost_atomic
                                     pthread
-                                    dl)
+                                    ${CMAKE_DL_LIBS})
     add_dependencies(lucene lucene_ep)
 endmacro()
 
@@ -828,6 +844,8 @@ macro(build_jieba)
     externalproject_add(limonp_ep
                         URL ${LIMONP_SOURCE_URL}
                         URL_HASH "SHA256=${PAIMON_LIMONP_BUILD_SHA256_CHECKSUM}"
+                        CONFIGURE_COMMAND ""
+                        BUILD_COMMAND ""
                         INSTALL_COMMAND "")
 
     message(STATUS "Building jieba from source")
@@ -904,17 +922,9 @@ macro(build_fmt)
         "${FMT_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${FMT_STATIC_LIB_NAME}${FMT_LIB_SUFFIX}${CMAKE_STATIC_LIBRARY_SUFFIX}"
     )
     set(FMT_LIBRARIES ${FMT_STATIC_LIB})
-    set(FMT_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} -Wno-error")
-    set(FMT_CMAKE_C_FLAGS "${EP_C_FLAGS} -Wno-error")
-    string(REPLACE "-Werror" "" FMT_CMAKE_CXX_FLAGS ${FMT_CMAKE_CXX_FLAGS})
 
-    set(FMT_CMAKE_ARGS
-        ${EP_COMMON_CMAKE_ARGS}
-        -DCMAKE_INSTALL_PREFIX=${FMT_PREFIX}
-        "-DCMAKE_CXX_FLAGS=${FMT_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_C_FLAGS=${FMT_CMAKE_C_FLAGS}"
-        -DFMT_TEST=OFF
-        -DFMT_DOC=OFF)
+    set(FMT_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} -DCMAKE_INSTALL_PREFIX=${FMT_PREFIX}
+                       -DFMT_TEST=OFF -DFMT_DOC=OFF)
     set(FMT_CONFIGURE CMAKE_ARGS ${FMT_CMAKE_ARGS})
     externalproject_add(fmt_ep
                         URL ${FMT_SOURCE_URL}
@@ -950,12 +960,16 @@ macro(build_boost)
         ${BOOST_LIBRARY_DIR}/libboost_chrono.a
         ${BOOST_LIBRARY_DIR}/libboost_iostreams.a)
 
-    set(BOOST_CXX_FLAGS "-fPIC")
-    if(PAIMON_USE_CXX11_ABI)
-        string(APPEND BOOST_CXX_FLAGS " -D_GLIBCXX_USE_CXX11_ABI=1")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+        set(BOOST_TOOLSET clang)
+    elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+        set(BOOST_TOOLSET gcc)
     else()
-        string(APPEND BOOST_CXX_FLAGS " -D_GLIBCXX_USE_CXX11_ABI=0")
+        message(FATAL_ERROR "Unsupported compiler for Boost: ${CMAKE_CXX_COMPILER_ID}")
     endif()
+    set(BOOST_USER_CONFIG "${CMAKE_CURRENT_BINARY_DIR}/boost-user-config.jam")
+    file(WRITE ${BOOST_USER_CONFIG}
+         "using ${BOOST_TOOLSET} : : \"${CMAKE_CXX_COMPILER}\" ;\n")
 
     externalproject_add(boost_ep
                         URL ${BOOST_SOURCE_URL}
@@ -969,14 +983,17 @@ macro(build_boost)
                                       -sZLIB_INCLUDE=${ZLIB_INCLUDE_DIR}
                                       -sZLIB_LIBRARY_PATH=${ZLIB_PREFIX}/lib
                                       runtime-link=shared threading=multi variant=release
-                                      cxxflags=${BOOST_CXX_FLAGS} install
+                                      --user-config=${BOOST_USER_CONFIG}
+                                      toolset=${BOOST_TOOLSET} cxxflags=${EP_CXX_FLAGS}
+                                      linkflags=${EP_CXX_FLAGS} install
                         INSTALL_COMMAND bash -c
                                         "mkdir -p ${BOOST_INSTALL}/include/boost && cp -r ${BOOST_PREFIX}/src/boost_ep/libs/*/include/boost/* ${BOOST_INSTALL}/include/boost && cp -r ${BOOST_PREFIX}/src/boost_ep/libs/*/*/include/boost/* ${BOOST_INSTALL}/include/boost"
                         DEPENDS zlib
                         BUILD_BYPRODUCTS ${BOOST_BYPRODUCTS}
                         LOG_DOWNLOAD ON
                         LOG_CONFIGURE ON
-                        LOG_BUILD ON)
+                        LOG_BUILD ON
+                        LOG_OUTPUT_ON_FAILURE ON)
 
     include_directories(SYSTEM ${BOOST_INCLUDE_DIR})
 
@@ -1120,17 +1137,9 @@ macro(build_zstd)
         "${ZSTD_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${ZSTD_STATIC_LIB_NAME}${CMAKE_STATIC_LIBRARY_SUFFIX}"
     )
     set(ZSTD_LIBRARIES ${ZSTD_STATIC_LIB})
-    set(ZSTD_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} -Wno-error")
-    set(ZSTD_CMAKE_C_FLAGS "${EP_C_FLAGS} -Wno-error")
-    string(REPLACE "-Werror" "" ZSTD_CMAKE_CXX_FLAGS ${ZSTD_CMAKE_CXX_FLAGS})
 
-    set(ZSTD_CMAKE_ARGS
-        ${EP_COMMON_CMAKE_ARGS}
-        -DCMAKE_INSTALL_PREFIX=${ZSTD_PREFIX}
-        "-DCMAKE_CXX_FLAGS=${ZSTD_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_C_FLAGS=${ZSTD_CMAKE_C_FLAGS}"
-        -DZSTD_BUILD_SHARED=OFF
-        -DZSTD_BUILD_PROGRAMS=OFF)
+    set(ZSTD_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} -DCMAKE_INSTALL_PREFIX=${ZSTD_PREFIX}
+                        -DZSTD_BUILD_SHARED=OFF -DZSTD_BUILD_PROGRAMS=OFF)
 
     set(ZSTD_CONFIGURE SOURCE_SUBDIR "build/cmake" CMAKE_ARGS ${ZSTD_CMAKE_ARGS})
     externalproject_add(zstd_ep
@@ -1270,14 +1279,8 @@ macro(build_jindosdk_nextarch)
     get_target_property(JINDOSDK_C_LIBRARY_LOCATION jindosdk::c_sdk IMPORTED_LOCATION)
     get_filename_component(JINDOSDK_C_DIR_ROOT "${JINDOSDK_C_INCLUDE_DIR}" DIRECTORY)
 
-    # Compile flags for jindosdk-nextarch
-    set(JINDOSDK_NEXTARCH_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS}")
-    set(JINDOSDK_NEXTARCH_CMAKE_C_FLAGS "${EP_C_FLAGS}")
     set(JINDOSDK_NEXTARCH_CMAKE_ARGS
-        ${EP_COMMON_CMAKE_ARGS}
-        "-DCMAKE_INSTALL_PREFIX=${JINDOSDK_NEXTARCH_PREFIX}"
-        "-DCMAKE_CXX_FLAGS=${JINDOSDK_NEXTARCH_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_C_FLAGS=${JINDOSDK_NEXTARCH_CMAKE_C_FLAGS}"
+        ${EP_COMMON_CMAKE_ARGS} "-DCMAKE_INSTALL_PREFIX=${JINDOSDK_NEXTARCH_PREFIX}"
         -DJINDOSDK_ROOT=${JINDOSDK_C_DIR_ROOT}
         -DJINDOSDK_LIBRARY_NAME=${JINDOSDK_C_DYNAMIC_LIB_NAME})
 
@@ -1296,7 +1299,8 @@ macro(build_jindosdk_nextarch)
                           PROPERTIES IMPORTED_LOCATION "${JINDOSDK_NEXTARCH_STATIC_LIB}"
                                      INTERFACE_INCLUDE_DIRECTORIES
                                      "${JINDOSDK_NEXTARCH_INCLUDE_DIR}")
-    target_link_libraries(jindosdk::nextarch INTERFACE jindosdk::c_sdk pthread dl)
+    target_link_libraries(jindosdk::nextarch INTERFACE jindosdk::c_sdk pthread
+                                                       ${CMAKE_DL_LIBS})
     list(APPEND JINDOSDK_INCLUDE_DIR ${JINDOSDK_NEXTARCH_INCLUDE_DIR})
 
     add_dependencies(jindosdk::nextarch jindosdk-nextarch_ep)
@@ -1318,6 +1322,26 @@ macro(build_protobuf)
     get_target_property(THIRDPARTY_ZLIB_INCLUDE_DIR zlib INTERFACE_INCLUDE_DIRECTORIES)
     get_filename_component(THIRDPARTY_ZLIB_ROOT "${THIRDPARTY_ZLIB_INCLUDE_DIR}"
                            DIRECTORY)
+    get_target_property(THIRDPARTY_ZLIB_LIBRARY zlib IMPORTED_LOCATION)
+    set(PROTOBUF_ZLIB_LIBRARY_ARGS)
+    foreach(_PAIMON_ZLIB_LOCATION_PROPERTY
+            IMPORTED_LOCATION
+            IMPORTED_LOCATION_NOCONFIG
+            IMPORTED_LOCATION_RELEASE
+            IMPORTED_LOCATION_DEBUG
+            IMPORTED_LOCATION_RELWITHDEBINFO
+            IMPORTED_LOCATION_MINSIZEREL)
+        if(NOT THIRDPARTY_ZLIB_LIBRARY AND TARGET ZLIB::ZLIB)
+            get_target_property(THIRDPARTY_ZLIB_LIBRARY ZLIB::ZLIB
+                                ${_PAIMON_ZLIB_LOCATION_PROPERTY})
+        endif()
+    endforeach()
+    unset(_PAIMON_ZLIB_LOCATION_PROPERTY)
+    if(THIRDPARTY_ZLIB_LIBRARY)
+        set(PROTOBUF_ZLIB_LIBRARY_ARGS
+            "-DZLIB_LIBRARY=${THIRDPARTY_ZLIB_LIBRARY}"
+            "-DZLIB_LIBRARY_RELEASE=${THIRDPARTY_ZLIB_LIBRARY}")
+    endif()
 
     # Strip lto flags (which may be added by dh_auto_configure)
     # See https://github.com/protocolbuffers/protobuf/issues/7092
@@ -1337,6 +1361,7 @@ macro(build_protobuf)
         "-DZLIB_ROOT=${THIRDPARTY_ZLIB_ROOT}"
         -Dprotobuf_BUILD_TESTS=OFF
         -Dprotobuf_DEBUG_POSTFIX=)
+    list(APPEND PROTOBUF_CMAKE_ARGS ${PROTOBUF_ZLIB_LIBRARY_ARGS})
     set(PROTOBUF_CONFIGURE SOURCE_SUBDIR "cmake" CMAKE_ARGS ${PROTOBUF_CMAKE_ARGS})
 
     externalproject_add(protobuf_ep
@@ -1386,14 +1411,9 @@ macro(build_avro)
     get_target_property(AVRO_FMT_INCLUDE_DIR fmt INTERFACE_INCLUDE_DIRECTORIES)
     get_filename_component(AVRO_FMT_ROOT "${AVRO_FMT_INCLUDE_DIR}" DIRECTORY)
 
-    set(AVRO_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} -Wno-error")
-    set(AVRO_CMAKE_C_FLAGS "${EP_C_FLAGS} -Wno-error")
-
     set(AVRO_CMAKE_ARGS
         ${EP_COMMON_CMAKE_ARGS}
         "-DCMAKE_INSTALL_PREFIX=${AVRO_PREFIX}"
-        "-DCMAKE_CXX_FLAGS=${AVRO_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_C_FLAGS=${AVRO_CMAKE_C_FLAGS}"
         "-DAVRO_BUILD_TESTS=OFF"
         "-DAVRO_BUILD_EXECUTABLES=OFF"
         "-DZLIB_ROOT=${AVRO_ZLIB_ROOT}"
@@ -1441,13 +1461,14 @@ macro(build_orc)
     message(STATUS "PAIMON_RPATH value: ${PAIMON_RPATH}")
     set(ORC_RPATH ${PAIMON_RPATH})
     message(STATUS "ORC_RPATH value: ${ORC_RPATH}")
-
-    string(REPLACE "-Werror" "" EP_CXX_FLAGS ${EP_CXX_FLAGS})
-
-    set(ORC_CMAKE_CXX_FLAGS
-        "${EP_CXX_FLAGS} -fPIC -Wno-error ${CMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}}")
-    set(ORC_CMAKE_C_FLAGS
-        "${EP_C_FLAGS} -fPIC -Wno-error ${CMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}}")
+    set(ORC_LINKER_FLAGS)
+    if(NOT "${ORC_RPATH}" STREQUAL "")
+        list(APPEND
+             ORC_LINKER_FLAGS
+             "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath=${ORC_RPATH}"
+             "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath=${ORC_RPATH}"
+             "-DCMAKE_MODULE_LINKER_FLAGS=-Wl,-rpath=${ORC_RPATH}")
+    endif()
 
     set(ORC_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/orc_ep-prefix")
     set(ORC_INCLUDE_DIR "${ORC_PREFIX}/include")
@@ -1456,19 +1477,10 @@ macro(build_orc)
 
     set(ORC_STATIC_LIB "${ORC_PREFIX}/lib/liborc.a")
 
-    message("ORC_STATIC_LIB IS ${ORC_STATIC_LIB}")
-    message("ORC_CMAKE_CXX_FLAGS ${ORC_CMAKE_CXX_FLAGS}")
-    message("ORC_CMAKE_C_FLAGS ${ORC_CMAKE_C_FLAGS}")
-
     set(ORC_CMAKE_ARGS
         ${EP_COMMON_CMAKE_ARGS}
         "-DCMAKE_INSTALL_PREFIX=${ORC_PREFIX}"
-        "-DCMAKE_CXX_FLAGS=${ORC_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_C_FLAGS=${ORC_CMAKE_C_FLAGS}"
-        "-DCMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}=${ORC_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_EXE_LINKER_FLAGS=-Wl,-rpath=${ORC_RPATH}"
-        "-DCMAKE_SHARED_LINKER_FLAGS=-Wl,-rpath=${ORC_RPATH}"
-        "-DCMAKE_MODULE_LINKER_FLAGS=-Wl,-rpath=${ORC_RPATH}"
+        ${ORC_LINKER_FLAGS}
         "-DSNAPPY_HOME=${ORC_SNAPPY_ROOT}"
         "-DLZ4_HOME=${ORC_LZ4_ROOT}"
         "-DZSTD_HOME=${ORC_ZSTD_ROOT}"
@@ -1533,9 +1545,7 @@ macro(build_arrow)
     get_target_property(ARROW_RE2_INCLUDE_DIR re2::re2 INTERFACE_INCLUDE_DIRECTORIES)
     get_filename_component(ARROW_RE2_ROOT "${ARROW_RE2_INCLUDE_DIR}" DIRECTORY)
 
-    set(ARROW_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} -Wno-error")
-    set(ARROW_CMAKE_C_FLAGS "${EP_C_FLAGS} -Wno-error")
-    string(REPLACE "-Werror" "" ARROW_CMAKE_CXX_FLAGS ${ARROW_CMAKE_CXX_FLAGS})
+    set(ARROW_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS}")
     # Fix for thrift Mutex.h missing #include <cstdint> (GCC 15 strictness)
     # Use -include to force include cstdint for all C++ files
     string(APPEND ARROW_CMAKE_CXX_FLAGS " -include cstdint")
@@ -1570,8 +1580,7 @@ macro(build_arrow)
         ${EP_COMMON_CMAKE_ARGS}
         "-DCMAKE_INSTALL_PREFIX=${ARROW_PREFIX}"
         "-DCMAKE_CXX_FLAGS=${ARROW_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_C_FLAGS=${ARROW_CMAKE_C_FLAGS}"
-        "-DCMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}=${ARROW_CMAKE_CXX_FLAGS}"
+        -DARROW_DEPENDENCY_SOURCE=BUNDLED
         -DARROW_DEPENDENCY_USE_SHARED=OFF
         -DARROW_BUILD_SHARED=OFF
         -DARROW_BUILD_STATIC=ON
@@ -1595,6 +1604,12 @@ macro(build_arrow)
         -DARROW_WITH_ZSTD=ON
         -DARROW_WITH_BZ2=OFF
         -DARROW_WITH_BROTLI=ON
+        -Dzstd_SOURCE=SYSTEM
+        -DSnappy_SOURCE=SYSTEM
+        -Dlz4_SOURCE=SYSTEM
+        -DZLIB_SOURCE=SYSTEM
+        -Dre2_SOURCE=SYSTEM
+        -Dzstd_ROOT=${ARROW_ZSTD_ROOT}
         -DZSTD_ROOT=${ARROW_ZSTD_ROOT}
         -DZLIB_ROOT=${ARROW_ZLIB_ROOT}
         -DSnappy_ROOT=${ARROW_SNAPPY_ROOT}
@@ -1626,40 +1641,30 @@ macro(build_arrow)
     add_library(arrow STATIC IMPORTED)
     set_target_properties(arrow
                           PROPERTIES IMPORTED_LOCATION "${ARROW_PREFIX}/lib/libarrow.a"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}"
-                                     INTERFACE_LINK_DIRECTORIES
-                                     "${ARROW_BUILD_DIR}/${LOWERCASE_BUILD_TYPE}")
+                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}")
 
     add_library(arrow_dataset STATIC IMPORTED)
     set_target_properties(arrow_dataset
                           PROPERTIES IMPORTED_LOCATION
                                      "${ARROW_PREFIX}/lib/libarrow_dataset.a"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}"
-                                     INTERFACE_LINK_DIRECTORIES
-                                     "${ARROW_BUILD_DIR}/${LOWERCASE_BUILD_TYPE}")
+                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}")
 
     add_library(arrow_acero STATIC IMPORTED)
     set_target_properties(arrow_acero
                           PROPERTIES IMPORTED_LOCATION
                                      "${ARROW_PREFIX}/lib/libarrow_acero.a"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}"
-                                     INTERFACE_LINK_DIRECTORIES
-                                     "${ARROW_BUILD_DIR}/${LOWERCASE_BUILD_TYPE}")
+                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}")
 
     add_library(parquet STATIC IMPORTED)
     set_target_properties(parquet
                           PROPERTIES IMPORTED_LOCATION "${ARROW_PREFIX}/lib/libparquet.a"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}"
-                                     INTERFACE_LINK_DIRECTORIES
-                                     "${ARROW_BUILD_DIR}/${LOWERCASE_BUILD_TYPE}")
+                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}")
 
     add_library(arrow_bundled_dependencies STATIC IMPORTED)
     set_target_properties(arrow_bundled_dependencies
                           PROPERTIES IMPORTED_LOCATION
                                      "${ARROW_PREFIX}/lib/libarrow_bundled_dependencies.a"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}"
-                                     INTERFACE_LINK_DIRECTORIES
-                                     "${ARROW_BUILD_DIR}/${LOWERCASE_BUILD_TYPE}")
+                                     INTERFACE_INCLUDE_DIRECTORIES "${ARROW_INCLUDE_DIR}")
 
     add_dependencies(arrow arrow_ep)
     add_dependencies(parquet arrow_ep)
@@ -1671,13 +1676,19 @@ macro(build_arrow)
 
     target_link_libraries(arrow_dataset INTERFACE arrow_acero)
 
+    # libarrow.a calls dlsym; keep ${CMAKE_DL_LIBS} in the interface so -ldl is placed
+    # after libarrow.a on linkers that resolve symbols strictly left-to-right.
+    # Every library that uses dl itself (arrow here; also lucene and jindosdk::nextarch)
+    # declares it on its own interface the same way; consumers inherit it transitively
+    # and must not list ${CMAKE_DL_LIBS} again themselves.
     target_link_libraries(arrow
                           INTERFACE zstd
                                     snappy
                                     lz4
                                     zlib
                                     re2::re2
-                                    arrow_bundled_dependencies)
+                                    arrow_bundled_dependencies
+                                    ${CMAKE_DL_LIBS})
 
     target_link_libraries(parquet
                           INTERFACE zstd
@@ -1691,9 +1702,6 @@ endmacro(build_arrow)
 
 macro(build_gtest)
     message(STATUS "Building gtest from source")
-
-    set(GTEST_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} -Wno-error")
-    string(REPLACE "-Werror" "" GTEST_CMAKE_CXX_FLAGS ${GTEST_CMAKE_CXX_FLAGS})
 
     set(GTEST_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/googletest_ep-install")
     set(GTEST_INCLUDE_DIR "${GTEST_PREFIX}/include")
@@ -1715,10 +1723,7 @@ macro(build_gtest)
             "${GTEST_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}gtest_main.a")
     endif()
     set(GTEST_CMAKE_ARGS
-        ${EP_COMMON_CMAKE_ARGS}
-        "-DCMAKE_INSTALL_PREFIX=${GTEST_PREFIX}"
-        "-DCMAKE_CXX_FLAGS=${GTEST_CMAKE_CXX_FLAGS}"
-        "-DCMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}=${GTEST_CMAKE_CXX_FLAGS}"
+        ${EP_COMMON_CMAKE_ARGS} "-DCMAKE_INSTALL_PREFIX=${GTEST_PREFIX}"
         "-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY=${_GTEST_RUNTIME_DIR}"
         "-DCMAKE_RUNTIME_OUTPUT_DIRECTORY_${CMAKE_BUILD_TYPE}=${_GTEST_RUNTIME_DIR}")
 
@@ -1757,9 +1762,8 @@ endmacro()
 macro(build_tbb)
     message(STATUS "Building Tbb from source")
 
-    set(TBB_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS} -Wno-error")
-    set(TBB_CMAKE_C_FLAGS "${EP_C_FLAGS} -Wno-error")
-    string(REPLACE "-Werror" "" TBB_CMAKE_CXX_FLAGS ${TBB_CMAKE_CXX_FLAGS})
+    set(TBB_CMAKE_CXX_FLAGS "${EP_CXX_FLAGS}")
+    set(TBB_CMAKE_C_FLAGS "${EP_C_FLAGS}")
 
     string(REPLACE "-Wdocumentation" "" TBB_CMAKE_CXX_FLAGS ${TBB_CMAKE_CXX_FLAGS})
     string(REPLACE "-Wdocumentation" "" TBB_CMAKE_C_FLAGS ${TBB_CMAKE_C_FLAGS})
@@ -1782,7 +1786,6 @@ macro(build_tbb)
         "-DCMAKE_INSTALL_PREFIX=${TBB_PREFIX}"
         "-DCMAKE_CXX_FLAGS=${TBB_CMAKE_CXX_FLAGS}"
         "-DCMAKE_C_FLAGS=${TBB_CMAKE_C_FLAGS}"
-        "-DCMAKE_CXX_FLAGS_${UPPERCASE_BUILD_TYPE}=${TBB_CMAKE_CXX_FLAGS}"
         -DTBB_TEST=OFF)
 
     externalproject_add(tbb_ep
@@ -1794,15 +1797,58 @@ macro(build_tbb)
     add_library(tbb STATIC IMPORTED)
     set_target_properties(tbb
                           PROPERTIES IMPORTED_LOCATION "${TBB_STATIC_LIB}"
-                                     INTERFACE_INCLUDE_DIRECTORIES "${TBB_INCLUDE_DIR}"
-                                     INTERFACE_LINK_DIRECTORIES
-                                     "${TBB_BUILD_DIR}/${LOWERCASE_BUILD_TYPE}")
+                                     INTERFACE_INCLUDE_DIRECTORIES "${TBB_INCLUDE_DIR}")
     add_dependencies(tbb tbb_ep)
 
 endmacro(build_tbb)
 
+macro(build_benchmark)
+    message(STATUS "Building benchmark from source")
+
+    set(BENCHMARK_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/benchmark_ep-install")
+    set(BENCHMARK_INCLUDE_DIR "${BENCHMARK_PREFIX}/include")
+    set(BENCHMARK_STATIC_LIB
+        "${BENCHMARK_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}benchmark${CMAKE_STATIC_LIBRARY_SUFFIX}"
+    )
+    set(BENCHMARK_MAIN_STATIC_LIB
+        "${BENCHMARK_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}benchmark_main${CMAKE_STATIC_LIBRARY_SUFFIX}"
+    )
+
+    set(BENCHMARK_CMAKE_ARGS
+        ${EP_COMMON_CMAKE_ARGS}
+        "-DCMAKE_INSTALL_PREFIX=${BENCHMARK_PREFIX}"
+        -DBENCHMARK_ENABLE_TESTING=OFF
+        -DBENCHMARK_ENABLE_GTEST_TESTS=OFF
+        -DBENCHMARK_DOWNLOAD_DEPENDENCIES=OFF)
+
+    externalproject_add(benchmark_ep
+                        URL ${BENCHMARK_SOURCE_URL}
+                        URL_HASH "SHA256=${PAIMON_BENCHMARK_BUILD_SHA256_CHECKSUM}"
+                        CMAKE_ARGS ${BENCHMARK_CMAKE_ARGS}
+                        BUILD_BYPRODUCTS "${BENCHMARK_STATIC_LIB}"
+                                         "${BENCHMARK_MAIN_STATIC_LIB}")
+
+    file(MAKE_DIRECTORY "${BENCHMARK_INCLUDE_DIR}")
+
+    add_library(benchmark::benchmark STATIC IMPORTED)
+    set_target_properties(benchmark::benchmark
+                          PROPERTIES IMPORTED_LOCATION "${BENCHMARK_STATIC_LIB}"
+                                     INTERFACE_INCLUDE_DIRECTORIES
+                                     "${BENCHMARK_INCLUDE_DIR}")
+    add_dependencies(benchmark::benchmark benchmark_ep)
+
+    add_library(benchmark::benchmark_main STATIC IMPORTED)
+    set_target_properties(benchmark::benchmark_main
+                          PROPERTIES IMPORTED_LOCATION "${BENCHMARK_MAIN_STATIC_LIB}"
+                                     INTERFACE_INCLUDE_DIRECTORIES
+                                     "${BENCHMARK_INCLUDE_DIR}")
+    add_dependencies(benchmark::benchmark_main benchmark_ep)
+endmacro()
+
 macro(build_glog)
     message(STATUS "Building glog from source")
+    find_library(LIBUNWIND_LIBRARY NAMES unwind)
+
     set(GLOG_PREFIX "${CMAKE_CURRENT_BINARY_DIR}/glog_ep-install")
     set(GLOG_INCLUDE_DIR "${GLOG_PREFIX}/include")
     if(${UPPERCASE_BUILD_TYPE} STREQUAL "DEBUG")
@@ -1811,20 +1857,12 @@ macro(build_glog)
         set(GLOG_LIB_SUFFIX "")
     endif()
     set(GLOG_STATIC_LIB "${GLOG_PREFIX}/lib/libglog${GLOG_LIB_SUFFIX}.a")
-    set(GLOG_CMAKE_CXX_FLAGS " -Wno-error ${EP_CXX_FLAGS}")
-    set(GLOG_CMAKE_C_FLAGS " -Wno-error ${EP_C_FLAGS}")
-    if(CMAKE_THREAD_LIBS_INIT)
-        string(APPEND GLOG_CMAKE_CXX_FLAGS " ${CMAKE_THREAD_LIBS_INIT}")
-        string(APPEND GLOG_CMAKE_C_FLAGS " ${CMAKE_THREAD_LIBS_INIT}")
-    endif()
 
-    set(GLOG_CMAKE_ARGS
-        ${EP_COMMON_CMAKE_ARGS}
-        -DCMAKE_INSTALL_PREFIX=${GLOG_PREFIX}
-        -DWITH_GFLAGS=OFF
-        -DWITH_GTEST=OFF
-        -DCMAKE_CXX_FLAGS=${GLOG_CMAKE_CXX_FLAGS}
-        -DCMAKE_C_FLAGS=${GLOG_CMAKE_C_FLAGS})
+    set(GLOG_CMAKE_ARGS ${EP_COMMON_CMAKE_ARGS} -DCMAKE_INSTALL_PREFIX=${GLOG_PREFIX}
+                        -DWITH_GFLAGS=OFF -DWITH_GTEST=OFF)
+    if(NOT LIBUNWIND_LIBRARY)
+        list(APPEND GLOG_CMAKE_ARGS -DWITH_UNWIND=none)
+    endif()
 
     externalproject_add(glog_ep
                         URL ${GLOG_SOURCE_URL}
@@ -1842,7 +1880,6 @@ macro(build_glog)
 
     add_dependencies(glog glog_ep)
 
-    find_library(LIBUNWIND_LIBRARY NAMES unwind)
     if(LIBUNWIND_LIBRARY)
         target_link_libraries(glog INTERFACE ${LIBUNWIND_LIBRARY})
     endif()
@@ -1869,9 +1906,16 @@ if(PAIMON_ENABLE_ORC)
     resolve_dependency(Protobuf)
     resolve_dependency(ORC)
 endif()
+if(PAIMON_BUILD_BENCHMARKS)
+    resolve_dependency(benchmark)
+endif()
 if(PAIMON_ENABLE_JINDO)
     build_jindosdk_c()
     build_jindosdk_nextarch()
+endif()
+if(PAIMON_ENABLE_S3)
+    include(BuildAwsAuth)
+    build_aws_auth()
 endif()
 if(PAIMON_ENABLE_LUMINA)
     build_lumina()
@@ -1879,5 +1923,9 @@ endif()
 if(PAIMON_ENABLE_LUCENE)
     build_boost()
     build_lucene()
+endif()
+# jieba (dict + headers) is needed by BOTH lucene-fts and the tantivy jieba
+# tokenizer; build it whenever either backend is on, not only under lucene.
+if(PAIMON_ENABLE_LUCENE OR PAIMON_ENABLE_TANTIVY)
     build_jieba()
 endif()

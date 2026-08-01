@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <functional>
 #include <map>
 #include <optional>
 #include <set>
@@ -30,9 +31,12 @@
 #include <utility>
 
 #include "arrow/type.h"
+#include "arrow/util/checked_cast.h"
 #include "fmt/format.h"
 #include "fmt/ranges.h"
 #include "paimon/common/data/blob_utils.h"
+#include "paimon/common/data/shredding/map_shared_shredding_utils.h"
+#include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/object_utils.h"
@@ -41,6 +45,7 @@
 #include "paimon/core/core_options.h"
 #include "paimon/core/options/changelog_producer.h"
 #include "paimon/core/options/expire_config.h"
+#include "paimon/core/options/map_storage_layout.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/schema/arrow_schema_validator.h"
 #include "paimon/core/schema/table_schema.h"
@@ -49,10 +54,74 @@
 #include "paimon/result.h"
 
 namespace paimon {
+namespace {
+
+bool ContainsBlobField(const std::shared_ptr<arrow::Field>& field) {
+    if (BlobUtils::IsBlobField(field)) {
+        return true;
+    }
+    const std::shared_ptr<arrow::DataType>& type = field->type();
+    if (type->id() == arrow::Type::STRUCT) {
+        for (const auto& child : type->fields()) {
+            if (ContainsBlobField(child)) {
+                return true;
+            }
+        }
+    } else if (type->id() == arrow::Type::LIST) {
+        return ContainsBlobField(type->fields().front());
+    } else if (type->id() == arrow::Type::MAP) {
+        const auto& map_type = arrow::internal::checked_cast<const arrow::MapType&>(*type);
+        return ContainsBlobField(map_type.key_field()) || ContainsBlobField(map_type.item_field());
+    }
+    return false;
+}
+
+Status ValidateSharedShreddingCompression(const std::string& option_key,
+                                          const std::string& compression) {
+    std::string normalized = StringUtils::ToLowerCase(compression);
+    if (normalized != "none" && normalized != "lz4" && normalized != "zstd") {
+        return Status::Invalid(fmt::format(
+            "MAP shared-shredding only supports none/lz4/zstd compression, but {} is {}.",
+            option_key, compression));
+    }
+    return Status::OK();
+}
+
+Status ValidateSharedShreddingFileFormat(const std::string& option_key,
+                                         const std::string& file_format) {
+    std::string normalized = StringUtils::ToLowerCase(file_format);
+    if (normalized != "parquet" && normalized != "orc") {
+        return Status::Invalid(fmt::format(
+            "MAP shared-shredding only supports parquet/orc file formats, but {} is {}.",
+            option_key, file_format));
+    }
+    return Status::OK();
+}
+
+Status ValidatePerLevelOption(
+    const std::map<std::string, std::string>& options, const std::string& option_key,
+    const std::function<Status(const std::string&, const std::string&)>& validator) {
+    auto it = options.find(option_key);
+    if (it == options.end() || it->second.empty()) {
+        return Status::OK();
+    }
+    auto entries = StringUtils::Split(it->second, std::string(","));
+    for (const std::string& entry : entries) {
+        auto level_and_value = StringUtils::Split(entry, std::string(":"));
+        if (level_and_value.size() == 2) {
+            PAIMON_RETURN_NOT_OK(
+                validator(option_key + "." + level_and_value[0], level_and_value[1]));
+        }
+    }
+    return Status::OK();
+}
+
+}  // namespace
 
 bool SchemaValidation::IsComplexType(const std::shared_ptr<arrow::Field>& field) {
-    return (field->type()->id() == arrow::Type::TIMESTAMP ||
-            field->type()->id() == arrow::Type::DECIMAL || BlobUtils::IsBlobField(field));
+    arrow::Type::type arrow_type_id = field->type()->id();
+    return (arrow_type_id == arrow::Type::TIMESTAMP || arrow_type_id == arrow::Type::DECIMAL128 ||
+            BlobUtils::IsBlobField(field));
 }
 
 Status SchemaValidation::ValidateTableSchema(const TableSchema& schema) {
@@ -104,13 +173,9 @@ Status SchemaValidation::ValidateTableSchema(const TableSchema& schema) {
     // TODO(yonghao.fyh): check changelog num retain
     // TODO(yonghao.fyh): support file format validate data fields
     for (const auto& field_name : field_names) {
-        if (SpecialFields::IsSpecialFieldName(field_name)) {
+        if (SpecialFields::IsSystemField(field_name)) {
             return Status::Invalid(
                 fmt::format("field name '{}' in schema cannot be special field.", field_name));
-        }
-        if (StringUtils::StartsWith(field_name, SpecialFields::KEY_FIELD_PREFIX)) {
-            return Status::Invalid(fmt::format("field name '{}' in schema cannot start with '{}'.",
-                                               field_name, SpecialFields::KEY_FIELD_PREFIX));
         }
     }
     // TODO(yonghao.fyh): check streaming read overwrite
@@ -122,6 +187,7 @@ Status SchemaValidation::ValidateTableSchema(const TableSchema& schema) {
 
     PAIMON_RETURN_NOT_OK(ValidateRowTracking(schema, options));
     PAIMON_RETURN_NOT_OK(ValidateBlobFields(schema, options));
+    PAIMON_RETURN_NOT_OK(ValidateMapStorageLayout(schema, options));
     return Status::OK();
 }
 
@@ -449,13 +515,7 @@ Status SchemaValidation::ValidateBlobFields(const TableSchema& schema, const Cor
     const auto& configured_blob_names = options.GetBlobFields();
     const auto& blob_descriptor_names = options.GetBlobDescriptorFields();
     const auto& blob_view_names = options.GetBlobViewFields();
-    const auto& blob_external_storage_names = options.GetBlobExternalStorageFields();
-    std::vector<std::string> configured_blob_like_names = configured_blob_names;
-    configured_blob_like_names.insert(configured_blob_like_names.end(),
-                                      blob_descriptor_names.begin(), blob_descriptor_names.end());
-    configured_blob_like_names.insert(configured_blob_like_names.end(), blob_view_names.begin(),
-                                      blob_view_names.end());
-    if (configured_blob_like_names.empty() && blob_external_storage_names.empty()) {
+    if (configured_blob_names.empty() && blob_descriptor_names.empty() && blob_view_names.empty()) {
         return Status::OK();
     }
 
@@ -480,8 +540,6 @@ Status SchemaValidation::ValidateBlobFields(const TableSchema& schema, const Cor
     PAIMON_RETURN_NOT_OK(
         validate_blob_fields(blob_descriptor_names, Options::BLOB_DESCRIPTOR_FIELD));
     PAIMON_RETURN_NOT_OK(validate_blob_fields(blob_view_names, Options::BLOB_VIEW_FIELD));
-    PAIMON_RETURN_NOT_OK(
-        validate_blob_fields(blob_external_storage_names, Options::BLOB_EXTERNAL_STORAGE_FIELD));
 
     std::set<std::string> blob_descriptor_name_set(blob_descriptor_names.begin(),
                                                    blob_descriptor_names.end());
@@ -492,22 +550,104 @@ Status SchemaValidation::ValidateBlobFields(const TableSchema& schema, const Cor
                                                Options::BLOB_DESCRIPTOR_FIELD));
         }
     }
+    return Status::OK();
+}
 
-    for (const auto& blob_external_storage_name : blob_external_storage_names) {
-        if (blob_descriptor_name_set.count(blob_external_storage_name) == 0) {
+Status SchemaValidation::ValidateMapStorageLayout(const TableSchema& schema,
+                                                  const CoreOptions& options) {
+    // Extract all field names that have map.storage-layout configured from options
+    const std::string layout_suffix = std::string(".") + std::string(Options::MAP_STORAGE_LAYOUT);
+    const auto& options_map = options.ToMap();
+
+    std::unordered_map<std::string, std::shared_ptr<arrow::DataType>> schema_fields;
+    for (const auto& field : schema.Fields()) {
+        schema_fields[field.Name()] = field.Type();
+    }
+
+    std::string fields_prefix_str = std::string(Options::FIELDS_PREFIX);
+    bool has_shared_shredding = false;
+    for (const auto& [key, value] : options_map) {
+        if (!StringUtils::StartsWith(key, fields_prefix_str)) {
+            continue;
+        }
+        if (!StringUtils::EndsWith(key, layout_suffix)) {
+            continue;
+        }
+        // key = "fields.<field_name>.map.storage-layout"
+        // Extract field_name: skip "fields." prefix and ".map.storage-layout" suffix
+        std::string field_name =
+            key.substr(fields_prefix_str.size() + 1,
+                       key.size() - fields_prefix_str.size() - 1 - layout_suffix.size());
+
+        // Check field exists in schema
+        auto it = schema_fields.find(field_name);
+        if (it == schema_fields.end()) {
             return Status::Invalid(
-                fmt::format("Field '{}' in '{}' must also be in '{}'.", blob_external_storage_name,
-                            Options::BLOB_EXTERNAL_STORAGE_FIELD, Options::BLOB_DESCRIPTOR_FIELD));
+                fmt::format("Column '{}' is configured with map.storage-layout "
+                            "but does not exist in table schema.",
+                            field_name));
         }
-    }
-    if (!blob_external_storage_names.empty()) {
-        auto external_storage_path = options.GetBlobExternalStoragePath();
-        if (!external_storage_path || external_storage_path->empty()) {
-            return Status::Invalid(fmt::format("'{}' must be set when '{}' is configured.",
-                                               Options::BLOB_EXTERNAL_STORAGE_PATH,
-                                               Options::BLOB_EXTERNAL_STORAGE_FIELD));
+
+        // Any column configured with map.storage-layout must be a MAP type
+        const auto& field_type = it->second;
+        if (field_type->id() != arrow::Type::MAP) {
+            return Status::Invalid(
+                fmt::format("Column '{}' is configured with map.storage-layout "
+                            "but its type is not MAP.",
+                            field_name));
         }
+
+        PAIMON_ASSIGN_OR_RAISE(MapStorageLayout layout, options.GetMapStorageLayout(field_name));
+        if (layout != MapStorageLayout::SHARED_SHREDDING) {
+            continue;
+        }
+        has_shared_shredding = true;
+        for (const auto& field : schema.Fields()) {
+            if (VariantTypeUtils::ContainsVariantField(field.ArrowField())) {
+                return Status::Invalid(
+                    "MAP shared-shredding currently cannot be used with Variant fields.");
+            }
+        }
+        // Column configured with shared-shredding must be MAP<STRING, T>
+        if (!MapSharedShreddingUtils::IsShreddingKeyMap(field_type)) {
+            return Status::Invalid(
+                fmt::format("Column '{}' is configured with map.storage-layout=shared-shredding "
+                            "but its type is not MAP<STRING NOT NULL, T>.",
+                            field_name));
+        }
+        auto map_type = arrow::internal::checked_pointer_cast<arrow::MapType>(field_type);
+        if (map_type->key_field()->nullable()) {
+            return Status::Invalid(
+                fmt::format("Column '{}' is configured with map.storage-layout=shared-shredding "
+                            "but its map key type is nullable.",
+                            field_name));
+        }
+        if (ContainsBlobField(map_type->item_field())) {
+            return Status::Invalid("MAP shared-shredding currently cannot contain BLOB fields.");
+        }
+        // Validate max-columns config
+        PAIMON_RETURN_NOT_OK(options.GetMapSharedShreddingMaxColumns(field_name));
+        // Validate placement policy config
+        PAIMON_RETURN_NOT_OK(options.GetMapSharedShreddingColumnPlacementPolicy(field_name));
     }
+    if (!has_shared_shredding) {
+        return Status::OK();
+    }
+
+    if (IsPostponeBucketTable(schema, options.GetBucket())) {
+        return Status::Invalid(
+            "MAP shared-shredding currently does not support postpone bucket mode.");
+    }
+
+    PAIMON_RETURN_NOT_OK(ValidateSharedShreddingFileFormat(Options::FILE_FORMAT,
+                                                           options.GetFileFormat()->Identifier()));
+    PAIMON_RETURN_NOT_OK(ValidatePerLevelOption(options_map, Options::FILE_FORMAT_PER_LEVEL,
+                                                ValidateSharedShreddingFileFormat));
+    PAIMON_RETURN_NOT_OK(ValidateSharedShreddingCompression(Options::FILE_COMPRESSION,
+                                                            options.GetFileCompression()));
+    PAIMON_RETURN_NOT_OK(ValidatePerLevelOption(options_map, Options::FILE_COMPRESSION_PER_LEVEL,
+                                                ValidateSharedShreddingCompression));
+
     return Status::OK();
 }
 

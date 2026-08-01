@@ -18,6 +18,8 @@
 
 #include "paimon/core/mergetree/compact/lookup_merge_tree_compact_rewriter.h"
 
+#include <map>
+
 #include "paimon/common/table/special_fields.h"
 #include "paimon/core/mergetree/compact/first_row_merge_function_wrapper.h"
 #include "paimon/core/mergetree/compact/lookup_changelog_merge_function_wrapper.h"
@@ -90,6 +92,7 @@ LookupMergeTreeCompactRewriter<T>::Create(
     PAIMON_ASSIGN_OR_RAISE(
         std::unique_ptr<MergeFileSplitRead> merge_file_split_read,
         MergeFileSplitRead::Create(path_factory, internal_context, pool, CreateDefaultExecutor()));
+
     return std::unique_ptr<LookupMergeTreeCompactRewriter>(new LookupMergeTreeCompactRewriter(
         std::move(lookup_levels), dv_maintainer, max_level, partition, bucket, table_schema->Id(),
         trimmed_primary_keys, options, data_schema, write_schema, path_factory_cache,

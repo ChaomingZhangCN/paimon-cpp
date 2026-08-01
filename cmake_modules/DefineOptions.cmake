@@ -98,10 +98,20 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
 
     define_option(PAIMON_USE_CCACHE "Use ccache when compiling (if available)" ON)
 
+    define_option(PAIMON_USE_APPLE_LIBCXX_WITH_CLANG
+                  "Use Apple SDK libc++ headers when building with upstream Clang on macOS"
+                  ON)
+
     #----------------------------------------------------------------------
     set_option_category("Test")
 
     define_option(PAIMON_BUILD_TESTS "Build the Paimon googletest unit tests" OFF)
+
+    define_option(PAIMON_ENABLE_NETWORK_TESTS
+                  "Enable tests that access real remote services over the network" OFF)
+
+    define_option(PAIMON_BUILD_BENCHMARKS
+                  "Build the Paimon Google Benchmark performance benchmarks" OFF)
 
     if(PAIMON_BUILD_SHARED)
         set(PAIMON_TEST_LINKAGE_DEFAULT "shared")
@@ -233,6 +243,13 @@ if("${CMAKE_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_SOURCE_DIR}")
                          SYSTEM)
     define_option_string(GTest_SOURCE
                          "Dependency source for GoogleTest"
+                         ""
+                         AUTO
+                         BUNDLED
+                         SYSTEM)
+
+    define_option_string(benchmark_SOURCE
+                         "Dependency source for Google Benchmark"
                          ""
                          AUTO
                          BUNDLED

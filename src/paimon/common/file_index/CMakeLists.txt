@@ -44,7 +44,6 @@ add_paimon_lib(paimon_file_index
                arrow
                fmt
                xxhash
-               dl
                Threads::Threads
                SHARED_LINK_LIBS
                paimon_shared

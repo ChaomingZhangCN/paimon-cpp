@@ -24,6 +24,7 @@
 #include "arrow/api.h"
 #include "arrow/util/checked_cast.h"
 #include "gtest/gtest.h"
+#include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/string_utils.h"
 #include "paimon/fs/local/local_file_system.h"
@@ -134,6 +135,20 @@ TEST_F(TableSchemaTest, TestCreateWithAllFieldsHaveFieldId) {
     ASSERT_EQ(table_schema->PrimaryKeys(), primary_keys);
     ASSERT_EQ(table_schema->PartitionKeys(), partition_keys);
     ASSERT_EQ(table_schema->Options(), options);
+}
+
+TEST_F(TableSchemaTest, TestGetFieldTypeForVariant) {
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
+                                 VariantTypeUtils::ToArrowField("v")};
+    ASSERT_OK_AND_ASSIGN(auto table_schema,
+                         TableSchema::Create(/*schema_id=*/0, arrow::schema(fields),
+                                             /*partition_keys=*/{}, /*primary_keys=*/{},
+                                             /*options=*/{}));
+    ASSERT_OK_AND_ASSIGN(FieldType id_type, table_schema->GetFieldType("id"));
+    ASSERT_EQ(id_type, FieldType::INT);
+    // The variant marker must disambiguate the physical struct into FieldType::VARIANT.
+    ASSERT_OK_AND_ASSIGN(FieldType variant_type, table_schema->GetFieldType("v"));
+    ASSERT_EQ(variant_type, FieldType::VARIANT);
 }
 
 TEST_F(TableSchemaTest, TestInvalidCreate) {
@@ -1264,6 +1279,34 @@ TEST_F(TableSchemaTest, MapKeyMustBeNotNull) {
     })";
     ASSERT_NOK_WITH_MSG(TableSchema::CreateFromJson(table_schema_str),
                         "Map field 'f0' has a nullable key.");
+
+    auto nullable_key_map =
+        std::make_shared<arrow::MapType>(arrow::field("key", arrow::int8(), /*nullable=*/true),
+                                         arrow::field("value", arrow::int16()));
+    ASSERT_NOK_WITH_MSG(
+        TableSchema::Create(/*schema_id=*/0, arrow::schema({arrow::field("f0", nullable_key_map)}),
+                            /*partition_keys=*/{}, /*primary_keys=*/{}, /*options=*/{}),
+        "Map field 'f0' has a nullable key.");
+}
+
+TEST_F(TableSchemaTest, MapKeysSortedIsNormalized) {
+    auto sorted_map =
+        std::make_shared<arrow::MapType>(arrow::field("key", arrow::utf8(), /*nullable=*/false),
+                                         arrow::field("value", arrow::int64()),
+                                         /*keys_sorted=*/true);
+    ASSERT_OK_AND_ASSIGN(
+        auto table_schema,
+        TableSchema::Create(/*schema_id=*/0, arrow::schema({arrow::field("f0", sorted_map)}),
+                            /*partition_keys=*/{}, /*primary_keys=*/{}, /*options=*/{}));
+
+    auto map_type = std::static_pointer_cast<arrow::MapType>(table_schema->Fields()[0].Type());
+    ASSERT_FALSE(map_type->keys_sorted());
+
+    ASSERT_OK_AND_ASSIGN(std::string json, table_schema->ToJsonString());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableSchema> restored, TableSchema::CreateFromJson(json));
+    auto restored_map_type = std::static_pointer_cast<arrow::MapType>(restored->Fields()[0].Type());
+    ASSERT_FALSE(restored_map_type->keys_sorted());
+    ASSERT_TRUE(map_type->Equals(*restored_map_type));
 }
 
 TEST_F(TableSchemaTest, CrossPartitionUpdate) {

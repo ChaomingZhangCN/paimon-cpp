@@ -22,6 +22,13 @@ if(PAIMON_BUILD_TESTS)
                     test_utils_static
                     ${GTEST_LINK_TOOLCHAIN})
 
+    add_paimon_test(variant_table_inte_test
+                    STATIC_LINK_LIBS
+                    paimon_shared
+                    ${TEST_STATIC_LINK_LIBS}
+                    test_utils_static
+                    ${GTEST_LINK_TOOLCHAIN})
+
     add_paimon_test(data_evolution_table_test
                     STATIC_LINK_LIBS
                     paimon_shared
@@ -93,6 +100,20 @@ if(PAIMON_BUILD_TESTS)
                     ${GTEST_LINK_TOOLCHAIN})
 
     add_paimon_test(pk_compaction_inte_test
+                    STATIC_LINK_LIBS
+                    paimon_shared
+                    ${TEST_STATIC_LINK_LIBS}
+                    test_utils_static
+                    ${GTEST_LINK_TOOLCHAIN})
+
+    add_paimon_test(nested_column_pruning_inte_test
+                    STATIC_LINK_LIBS
+                    paimon_shared
+                    ${TEST_STATIC_LINK_LIBS}
+                    test_utils_static
+                    ${GTEST_LINK_TOOLCHAIN})
+
+    add_paimon_test(predicate_abi_inte_test
                     STATIC_LINK_LIBS
                     paimon_shared
                     ${TEST_STATIC_LINK_LIBS}

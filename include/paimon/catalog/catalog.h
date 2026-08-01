@@ -171,8 +171,9 @@ class PAIMON_EXPORT Catalog {
     /// @note This does not check whether the table actually exists.
     ///
     /// @param identifier The table identifier containing database and table name.
-    /// @return A string representing the expected location of the table.
-    virtual std::string GetTableLocation(const Identifier& identifier) const = 0;
+    /// @return A result containing the expected location of the table, or an error status on
+    /// failure.
+    virtual Result<std::string> GetTableLocation(const Identifier& identifier) const = 0;
 
     /// Returns the root path of the catalog.
     ///
@@ -183,6 +184,11 @@ class PAIMON_EXPORT Catalog {
     ///
     /// @return A shared pointer to the file system instance.
     virtual std::shared_ptr<FileSystem> GetFileSystem() const = 0;
+
+    /// Returns the catalog-level options that were passed during catalog creation.
+    ///
+    /// @return A const reference to the map of catalog options (key-value pairs).
+    virtual const std::map<std::string, std::string>& GetOptions() const = 0;
 
     /// Loads the latest schema of a specified table.
     ///

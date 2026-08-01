@@ -27,6 +27,7 @@ set(PAIMON_COMMON_SRCS
     common/data/binary_string.cpp
     common/data/blob.cpp
     common/data/blob_descriptor.cpp
+    common/data/blob_view_struct.cpp
     common/data/blob_utils.cpp
     common/data/columnar/columnar_array.cpp
     common/data/columnar/columnar_map.cpp
@@ -39,6 +40,24 @@ set(PAIMON_COMMON_SRCS
     common/data/serializer/row_compacted_serializer.cpp
     common/data/serializer/binary_serializer_utils.cpp
     common/data/timestamp.cpp
+    common/data/variant/generic_variant.cpp
+    common/data/variant/infer_variant_shredding_schema.cpp
+    common/data/variant/variant_shredding_inference_session.cpp
+    common/data/variant/variant.cpp
+    common/data/variant/variant_binary_util.cpp
+    common/data/variant/variant_builder.cpp
+    common/data/variant/variant_get.cpp
+    common/data/variant/variant_json_utils.cpp
+    common/data/variant/variant_path_segment.cpp
+    common/data/variant/variant_reassembler.cpp
+    common/data/variant/variant_shredding_batch_converter.cpp
+    common/data/variant/variant_access_utils.cpp
+    common/data/variant/variant_shredding_read_plan_factory.cpp
+    common/data/variant/variant_shredding_utils.cpp
+    common/data/variant/variant_shredding_write_plan.cpp
+    common/data/variant/variant_shredding_write_plan_factory.cpp
+    common/data/variant/variant_shredding_writer.cpp
+    common/data/variant/variant_type_utils.cpp
     common/defs.cpp
     common/executor/executor.cpp
     common/factories/singleton.cpp
@@ -67,6 +86,7 @@ set(PAIMON_COMMON_SRCS
     common/io/data_output_stream.cpp
     common/io/memory_segment_output_stream.cpp
     common/io/offset_input_stream.cpp
+    common/io/cache/cache.cpp
     common/io/cache/cache_key.cpp
     common/io/cache/cache_manager.cpp
     common/io/cache/lru_cache.cpp
@@ -104,6 +124,7 @@ set(PAIMON_COMMON_SRCS
     common/predicate/not_equal.cpp
     common/predicate/not_in.cpp
     common/predicate/or.cpp
+    common/predicate/predicate.cpp
     common/predicate/predicate_builder.cpp
     common/predicate/predicate_utils.cpp
     common/predicate/starts_with.cpp
@@ -112,6 +133,8 @@ set(PAIMON_COMMON_SRCS
     common/reader/predicate_batch_reader.cpp
     common/reader/prefetch_file_batch_reader_impl.cpp
     common/reader/reader_utils.cpp
+    common/reader/blob_fallback_batch_reader.cpp
+    common/reader/blob_view_resolving_batch_reader.cpp
     common/reader/complete_row_kind_batch_reader.cpp
     common/reader/data_evolution_file_reader.cpp
     common/sst/block_handle.cpp
@@ -137,6 +160,16 @@ set(PAIMON_COMMON_SRCS
     common/utils/bloom_filter64.cpp
     common/utils/crc32c.cpp
     common/utils/decimal_utils.cpp
+    common/data/shredding/map_shared_shredding_utils.cpp
+    common/data/shredding/map_shared_shredding_schema_utils.cpp
+    common/data/shredding/map_shared_shredding_write_plan_factory.cpp
+    common/data/shredding/shredding_write_plan_factories.cpp
+    common/data/shredding/map_shared_shredding_context.cpp
+    common/data/shredding/map_shared_shredding_batch_converter.cpp
+    common/data/shredding/map_shared_shredding_column_allocator.cpp
+    common/data/shredding/lru_map_shared_shredding_column_allocator.cpp
+    common/data/shredding/map_shared_shredding_file_reader.cpp
+    common/data/shredding/shredding_file_reader.cpp
     common/utils/delta_varint_compressor.cpp
     common/utils/fields_comparator.cpp
     common/utils/path_util.cpp
@@ -148,6 +181,12 @@ set(PAIMON_COMMON_SRCS
     common/utils/row_range_index.cpp
     common/utils/status.cpp
     common/utils/string_utils.cpp)
+
+if(PAIMON_ENABLE_S3)
+    list(APPEND PAIMON_COMMON_SRCS common/fs/http_client.cpp
+         common/fs/object_store_file_system.cpp)
+    set(PAIMON_OBJECT_STORE_LINK_LIBS CURL::libcurl)
+endif()
 
 set(PAIMON_CORE_SRCS
     core/disk/file_io_channel.cpp
@@ -161,6 +200,7 @@ set(PAIMON_CORE_SRCS
     core/bucket/hive_bucket_function.cpp
     core/bucket/mod_bucket_function.cpp
     core/bucket/bucket_id_calculator.cpp
+    core/casting/binary_to_blob_cast_executor.cpp
     core/casting/binary_to_string_cast_executor.cpp
     core/casting/boolean_to_decimal_cast_executor.cpp
     core/casting/boolean_to_numeric_cast_executor.cpp
@@ -203,6 +243,7 @@ set(PAIMON_CORE_SRCS
     core/index/index_file_handler.cpp
     core/index/global_index_meta.cpp
     core/index/index_file_meta_serializer.cpp
+    core/io/generic_row_to_arrow_array_converter.cpp
     core/io/meta_to_arrow_array_converter.cpp
     core/io/async_key_value_producer_and_consumer.cpp
     core/io/data_file_meta_09_serializer.cpp
@@ -212,17 +253,23 @@ set(PAIMON_CORE_SRCS
     core/io/data_file_meta.cpp
     core/io/data_file_meta_serializer.cpp
     core/io/data_file_path_factory.cpp
+    core/io/append_data_file_writer_factory.cpp
+    core/io/blob_data_file_writer_factory.cpp
+    core/io/data_file_writer_factory.cpp
     core/io/data_file_writer.cpp
     core/io/field_mapping_reader.cpp
     core/io/complete_row_tracking_fields_reader.cpp
     core/io/file_index_evaluator.cpp
     core/io/key_value_data_file_record_reader.cpp
+    core/io/key_value_data_file_writer_factory.cpp
     core/io/key_value_data_file_writer.cpp
     core/io/key_value_in_memory_record_reader.cpp
     core/io/merged_key_value_record_reader.cpp
     core/io/key_value_meta_projection_consumer.cpp
     core/io/key_value_projection_consumer.cpp
     core/io/key_value_projection_reader.cpp
+    core/io/shredding_append_data_file_writer_factory.cpp
+    core/io/shredding_key_value_data_file_writer_factory.cpp
     core/io/multiple_blob_file_writer.cpp
     core/io/rolling_blob_file_writer.cpp
     core/manifest/file_kind.cpp
@@ -263,6 +310,7 @@ set(PAIMON_CORE_SRCS
     core/mergetree/lookup_file.cpp
     core/mergetree/lookup_levels.cpp
     core/mergetree/lookup/remote_lookup_file_manager.cpp
+    core/mergetree/row_count_accumulator.cpp
     core/migrate/file_meta_utils.cpp
     core/operation/data_evolution_file_store_scan.cpp
     core/operation/data_evolution_split_read.cpp
@@ -270,6 +318,17 @@ set(PAIMON_CORE_SRCS
     core/operation/abstract_split_read.cpp
     core/operation/append_only_file_store_scan.cpp
     core/operation/append_only_file_store_write.cpp
+    core/operation/metrics/commit_metrics.cpp
+    core/operation/commit/conflict_detection.cpp
+    core/operation/commit/commit_scanner.cpp
+    core/operation/commit/commit_changes_provider.cpp
+    core/operation/commit/compacted_changelog_path_resolver.cpp
+    core/operation/commit/overwrite_changes_provider.cpp
+    core/operation/commit/row_id_column_conflict_checker.cpp
+    core/operation/commit/manifest_entry_changes.cpp
+    core/operation/commit/row_tracking_commit_utils.cpp
+    core/operation/commit/sequence_snapshot_properties.cpp
+    core/operation/commit/retry_waiter.cpp
     core/operation/commit_context.cpp
     core/operation/expire_snapshots.cpp
     core/operation/file_store_commit.cpp
@@ -287,6 +346,7 @@ set(PAIMON_CORE_SRCS
     core/operation/raw_file_split_read.cpp
     core/operation/read_context.cpp
     core/operation/scan_context.cpp
+    core/manifest/snapshot_live_manifest_entries.cpp
     core/operation/write_context.cpp
     core/operation/write_restore.cpp
     core/postpone/postpone_bucket_writer.cpp
@@ -301,9 +361,11 @@ set(PAIMON_CORE_SRCS
     core/stats/simple_stats.cpp
     core/stats/simple_stats_evolution.cpp
     core/table/table.cpp
+    core/table/bucket_mode.cpp
     core/table/sink/commit_message.cpp
     core/table/sink/commit_message_impl.cpp
     core/table/sink/commit_message_serializer.cpp
+    core/table/source/append_count_reader.cpp
     core/table/source/append_only_table_read.cpp
     core/table/source/split.cpp
     core/table/source/data_split_impl.cpp
@@ -311,6 +373,7 @@ set(PAIMON_CORE_SRCS
     core/table/source/data_table_stream_scan.cpp
     core/table/source/fallback_table_read.cpp
     core/table/source/key_value_table_read.cpp
+    core/table/source/pk_count_reader.cpp
     core/table/source/merge_tree_split_generator.cpp
     core/table/source/data_evolution_split_generator.cpp
     core/table/source/plan_impl.cpp
@@ -321,12 +384,19 @@ set(PAIMON_CORE_SRCS
     core/table/source/data_evolution_batch_scan.cpp
     core/table/system/audit_log_system_table.cpp
     core/table/system/binlog_system_table.cpp
-    core/table/system/options_system_table.cpp
+    core/table/system/global_system_tables.cpp
+    core/table/system/in_memory_system_table.cpp
+    core/table/system/metadata_system_tables.cpp
+    core/table/system/read_optimized_system_table.cpp
     core/table/system/system_table.cpp
     core/table/system/system_table_scan.cpp
     core/table/system/system_table_schema.cpp
     core/tag/tag.cpp
+    core/utils/branch_manager.cpp
+    core/utils/blob_view_lookup.cpp
+    core/utils/consumer_manager.cpp
     core/utils/field_mapping.cpp
+    core/utils/nested_projection_utils.cpp
     core/utils/file_store_path_factory.cpp
     core/utils/file_utils.cpp
     core/utils/manifest_meta_reader.cpp
@@ -349,16 +419,17 @@ add_paimon_lib(paimon
                xxhash
                Threads::Threads
                RapidJSON
+               ${PAIMON_OBJECT_STORE_LINK_LIBS}
                STATIC_LINK_LIBS
                arrow
                tbb
                glog
-               dl
                fmt
                roaring_bitmap
                xxhash
                Threads::Threads
                RapidJSON
+               ${PAIMON_OBJECT_STORE_LINK_LIBS}
                SHARED_LINK_FLAGS
                ${PAIMON_VERSION_SCRIPT_FLAGS})
 
@@ -401,7 +472,18 @@ if(PAIMON_BUILD_TESTS)
                     common/data/timestamp_test.cpp
                     common/data/blob_test.cpp
                     common/data/blob_descriptor_test.cpp
+                    common/data/blob_view_struct_test.cpp
                     common/data/blob_utils_test.cpp
+                    common/data/variant/generic_variant_test.cpp
+                    common/data/variant/infer_variant_shredding_schema_test.cpp
+                    common/data/variant/variant_access_utils_test.cpp
+                    common/data/variant/variant_shredding_read_plan_factory_test.cpp
+                    common/data/variant/variant_shredding_write_plan_factory_test.cpp
+                    common/data/variant/variant_get_test.cpp
+                    common/data/variant/variant_json_utils_test.cpp
+                    common/data/variant/variant_shredding_test.cpp
+                    common/data/variant/variant_test.cpp
+                    common/data/variant/variant_type_utils_test.cpp
                     common/executor/default_executor_test.cpp
                     common/format/column_stats_test.cpp
                     common/fs/external_path_provider_test.cpp
@@ -463,6 +545,8 @@ if(PAIMON_BUILD_TESTS)
                     common/reader/prefetch_file_batch_reader_impl_test.cpp
                     common/reader/reader_utils_test.cpp
                     common/reader/complete_row_kind_batch_reader_test.cpp
+                    common/reader/blob_fallback_batch_reader_test.cpp
+                    common/reader/blob_view_resolving_batch_reader_test.cpp
                     common/reader/data_evolution_file_reader_test.cpp
                     common/reader/data_evolution_array_test.cpp
                     common/reader/data_evolution_row_test.cpp
@@ -519,6 +603,15 @@ if(PAIMON_BUILD_TESTS)
                     common/utils/decimal_utils_test.cpp
                     common/utils/threadsafe_queue_test.cpp
                     common/utils/generic_lru_cache_test.cpp
+                    common/data/shredding/map_shared_shredding_utils_test.cpp
+                    common/data/shredding/map_shared_shredding_schema_utils_test.cpp
+                    common/data/shredding/map_shared_shredding_batch_converter_test.cpp
+                    common/data/shredding/lru_map_shared_shredding_column_allocator_test.cpp
+                    common/data/shredding/plain_map_shared_shredding_column_allocator_test.cpp
+                    common/data/shredding/sequential_map_shared_shredding_column_allocator_test.cpp
+                    common/data/shredding/map_shared_shredding_field_dict_test.cpp
+                    common/data/shredding/map_shared_shredding_context_test.cpp
+                    common/data/shredding/map_shared_shredding_file_reader_test.cpp
                     STATIC_LINK_LIBS
                     paimon_shared
                     test_utils_static
@@ -545,9 +638,7 @@ if(PAIMON_BUILD_TESTS)
                     STATIC_LINK_LIBS
                     paimon_shared
                     test_utils_static
-                    "-Wl,--whole-archive"
-                    paimon_local_file_system_static
-                    "-Wl,--no-whole-archive"
+                    ${PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS}
                     ${GTEST_LINK_TOOLCHAIN})
 
     add_paimon_test(core_test
@@ -587,6 +678,7 @@ if(PAIMON_BUILD_TESTS)
                     core/index/index_file_meta_serializer_test.cpp
                     core/index/index_file_handler_test.cpp
                     core/io/compact_increment_test.cpp
+                    core/io/infer_shredding_file_writer_test.cpp
                     core/io/concat_key_value_record_reader_test.cpp
                     core/io/data_file_meta_serializer_test.cpp
                     core/io/data_file_path_factory_test.cpp
@@ -661,13 +753,25 @@ if(PAIMON_BUILD_TESTS)
                     core/mergetree/spill_reader_writer_test.cpp
                     core/migrate/file_meta_utils_test.cpp
                     core/operation/metrics/compaction_metrics_test.cpp
+                    core/operation/metrics/commit_stats_test.cpp
                     core/operation/data_evolution_file_store_scan_test.cpp
                     core/operation/data_evolution_split_read_test.cpp
+                    core/operation/commit/compacted_changelog_path_resolver_test.cpp
+                    core/operation/commit/commit_changes_provider_test.cpp
+                    core/operation/commit/commit_scanner_test.cpp
+                    core/operation/commit/conflict_detection_test.cpp
+                    core/operation/commit/manifest_entry_changes_test.cpp
+                    core/operation/commit/overwrite_changes_provider_test.cpp
+                    core/operation/commit/row_id_column_conflict_checker_test.cpp
+                    core/operation/commit/row_tracking_commit_utils_test.cpp
+                    core/operation/commit/sequence_snapshot_properties_test.cpp
+                    core/operation/commit/retry_waiter_test.cpp
                     core/operation/key_value_file_store_write_test.cpp
                     core/operation/internal_read_context_test.cpp
                     core/operation/abstract_split_read_test.cpp
                     core/operation/append_only_file_store_write_test.cpp
                     core/operation/commit_metrics_test.cpp
+                    core/operation/commit_context_test.cpp
                     core/operation/expire_snapshots_test.cpp
                     core/operation/file_store_commit_impl_test.cpp
                     core/operation/file_store_commit_test.cpp
@@ -696,20 +800,28 @@ if(PAIMON_BUILD_TESTS)
                     core/stats/simple_stats_collector_test.cpp
                     core/stats/simple_stats_test.cpp
                     core/table/table_test.cpp
+                    core/table/bucket_mode_test.cpp
                     core/table/sink/commit_message_test.cpp
                     core/table/sink/commit_message_impl_test.cpp
                     core/table/source/fallback_data_split_test.cpp
                     core/table/source/table_read_test.cpp
+                    core/table/source/append_count_reader_test.cpp
+                    core/table/source/pk_count_reader_test.cpp
+                    core/table/source/data_evolution_batch_scan_test.cpp
                     core/table/source/data_split_test.cpp
                     core/table/source/deletion_file_test.cpp
                     core/table/source/split_generator_test.cpp
+                    core/table/source/snapshot/snapshot_reader_test.cpp
                     core/table/source/startup_mode_test.cpp
                     core/table/source/table_scan_test.cpp
                     core/table/system/system_table_test.cpp
                     core/tag/tag_test.cpp
+                    core/utils/blob_view_lookup_test.cpp
                     core/utils/branch_manager_test.cpp
+                    core/utils/consumer_manager_test.cpp
                     core/utils/file_store_path_factory_cache_test.cpp
                     core/utils/field_mapping_test.cpp
+                    core/utils/nested_projection_utils_test.cpp
                     core/utils/file_store_path_factory_test.cpp
                     core/utils/file_utils_test.cpp
                     core/utils/manifest_meta_reader_test.cpp
@@ -725,20 +837,42 @@ if(PAIMON_BUILD_TESTS)
                     ${TEST_STATIC_LINK_LIBS}
                     ${GTEST_LINK_TOOLCHAIN})
 
+    set(PAIMON_JINDO_FS_TEST_SOURCES)
+    set(PAIMON_JINDO_FS_TEST_LINK_LIBS)
+    if(PAIMON_ENABLE_JINDO)
+        # These unit tests do not access remote OSS.
+        list(APPEND PAIMON_JINDO_FS_TEST_SOURCES fs/jindo/jindo_file_system_unit_test.cpp
+             fs/jindo/jindo_utils_test.cpp)
+        if(PAIMON_ENABLE_NETWORK_TESTS)
+            # Factory and integration tests access real OSS.
+            list(APPEND PAIMON_JINDO_FS_TEST_SOURCES
+                 fs/jindo/jindo_file_system_factory_test.cpp
+                 fs/jindo/jindo_file_system_test.cpp)
+        endif()
+        list(APPEND PAIMON_JINDO_FS_TEST_LINK_LIBS
+             ${PAIMON_JINDO_FILE_SYSTEM_STATIC_LINK_LIBS})
+    endif()
+
+    set(PAIMON_OBJECT_STORE_FS_TEST_SOURCES)
+    if(PAIMON_ENABLE_S3)
+        list(APPEND PAIMON_OBJECT_STORE_FS_TEST_SOURCES
+             common/fs/object_store_file_system_test.cpp)
+    endif()
+
     add_paimon_test(fs_test
                     SOURCES
                     common/fs/file_system_test.cpp
                     common/fs/resolving_file_system_test.cpp
+                    ${PAIMON_OBJECT_STORE_FS_TEST_SOURCES}
                     fs/local/local_file_test.cpp
-                    # fs/jindo/jindo_file_system_factory_test.cpp
-                    # fs/jindo/jindo_file_system_test.cpp
+                    ${PAIMON_JINDO_FS_TEST_SOURCES}
                     STATIC_LINK_LIBS
                     paimon_shared
-                    "-Wl,--whole-archive"
-                    paimon_local_file_system_static
-                    # paimon_jindo_file_system_static
-                    "-Wl,--no-whole-archive"
+                    ${PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS}
+                    ${PAIMON_JINDO_FS_TEST_LINK_LIBS}
                     test_utils_static
-                    ${GTEST_LINK_TOOLCHAIN})
+                    ${GTEST_LINK_TOOLCHAIN}
+                    EXTRA_INCLUDES
+                    ${JINDOSDK_INCLUDE_DIR})
 
 endif()

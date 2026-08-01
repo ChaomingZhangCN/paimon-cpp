@@ -18,8 +18,8 @@
 
 #include "paimon/testing/mock/mock_format_writer.h"
 
+#include <map>
 #include <string>
-#include <utility>
 
 #include "arrow/c/helpers.h"
 #include "paimon/common/utils/date_time_utils.h"
@@ -35,13 +35,13 @@ class MemoryPool;
 namespace paimon::test {
 MockFormatWriter::MockFormatWriter(const std::shared_ptr<OutputStream>& out,
                                    const std::shared_ptr<MemoryPool>& pool)
-    : FormatWriter(), out_(std::move(out)), pool_(pool) {}
+    : FormatWriter(), out_(out), pool_(pool) {}
 
 Status MockFormatWriter::AddBatch(ArrowArray* batch) {
     ArrowArrayRelease(batch);
     std::string str = std::to_string(DateTimeUtils::GetCurrentUTCTimeUs()) + "\n";
-    PAIMON_ASSIGN_OR_RAISE(int32_t res, out_->Write(str.data(), str.size()));
-    if (res != static_cast<int32_t>(str.size())) {
+    PAIMON_ASSIGN_OR_RAISE(int64_t res, out_->Write(str.data(), str.size()));
+    if (res != static_cast<int64_t>(str.size())) {
         return Status::IOError("write size does not match");
     }
     counter_++;
@@ -58,6 +58,10 @@ Result<bool> MockFormatWriter::ReachTargetSize(bool suggested_check, int64_t tar
         return true;
     }
     return false;
+}
+
+Status MockFormatWriter::AddMetadata(const std::map<std::string, std::string>& /*metadata*/) {
+    return Status::NotImplemented("AddMetadata is not supported by mock format writer.");
 }
 
 }  // namespace paimon::test

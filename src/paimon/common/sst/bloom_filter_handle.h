@@ -18,11 +18,13 @@
 
 #pragma once
 
-#include <memory>
+#include <cstdint>
+#include <string>
 
-#include "paimon/common/memory/memory_segment.h"
 #include "paimon/memory/bytes.h"
+#include "paimon/memory/memory_segment.h"
 #include "paimon/result.h"
+#include "paimon/visibility.h"
 
 namespace paimon {
 

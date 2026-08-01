@@ -21,12 +21,15 @@
 #include <cassert>
 #include <cstdint>
 #include <functional>
+#include <map>
 #include <memory>
 #include <string>
 #include <utility>
 
 #include "arrow/c/abi.h"
+#include "arrow/c/bridge.h"
 #include "arrow/c/helpers.h"
+#include "arrow/ipc/api.h"
 #include "fmt/format.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/scope_guard.h"
@@ -40,6 +43,10 @@
 #include "paimon/record_batch.h"
 #include "paimon/result.h"
 #include "paimon/status.h"
+
+namespace arrow {
+class Schema;
+}  // namespace arrow
 
 namespace paimon {
 
@@ -92,6 +99,12 @@ class SingleFileWriter : public FileWriter<T, R> {
     void Abort() override;
     Status Close() override;
 
+    /// Sets a callback invoked only after the format writer and output stream have both
+    /// completed successfully.
+    void SetCompletionCallback(std::function<Status()> callback) {
+        completion_callback_ = std::move(callback);
+    }
+
     std::shared_ptr<Metrics> GetMetrics() const override {
         if (writer_) {
             return writer_->GetWriterMetrics();
@@ -99,20 +112,29 @@ class SingleFileWriter : public FileWriter<T, R> {
         return nullptr;
     }
 
-    Result<bool> ReachTargetSize(bool suggested_check, int64_t target_size);
+    virtual Result<bool> ReachTargetSize(bool suggested_check, int64_t target_size);
 
-    Result<AbortExecutor> GetAbortExecutor() const {
+    virtual Result<AbortExecutor> GetAbortExecutor() const {
         if (closed_ == false) {
             return Status::Invalid("Writer should be closed!");
         }
         return AbortExecutor(fs_, path_);
     }
 
-    std::string GetPath() const {
+    virtual std::string GetPath() const {
         return path_;
     }
 
  protected:
+    /// Hook called after Flush() and before Finish() during Close().
+    /// Subclasses can override to update per-field metadata before the file is finalized.
+    virtual Status BeforeFinish() {
+        return Status::OK();
+    }
+
+    /// Serializes schema and forwards it as file metadata to FormatWriter.
+    Status UpdateSchema(const std::shared_ptr<arrow::Schema>& schema);
+
     int64_t output_bytes_ = -1;
     std::string compression_;
     std::function<Status(T, ArrowArray*)> converter_;
@@ -120,6 +142,7 @@ class SingleFileWriter : public FileWriter<T, R> {
     std::shared_ptr<OutputStream> out_;  // nullptr for DirectWriterBuilder
     bool closed_ = false;
     std::string path_;
+    std::function<Status()> completion_callback_;
 
  private:
     int64_t record_count_ = 0;
@@ -201,16 +224,24 @@ Status SingleFileWriter<T, R>::Close() {
                         path_.c_str());
     });
     PAIMON_RETURN_NOT_OK(writer_->Flush());
+    PAIMON_RETURN_NOT_OK(BeforeFinish());
     PAIMON_RETURN_NOT_OK(writer_->Finish());
     if (out_) {
         PAIMON_RETURN_NOT_OK(out_->Flush());
         PAIMON_ASSIGN_OR_RAISE(output_bytes_, out_->GetPos());
-        PAIMON_RETURN_NOT_OK(out_->Close());
+        std::shared_ptr<OutputStream> out = std::move(out_);
+        PAIMON_RETURN_NOT_OK(out->Close());
     } else {
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStatus> file_status, fs_->GetFileStatus(path_));
         output_bytes_ = file_status->GetLen();
     }
+    // Completing the format writer and stream is terminal even if publication fails. The scope
+    // guard still removes the file on a callback error, while a repeated Close() does not publish
+    // the same file again.
     closed_ = true;
+    if (completion_callback_) {
+        PAIMON_RETURN_NOT_OK(completion_callback_());
+    }
     guard.Release();
     return Status::OK();
 }
@@ -221,9 +252,24 @@ Result<bool> SingleFileWriter<T, R>::ReachTargetSize(bool suggested_check, int64
 }
 
 template <typename T, typename R>
+Status SingleFileWriter<T, R>::UpdateSchema(const std::shared_ptr<arrow::Schema>& schema) {
+    if (!writer_) {
+        return Status::Invalid("Cannot update schema: format writer is not initialized.");
+    }
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Buffer> serialized,
+                                      arrow::ipc::SerializeSchema(*schema));
+    std::map<std::string, std::string> metadata;
+    metadata.emplace(ArrowUtils::kArrowSchemaMetadataKey,
+                     std::string(reinterpret_cast<const char*>(serialized->data()),
+                                 static_cast<size_t>(serialized->size())));
+    return writer_->AddMetadata(metadata);
+}
+
+template <typename T, typename R>
 void SingleFileWriter<T, R>::Abort() {
     if (out_) {
-        auto status = out_->Close();
+        std::shared_ptr<OutputStream> out = std::move(out_);
+        auto status = out->Close();
         if (!status.ok()) {
             PAIMON_LOG_WARN(logger_, "Exception occurs when closing %s: %s", path_.c_str(),
                             status.ToString().c_str());

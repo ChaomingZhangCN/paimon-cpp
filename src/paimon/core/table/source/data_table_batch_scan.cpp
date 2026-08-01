@@ -36,10 +36,15 @@ class DataSplit;
 
 DataTableBatchScan::DataTableBatchScan(bool pk_table, const CoreOptions& core_options,
                                        const std::shared_ptr<SnapshotReader>& snapshot_reader,
-                                       std::optional<int32_t> push_down_limit)
+                                       bool read_optimized, std::optional<int32_t> push_down_limit)
     : AbstractTableScan(core_options, snapshot_reader), push_down_limit_(push_down_limit) {
-    if (pk_table && (core_options.DeletionVectorsEnabled() ||
-                     core_options.GetMergeEngine() == MergeEngine::FIRST_ROW)) {
+    if (pk_table && read_optimized) {
+        int32_t top_level = core_options.GetNumLevels() - 1;
+        snapshot_reader_->WithLevelFilter(
+            [top_level](int32_t level) -> bool { return level == top_level; });
+        snapshot_reader_->EnableValueFilter();
+    } else if (pk_table && (core_options.DeletionVectorsEnabled() ||
+                            core_options.GetMergeEngine() == MergeEngine::FIRST_ROW)) {
         auto level_filter = [](int32_t level) -> bool { return level > 0; };
         snapshot_reader_->WithLevelFilter(level_filter);
         snapshot_reader_->EnableValueFilter();
@@ -83,9 +88,14 @@ Result<std::shared_ptr<Plan>> DataTableBatchScan::ApplyPushDownLimit(
             return Status::Invalid("DataSplit cannot cast to DataSplitImpl");
         }
         if (data_split->RawConvertible()) {
-            int64_t partial_merged_row_count = data_split->PartialMergedRowCount();
+            PAIMON_ASSIGN_OR_RAISE(std::optional<int64_t> partial_merged_row_count,
+                                   data_split->MergedRowCount());
+            if (!partial_merged_row_count.has_value()) {
+                // Cannot safely estimate split rows from metadata; skip push-down limit.
+                return current_scan_result->GetPlan();
+            }
             limited_data_splits.emplace_back(data_split);
-            scanned_row_count += partial_merged_row_count;
+            scanned_row_count += partial_merged_row_count.value();
             if (scanned_row_count >= push_down_limit_.value()) {
                 PAIMON_ASSIGN_OR_RAISE(int64_t snapshot_id, current_scan_result->SnapshotId());
                 return std::make_shared<PlanImpl>(snapshot_id, limited_data_splits);

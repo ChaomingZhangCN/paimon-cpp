@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -48,9 +49,11 @@ struct FieldMapping;
 
 class FieldMappingReader : public FileBatchReader {
  public:
-    FieldMappingReader(int32_t field_count, std::unique_ptr<FileBatchReader>&& reader,
-                       const BinaryRow& partition, std::unique_ptr<FieldMapping>&& mapping,
-                       const std::shared_ptr<MemoryPool>& pool);
+    static Result<std::unique_ptr<FieldMappingReader>> Create(
+        int32_t field_count, std::unique_ptr<FileBatchReader>&& reader, const BinaryRow& partition,
+        std::unique_ptr<FieldMapping>&& mapping,
+        std::set<int32_t>&& skip_map_selected_keys_filter_field_ids,
+        const std::shared_ptr<MemoryPool>& pool);
 
     Result<ReadBatch> NextBatch() override {
         return Status::Invalid(
@@ -76,8 +79,8 @@ class FieldMappingReader : public FileBatchReader {
         return Status::Invalid("FieldMappingReader does not support SetReadSchema");
     }
 
-    Result<uint64_t> GetPreviousBatchFirstRowNumber() const override {
-        return reader_->GetPreviousBatchFirstRowNumber();
+    Result<uint64_t> GetPreviousBatchFileRowId(uint64_t batch_row_id) const override {
+        return reader_->GetPreviousBatchFileRowId(batch_row_id);
     }
 
     Result<uint64_t> GetNumberOfRows() const override {
@@ -89,6 +92,10 @@ class FieldMappingReader : public FileBatchReader {
     }
 
  private:
+    FieldMappingReader(int32_t field_count, std::unique_ptr<FileBatchReader>&& reader,
+                       const BinaryRow& partition, std::unique_ptr<FieldMapping>&& mapping,
+                       const std::shared_ptr<MemoryPool>& pool);
+
     Result<std::shared_ptr<arrow::Array>> GenerateSinglePartitionArray(int32_t idx,
                                                                        int32_t batch_size) const;
 
@@ -98,11 +105,18 @@ class FieldMappingReader : public FileBatchReader {
     Result<std::shared_ptr<arrow::Array>> CastNonPartitionArrayIfNeed(
         const std::shared_ptr<arrow::Array>& src_array) const;
 
-    static void MappingFields(const std::shared_ptr<arrow::Array>& src_array,
-                              const std::vector<DataField>& read_fields_of_data_array,
-                              const std::vector<int32_t>& idx_in_target_schema,
-                              arrow::ArrayVector* target_array,
-                              std::vector<std::string>* target_field_names);
+    Status MappingFields(const std::shared_ptr<arrow::Array>& src_array,
+                         const std::vector<DataField>& read_fields_of_data_array,
+                         const std::vector<int32_t>& idx_in_target_schema,
+                         arrow::ArrayVector* target_array,
+                         std::vector<std::string>* target_field_names);
+
+    Result<bool> HasMapSelectedKeysRecursively(
+        const std::shared_ptr<arrow::Field>& read_field) const;
+
+    Result<std::shared_ptr<arrow::Array>> FilterMapSelectedKeysRecursively(
+        const std::shared_ptr<arrow::Array>& array,
+        const std::shared_ptr<arrow::Field>& read_field) const;
 
  private:
     bool need_mapping_ = false;
@@ -115,6 +129,7 @@ class FieldMappingReader : public FileBatchReader {
     std::optional<PartitionInfo> partition_info_;
     NonPartitionInfo non_partition_info_;
     std::optional<NonExistFieldInfo> non_exist_field_info_;
+    std::set<int32_t> skip_map_selected_keys_filter_field_ids_;
 
     std::shared_ptr<arrow::Array> partition_array_;
     std::shared_ptr<arrow::Array> non_exist_array_;

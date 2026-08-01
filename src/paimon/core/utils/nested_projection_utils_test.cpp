@@ -1,0 +1,737 @@
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one
+ * or more contributor license agreements.  See the NOTICE file
+ * distributed with this work for additional information
+ * regarding copyright ownership.  The ASF licenses this file
+ * to you under the Apache License, Version 2.0 (the
+ * "License"); you may not use this file except in compliance
+ * with the License.  You may obtain a copy of the License at
+ *
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
+ */
+
+#include "paimon/core/utils/nested_projection_utils.h"
+
+#include "arrow/array/array_dict.h"
+#include "arrow/array/array_nested.h"
+#include "arrow/array/builder_binary.h"
+#include "arrow/array/builder_dict.h"
+#include "arrow/array/builder_nested.h"
+#include "arrow/array/builder_primitive.h"
+#include "arrow/ipc/json_simple.h"
+#include "arrow/memory_pool.h"
+#include "arrow/type.h"
+#include "gtest/gtest.h"
+#include "paimon/common/data/variant/variant_access_utils.h"
+#include "paimon/common/data/variant/variant_type_utils.h"
+#include "paimon/common/types/data_field.h"
+#include "paimon/testing/utils/testharness.h"
+
+namespace paimon::test {
+
+// Helper: create an arrow::Field with paimon.id metadata
+static std::shared_ptr<arrow::Field> MakeField(const std::string& name,
+                                               const std::shared_ptr<arrow::DataType>& type,
+                                               int32_t paimon_id) {
+    DataField data_field(paimon_id, arrow::field(name, type));
+    return DataField::ConvertDataFieldToArrowField(data_field);
+}
+
+// Helper: a variant-access projection, i.e. a struct whose children carry `__VARIANT_METADATA`
+// descriptions.
+static std::shared_ptr<arrow::DataType> MakeVariantAccessType() {
+    auto child = arrow::field(
+        "0", arrow::int64(), /*nullable=*/true,
+        arrow::KeyValueMetadata::Make(
+            {DataField::DESCRIPTION},
+            {VariantAccessUtils::BuildVariantMetadata("$.x", /*fail_on_error=*/false, "UTC")}));
+    return arrow::struct_({child});
+}
+
+// ============== GetPaimonFieldId ==============
+
+TEST(NestedProjectionUtilsTest, GetPaimonFieldIdPresent) {
+    auto field = MakeField("col", arrow::int32(), 42);
+    ASSERT_OK_AND_ASSIGN(int32_t field_id, NestedProjectionUtils::GetPaimonFieldId(field));
+    ASSERT_EQ(field_id, 42);
+}
+
+TEST(NestedProjectionUtilsTest, GetPaimonFieldIdMissing) {
+    auto field = arrow::field("col", arrow::int32());
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::GetPaimonFieldId(field),
+                        "do not exist metadata in field");
+}
+
+// ============== FindFieldByPaimonId ==============
+
+TEST(NestedProjectionUtilsTest, FindFieldByPaimonIdFound) {
+    auto struct_type =
+        arrow::struct_({MakeField("x", arrow::int32(), 1), MakeField("y", arrow::utf8(), 2)});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Field> found,
+                         NestedProjectionUtils::FindFieldByPaimonId(struct_type, 2));
+    ASSERT_NE(found, nullptr);
+    ASSERT_EQ(found->name(), "y");
+}
+
+TEST(NestedProjectionUtilsTest, FindFieldByPaimonIdNotFound) {
+    auto struct_type = arrow::struct_({MakeField("x", arrow::int32(), 1)});
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::FindFieldByPaimonId(struct_type, 99),
+                        "cannot find field 99");
+}
+
+// ============== PruneDataType ==============
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeIdenticalTypes) {
+    auto type = arrow::int32();
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(type, type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(type));
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeAtomicType) {
+    // Different atomic types: return data_type
+    auto read_type = arrow::int64();
+    auto data_type = arrow::int32();
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(data_type));
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeStructPruneSubset) {
+    // data: STRUCT<x:INT(id=1), y:STRING(id=2), z:DOUBLE(id=3)>
+    // read: STRUCT<x:INT(id=1)>
+    // expected: STRUCT<x:INT(id=1)>
+    auto data_type =
+        arrow::struct_({MakeField("x", arrow::int32(), 1), MakeField("y", arrow::utf8(), 2),
+                        MakeField("z", arrow::float64(), 3)});
+    auto read_type = arrow::struct_({MakeField("x", arrow::int32(), 1)});
+
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value()->num_fields(), 1);
+    ASSERT_EQ(result.value()->field(0)->name(), "x");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeStructAllFieldsPruned) {
+    // data: STRUCT<x:INT(id=1)>
+    // read: STRUCT<y:INT(id=99)>  — no match
+    // expected: fail-fast (struct-internal schema evolution unsupported)
+    auto data_type = arrow::struct_({MakeField("x", arrow::int32(), 1)});
+    auto read_type = arrow::struct_({MakeField("y", arrow::int32(), 99)});
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "cannot find field 99 in struct type");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeNestedStruct) {
+    // data: STRUCT<inner:STRUCT<a:INT(id=10), b:STRING(id=11)>(id=1)>
+    // read: STRUCT<inner:STRUCT<a:INT(id=10)>(id=1)>
+    // expected: STRUCT<inner:STRUCT<a:INT(id=10)>(id=1)>
+    auto inner_data =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto data_type = arrow::struct_({MakeField("inner", inner_data, 1)});
+
+    auto inner_read = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto read_type = arrow::struct_({MakeField("inner", inner_read, 1)});
+
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result.value()->num_fields(), 1);
+    auto pruned_inner = result.value()->field(0)->type();
+    ASSERT_EQ(pruned_inner->num_fields(), 1);
+    ASSERT_EQ(pruned_inner->field(0)->name(), "a");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListWithStructElement) {
+    // data: LIST<STRUCT<a:INT(id=10), b:STRING(id=11)>>
+    // read: LIST<STRUCT<a:INT(id=10)>>
+    auto inner_data =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto data_type = arrow::list(arrow::field("item", inner_data));
+
+    auto inner_read = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto read_type = arrow::list(arrow::field("item", inner_read));
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "partial projection inside list");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeMapWithStructValue) {
+    // data: MAP<STRING, STRUCT<a:INT(id=10), b:STRING(id=11)>>
+    // read: MAP<STRING, STRUCT<a:INT(id=10)>>
+    auto inner_data =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto data_type = arrow::map(arrow::utf8(), inner_data);
+
+    auto inner_read = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto read_type = arrow::map(arrow::utf8(), inner_read);
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "partial projection inside map");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListWithVariantAccessElement) {
+    // data: LIST<VARIANT>, read: LIST<variant-access projection>
+    // Not a projection of the list itself, so it must pass through to the variant read plans.
+    auto data_type = arrow::list(arrow::field("element", VariantTypeUtils::UnshreddedStructType()));
+    auto read_type = arrow::list(arrow::field("element", MakeVariantAccessType()));
+
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<arrow::DataType>> pruned,
+                         NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(pruned.has_value());
+    ASSERT_TRUE(pruned.value()->Equals(*read_type)) << pruned.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeMapWithVariantAccessValue) {
+    auto data_type = arrow::map(arrow::utf8(), VariantTypeUtils::UnshreddedStructType());
+    auto read_type = arrow::map(arrow::utf8(), MakeVariantAccessType());
+
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<arrow::DataType>> pruned,
+                         NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(pruned.has_value());
+    ASSERT_TRUE(pruned.value()->Equals(*read_type)) << pruned.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListWithVariantAccessInsideStruct) {
+    // The variant sits one struct level below the list, next to a plain sibling that is kept.
+    auto data_inner = arrow::struct_({MakeField("v", VariantTypeUtils::UnshreddedStructType(), 10),
+                                      MakeField("t", arrow::utf8(), 11)});
+    auto read_inner = arrow::struct_(
+        {MakeField("v", MakeVariantAccessType(), 10), MakeField("t", arrow::utf8(), 11)});
+    auto data_type = arrow::list(arrow::field("element", data_inner));
+    auto read_type = arrow::list(arrow::field("element", read_inner));
+
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<arrow::DataType>> pruned,
+                         NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(pruned.has_value());
+    ASSERT_TRUE(pruned.value()->Equals(*read_type)) << pruned.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListDroppingSiblingOfVariantStillFails) {
+    // Dropping the plain sibling is a real partial projection inside the list and must keep
+    // failing fast, variant access or not.
+    auto data_inner = arrow::struct_({MakeField("v", VariantTypeUtils::UnshreddedStructType(), 10),
+                                      MakeField("t", arrow::utf8(), 11)});
+    auto read_inner = arrow::struct_({MakeField("v", MakeVariantAccessType(), 10)});
+    auto data_type = arrow::list(arrow::field("element", data_inner));
+    auto read_type = arrow::list(arrow::field("element", read_inner));
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "partial projection inside list");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListStructSchemaEvolutionAddedField) {
+    // Added field (id=12) inside the list's struct: return the file struct.
+    auto data_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto read_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11),
+                        MakeField("c", arrow::int32(), 12)});
+    auto data_type = arrow::list(arrow::field("item", data_inner));
+    auto read_type = arrow::list(arrow::field("item", read_inner));
+
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(*data_type)) << result.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeMapStructSchemaEvolutionAddedField) {
+    // Added field inside a MAP value.
+    auto data_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto read_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11),
+                        MakeField("c", arrow::int32(), 12)});
+    auto data_type = arrow::map(arrow::utf8(), data_inner);
+    auto read_type = arrow::map(arrow::utf8(), read_inner);
+
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(*data_type)) << result.value()->ToString();
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeListStructDropAndAddStillFails) {
+    // Dropping a file field (b) is a real partial projection -- keep failing.
+    auto data_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    auto read_inner =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("c", arrow::int32(), 12)});
+    auto data_type = arrow::list(arrow::field("item", data_inner));
+    auto read_type = arrow::list(arrow::field("item", read_inner));
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "partial projection inside list");
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeNullFillsAddedListStructField) {
+    auto* pool = arrow::default_memory_pool();
+    // file array: list<struct<a:int(10), b:string(11)>> = [ [{1,"x"},{2,"y"}], [{3,"z"}] ]
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({1, 2, 3}).ok());
+    std::shared_ptr<arrow::Array> a;
+    ASSERT_TRUE(ab.Finish(&a).ok());
+    arrow::StringBuilder bb(pool);
+    ASSERT_TRUE(bb.AppendValues({"x", "y", "z"}).ok());
+    std::shared_ptr<arrow::Array> b;
+    ASSERT_TRUE(bb.Finish(&b).ok());
+    auto data_struct_type =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11)});
+    std::shared_ptr<arrow::Array> struct_arr =
+        arrow::StructArray::Make({a, b}, data_struct_type->fields()).ValueOrDie();
+    arrow::Int32Builder offb(pool);
+    ASSERT_TRUE(offb.AppendValues({0, 2, 3}).ok());
+    std::shared_ptr<arrow::Array> offsets;
+    ASSERT_TRUE(offb.Finish(&offsets).ok());
+    std::shared_ptr<arrow::Array> list_arr =
+        arrow::ListArray::FromArrays(*offsets, *struct_arr, pool).ValueOrDie();
+
+    // read type adds c:int(12) inside the struct.
+    auto read_struct =
+        arrow::struct_({MakeField("a", arrow::int32(), 10), MakeField("b", arrow::utf8(), 11),
+                        MakeField("c", arrow::int32(), 12)});
+    auto read_type = arrow::list(arrow::field("item", read_struct));
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(list_arr, read_type, pool));
+    ASSERT_TRUE(aligned->type()->Equals(*read_type)) << aligned->type()->ToString();
+    auto out_struct = std::static_pointer_cast<arrow::StructArray>(
+        std::static_pointer_cast<arrow::ListArray>(aligned)->values());
+    auto c_col = out_struct->GetFieldByName("c");
+    ASSERT_NE(c_col, nullptr);
+    ASSERT_EQ(c_col->null_count(), c_col->length());  // added field is all null
+    auto a_col = std::static_pointer_cast<arrow::Int32Array>(out_struct->GetFieldByName("a"));
+    ASSERT_EQ(a_col->Value(0), 1);
+    ASSERT_EQ(a_col->Value(2), 3);
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeDecodesDictionaryLeafAndNullFills) {
+    // ORC lazy decoding returns dictionary<int64, large_string>; decode/cast to string.
+    auto* pool = arrow::default_memory_pool();
+    auto dict_type = arrow::dictionary(arrow::int64(), arrow::large_utf8());
+    auto a_dict =
+        arrow::ipc::internal::json::ArrayFromJSON(dict_type, R"(["x", "y", "x"])").ValueOrDie();
+    auto data_struct = arrow::struct_({MakeField("a", dict_type, 10)});
+    auto struct_arr = arrow::StructArray::Make({a_dict}, data_struct->fields()).ValueOrDie();
+
+    auto read_type =
+        arrow::struct_({MakeField("a", arrow::utf8(), 10), MakeField("b", arrow::int32(), 11)});
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    ASSERT_TRUE(aligned->type()->Equals(*read_type)) << aligned->type()->ToString();
+    auto out = std::static_pointer_cast<arrow::StructArray>(aligned);
+    ASSERT_EQ(std::static_pointer_cast<arrow::StringArray>(out->GetFieldByName("a"))->GetString(0),
+              "x");
+    auto b = out->GetFieldByName("b");
+    ASSERT_EQ(b->null_count(), b->length());
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeAppliesReadNullability) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({1, 2}).ok());
+    std::shared_ptr<arrow::Array> a_arr;
+    ASSERT_TRUE(ab.Finish(&a_arr).ok());
+    auto data_field = DataField::ConvertDataFieldToArrowField(
+        DataField(10, arrow::field("a", arrow::int32(), /*nullable=*/false)));
+    auto struct_arr = arrow::StructArray::Make({a_arr}, {data_field}).ValueOrDie();
+    auto read_type = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    ASSERT_TRUE(aligned->type()->field(0)->nullable());
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeFieldIdChangeNullFillsNotLeak) {
+    // a(id=10) replaced by a(id=11), same name/type: new field must read null, not leak.
+    auto* pool = arrow::default_memory_pool();
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({42}).ok());
+    std::shared_ptr<arrow::Array> a_arr;
+    ASSERT_TRUE(ab.Finish(&a_arr).ok());
+    auto data_struct = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto struct_arr = arrow::StructArray::Make({a_arr}, data_struct->fields()).ValueOrDie();
+    auto read_type = arrow::struct_({MakeField("a", arrow::int32(), 11)});
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    auto a_out = std::static_pointer_cast<arrow::StructArray>(aligned)->GetFieldByName("a");
+    ASSERT_NE(a_out, nullptr);
+    ASSERT_EQ(a_out->null_count(), a_out->length());
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeRejectsLeafTypeChange) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::Int32Builder ab(pool);
+    ASSERT_TRUE(ab.AppendValues({1}).ok());
+    std::shared_ptr<arrow::Array> a_arr;
+    ASSERT_TRUE(ab.Finish(&a_arr).ok());
+    auto data_struct = arrow::struct_({MakeField("a", arrow::int32(), 10)});
+    auto struct_arr = arrow::StructArray::Make({a_arr}, data_struct->fields()).ValueOrDie();
+    auto read_type = arrow::struct_({MakeField("a", arrow::int64(), 10)});
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool),
+                        "AlignArrayToReadType unsupported leaf type change");
+}
+
+TEST(NestedProjectionUtilsTest, AlignArrayToReadTypeKeepsNestedLargeBinaryBlob) {
+    auto* pool = arrow::default_memory_pool();
+    arrow::LargeBinaryBuilder blobb(pool);
+    ASSERT_TRUE(blobb.AppendValues({"a", "b"}).ok());
+    std::shared_ptr<arrow::Array> blob;
+    ASSERT_TRUE(blobb.Finish(&blob).ok());
+    auto data_struct = arrow::struct_({MakeField("blob", arrow::large_binary(), 10)});
+    auto struct_arr = arrow::StructArray::Make({blob}, data_struct->fields()).ValueOrDie();
+    auto read_type = arrow::struct_(
+        {MakeField("blob", arrow::large_binary(), 10), MakeField("c", arrow::int32(), 11)});
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::Array> aligned,
+                         NestedProjectionUtils::AlignArrayToReadType(struct_arr, read_type, pool));
+    auto blob_out = std::static_pointer_cast<arrow::StructArray>(aligned)->GetFieldByName("blob");
+    ASSERT_EQ(blob_out->type_id(), arrow::Type::LARGE_BINARY);
+    ASSERT_TRUE(blob_out->Equals(*blob));
+}
+
+TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionNoProjection) {
+    auto file_schema = arrow::schema({
+        MakeField("f0", arrow::int32(), 1),
+        MakeField("f1", arrow::struct_({MakeField("a", arrow::int32(), 2)}), 3),
+    });
+    auto read_schema = arrow::schema({
+        MakeField("f0", arrow::int32(), 1),
+        MakeField("f1", arrow::struct_({MakeField("a", arrow::int32(), 2)}), 3),
+    });
+    ASSERT_OK_AND_ASSIGN(
+        auto has_nested_projection,
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, read_schema));
+    ASSERT_FALSE(has_nested_projection);
+}
+
+TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionWithProjection) {
+    auto file_schema = arrow::schema({
+        MakeField("f0", arrow::int32(), 1),
+        MakeField(
+            "f1",
+            arrow::struct_({MakeField("a", arrow::int32(), 2), MakeField("b", arrow::utf8(), 4)}),
+            3),
+    });
+    auto read_schema = arrow::schema({
+        MakeField("f0", arrow::int32(), 1),
+        MakeField("f1", arrow::struct_({MakeField("a", arrow::int32(), 2)}), 3),
+    });
+    ASSERT_OK_AND_ASSIGN(
+        auto has_nested_projection,
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, read_schema));
+    ASSERT_TRUE(has_nested_projection);
+}
+
+TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionTypeMismatchReturnsInvalid) {
+    auto file_schema = arrow::schema({
+        MakeField("f0", arrow::struct_({MakeField("a", arrow::int32(), 2)}), 1),
+    });
+    auto read_schema = arrow::schema({
+        MakeField("f0", arrow::list(arrow::field("item", arrow::int32())), 1),
+    });
+
+    ASSERT_NOK_WITH_MSG(
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, read_schema),
+        "requires same nested type kind");
+}
+
+TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionAtomicTypeMismatchReturnsFalse) {
+    auto file_schema = arrow::schema({
+        MakeField("f0", arrow::map(arrow::utf8(), arrow::int32()), 1),
+    });
+    auto read_schema = arrow::schema({
+        MakeField("f0", arrow::map(arrow::utf8(), arrow::int16()), 1),
+    });
+
+    ASSERT_OK_AND_ASSIGN(
+        auto has_nested_projection,
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, read_schema));
+    ASSERT_FALSE(has_nested_projection);
+}
+
+TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionMissingStructChildReturnsInvalid) {
+    auto file_schema = arrow::schema({
+        MakeField(
+            "f0",
+            arrow::struct_({MakeField("a", arrow::int32(), 2), MakeField("b", arrow::utf8(), 3)}),
+            1),
+    });
+    auto read_schema = arrow::schema({
+        MakeField(
+            "f0",
+            arrow::struct_({MakeField("a", arrow::int32(), 2), MakeField("c", arrow::utf8(), 4)}),
+            1),
+    });
+
+    ASSERT_NOK_WITH_MSG(
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, read_schema),
+        "requested struct child");
+}
+
+TEST(NestedProjectionUtilsTest, HasNestedSubfieldProjectionMissingTopLevelFieldReturnsInvalid) {
+    auto file_schema = arrow::schema({
+        MakeField("f0", arrow::int32(), 1),
+    });
+    auto read_schema = arrow::schema({
+        MakeField("f0", arrow::int32(), 1),
+        MakeField("f1", arrow::struct_({MakeField("a", arrow::int32(), 2)}), 3),
+    });
+
+    ASSERT_NOK_WITH_MSG(
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, read_schema),
+        "missing in file schema");
+}
+
+// ============== GetMapSelectedKeys ==============
+TEST(NestedProjectionUtilsTest, GetMapSelectedKeysPresent) {
+    auto metadata =
+        arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {"key1,key2,key3"});
+    auto field =
+        arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()), /*nullable=*/true, metadata);
+    ASSERT_OK_AND_ASSIGN(auto keys, NestedProjectionUtils::GetMapSelectedKeys(field));
+    ASSERT_EQ(keys.size(), 3);
+    ASSERT_EQ(keys[0], "key1");
+    ASSERT_EQ(keys[1], "key2");
+    ASSERT_EQ(keys[2], "key3");
+}
+
+TEST(NestedProjectionUtilsTest, GetMapSelectedKeysAbsent) {
+    auto field = arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()));
+    ASSERT_OK_AND_ASSIGN(auto keys, NestedProjectionUtils::GetMapSelectedKeys(field));
+    ASSERT_TRUE(keys.empty());
+}
+
+TEST(NestedProjectionUtilsTest, GetMapSelectedKeysEmptyString) {
+    auto metadata = arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {""});
+    auto field =
+        arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()), /*nullable=*/true, metadata);
+    ASSERT_OK_AND_ASSIGN(auto keys, NestedProjectionUtils::GetMapSelectedKeys(field));
+    ASSERT_EQ(keys.size(), 1);
+    ASSERT_EQ(keys[0], "");
+}
+
+TEST(NestedProjectionUtilsTest, GetMapSelectedKeysContainsEmptyToken) {
+    auto metadata = arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {"a, ,b"});
+    auto field =
+        arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()), /*nullable=*/true, metadata);
+    ASSERT_OK_AND_ASSIGN(auto keys, NestedProjectionUtils::GetMapSelectedKeys(field));
+    ASSERT_EQ(keys.size(), 3);
+    ASSERT_EQ(keys[0], "a");
+    ASSERT_EQ(keys[1], " ");
+    ASSERT_EQ(keys[2], "b");
+}
+
+TEST(NestedProjectionUtilsTest, GetMapSelectedKeysWhitespaceOnly) {
+    auto metadata = arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {"   "});
+    auto field =
+        arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()), /*nullable=*/true, metadata);
+    ASSERT_OK_AND_ASSIGN(auto keys, NestedProjectionUtils::GetMapSelectedKeys(field));
+    ASSERT_EQ(keys.size(), 1);
+    ASSERT_EQ(keys[0], "   ");
+}
+
+TEST(NestedProjectionUtilsTest, GetMapSelectedKeysDuplicateKey) {
+    auto metadata = arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {"a,b,a"});
+    auto field =
+        arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()), /*nullable=*/true, metadata);
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::GetMapSelectedKeys(field),
+                        "Duplicate selected key 'a'");
+}
+
+// ============== FilterMapArrayBySelectedKeys ==============
+
+class NestedProjectionUtilsMapArrayTest : public ::testing::Test {
+ protected:
+    // Helper to build a MapArray<string, int32> from vectors of key-value pairs.
+    static std::shared_ptr<arrow::Array> BuildStringInt32MapArray(
+        const std::vector<std::vector<std::pair<std::string, int32_t>>>& maps,
+        const std::vector<bool>& null_mask = {}) {
+        auto key_builder = std::make_shared<arrow::StringBuilder>();
+        auto value_builder = std::make_shared<arrow::Int32Builder>();
+        arrow::MapBuilder map_builder(arrow::default_memory_pool(), key_builder, value_builder);
+        for (size_t i = 0; i < maps.size(); ++i) {
+            if (!null_mask.empty() && !null_mask[i]) {
+                EXPECT_TRUE(map_builder.AppendNull().ok());
+                continue;
+            }
+            EXPECT_TRUE(map_builder.Append().ok());
+            for (const auto& [k, v] : maps[i]) {
+                EXPECT_TRUE(key_builder->Append(k).ok());
+                EXPECT_TRUE(value_builder->Append(v).ok());
+            }
+        }
+        std::shared_ptr<arrow::Array> result;
+        EXPECT_TRUE(map_builder.Finish(&result).ok());
+        return result;
+    }
+};
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysBasic) {
+    // Map with 3 entries each, select only "a" and "c"
+    auto map_array = BuildStringInt32MapArray({
+        {{"a", 1}, {"b", 2}, {"c", 3}},
+        {{"a", 10}, {"d", 40}},
+    });
+
+    std::vector<std::string> selected = {"a", "c"};
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+
+    auto expected = BuildStringInt32MapArray({
+        {{"a", 1}, {"c", 3}},
+        {{"a", 10}},
+    });
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysEmptySelectedKeys) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}}});
+    std::vector<std::string> empty_keys;
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, empty_keys, arrow::default_memory_pool()));
+    // Should return original array unchanged
+    ASSERT_EQ(filtered.get(), map_array.get());
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysAllKept) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}, {"b", 2}}});
+    std::vector<std::string> selected = {"a", "b"};
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+    ASSERT_TRUE(filtered->Equals(map_array));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysNoneKept) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}, {"b", 2}}});
+    std::vector<std::string> selected = {"x", "y"};
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+    auto expected = BuildStringInt32MapArray({{}});
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysEmptyStringKeySelected) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}, {"", 9}, {"b", 2}}});
+    std::vector<std::string> selected = {""};
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+    auto expected = BuildStringInt32MapArray({{{"", 9}}});
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysWithNull) {
+    // maps[0] = {"a":1}, maps[1] = null, maps[2] = {"b":2,"c":3}
+    auto map_array =
+        BuildStringInt32MapArray({{{"a", 1}}, {}, {{"b", 2}, {"c", 3}}}, {true, false, true});
+
+    std::vector<std::string> selected = {"a", "c"};
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+    auto expected = BuildStringInt32MapArray({{{"a", 1}}, {}, {{"c", 3}}}, {true, false, true});
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysEmptyArray) {
+    auto map_array = BuildStringInt32MapArray({});
+    std::vector<std::string> selected = {"a"};
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+    auto expected = BuildStringInt32MapArray({});
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysSelectedOrderWins) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}, {"b", 2}, {"c", 3}}});
+    std::vector<std::string> selected = {"c", "a"};
+
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            map_array, selected, arrow::default_memory_pool()));
+    auto expected = BuildStringInt32MapArray({{{"c", 3}, {"a", 1}}});
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysDuplicateSelectedKeys) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}, {"b", 2}}});
+    std::vector<std::string> selected = {"a", "a"};
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                            map_array, selected, arrow::default_memory_pool()),
+                        "Duplicate selected key 'a'");
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysDictionaryStringKey) {
+    auto map_array = BuildStringInt32MapArray({
+        {{"a", 1}, {"b", 2}, {"c", 3}},
+        {{"c", 30}, {"a", 10}},
+    });
+    auto map = std::static_pointer_cast<arrow::MapArray>(map_array);
+    auto string_keys = std::static_pointer_cast<arrow::StringArray>(map->keys());
+
+    arrow::StringDictionaryBuilder dict_builder(arrow::default_memory_pool());
+    for (int64_t i = 0; i < string_keys->length(); ++i) {
+        ASSERT_TRUE(dict_builder.Append(string_keys->GetView(i)).ok());
+    }
+    auto dict_keys_result = dict_builder.Finish();
+    ASSERT_TRUE(dict_keys_result.ok());
+    auto dict_keys = dict_keys_result.ValueUnsafe();
+
+    auto dict_map_type = arrow::map(dict_keys->type(), map->items()->type());
+    auto dict_map_array = std::make_shared<arrow::MapArray>(
+        dict_map_type, map->length(), map->value_offsets(), dict_keys, map->items(),
+        map->null_bitmap(), map->null_count(), map->offset());
+
+    std::vector<std::string> selected = {"c", "a"};
+    ASSERT_OK_AND_ASSIGN(auto filtered,
+                         NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                             dict_map_array, selected, arrow::default_memory_pool()));
+
+    auto expected = BuildStringInt32MapArray({
+        {{"c", 3}, {"a", 1}},
+        {{"c", 30}, {"a", 10}},
+    });
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+TEST_F(NestedProjectionUtilsMapArrayTest, FilterMapArrayBySelectedKeysDictionaryLargeStringKey) {
+    auto map_array = BuildStringInt32MapArray({{{"a", 1}, {"b", 2}}});
+    auto map = std::static_pointer_cast<arrow::MapArray>(map_array);
+
+    arrow::LargeStringBuilder dict_value_builder(arrow::default_memory_pool());
+    ASSERT_TRUE(dict_value_builder.Append("a").ok());
+    ASSERT_TRUE(dict_value_builder.Append("b").ok());
+    std::shared_ptr<arrow::Array> dict_values;
+    ASSERT_TRUE(dict_value_builder.Finish(&dict_values).ok());
+
+    arrow::Int64Builder index_builder(arrow::default_memory_pool());
+    ASSERT_TRUE(index_builder.Append(0).ok());
+    ASSERT_TRUE(index_builder.Append(1).ok());
+    std::shared_ptr<arrow::Array> indices;
+    ASSERT_TRUE(index_builder.Finish(&indices).ok());
+
+    auto dict_type = arrow::dictionary(arrow::int64(), arrow::large_utf8());
+    auto large_string_dict_keys_result =
+        arrow::DictionaryArray::FromArrays(dict_type, indices, dict_values);
+    ASSERT_TRUE(large_string_dict_keys_result.ok());
+    auto large_string_dict_keys = large_string_dict_keys_result.ValueUnsafe();
+
+    auto dict_map_type = arrow::map(large_string_dict_keys->type(), map->items()->type());
+    auto dict_map_array = std::make_shared<arrow::MapArray>(
+        dict_map_type, map->length(), map->value_offsets(), large_string_dict_keys, map->items(),
+        map->null_bitmap(), map->null_count(), map->offset());
+
+    ASSERT_OK_AND_ASSIGN(auto filtered, NestedProjectionUtils::FilterMapArrayBySelectedKeys(
+                                            dict_map_array, {"a"}, arrow::default_memory_pool()));
+    auto expected = BuildStringInt32MapArray({{{"a", 1}}});
+    ASSERT_TRUE(filtered->Equals(expected));
+}
+
+}  // namespace paimon::test

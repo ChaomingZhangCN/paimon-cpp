@@ -18,6 +18,7 @@
 
 #include "paimon/format/avro/avro_file_batch_reader.h"
 
+#include <limits>
 #include <memory>
 #include <utility>
 
@@ -28,6 +29,7 @@
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/scope_guard.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/format/avro/avro_input_stream_impl.h"
 #include "paimon/format/avro/avro_schema_converter.h"
 #include "paimon/reader/batch_reader.h"
@@ -116,6 +118,7 @@ Result<BatchReader::ReadBatch> AvroFileBatchReader::NextBatch() {
         previous_first_row_ = next_row_to_read_;
         next_row_to_read_ += array_builder_->length();
         if (array_builder_->length() == 0) {
+            previous_batch_row_count_ = 0;
             return BatchReader::MakeEofBatch();
         }
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> array,
@@ -123,6 +126,7 @@ Result<BatchReader::ReadBatch> AvroFileBatchReader::NextBatch() {
         std::unique_ptr<ArrowArray> c_array = std::make_unique<ArrowArray>();
         std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*array, c_array.get(), c_schema.get()));
+        previous_batch_row_count_ = c_array->length;
         return make_pair(std::move(c_array), std::move(c_schema));
     } catch (const ::avro::Exception& e) {
         return Status::Invalid(fmt::format("avro reader next batch failed. {}", e.what()));
@@ -143,18 +147,34 @@ Status AvroFileBatchReader::SetReadSchema(::ArrowSchema* read_schema,
     if (selection_bitmap) {
         // TODO(menglingda.mld): support bitmap
     }
-    previous_first_row_ = std::numeric_limits<uint64_t>::max();
-    next_row_to_read_ = std::numeric_limits<uint64_t>::max();
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> arrow_read_schema,
                                       arrow::ImportSchema(read_schema));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Schema> file_schema,
                            ArrowUtils::DataTypeToSchema(file_data_type_));
+    PAIMON_ASSIGN_OR_RAISE(
+        bool has_nested_projection,
+        NestedProjectionUtils::HasNestedSubfieldProjection(file_schema, arrow_read_schema));
+    if (has_nested_projection) {
+        return Status::Invalid(
+            "SetReadSchema failed: avro reader does not support nested sub-field projection");
+    }
     PAIMON_ASSIGN_OR_RAISE(read_fields_projection_,
                            CalculateReadFieldsProjection(file_schema, arrow_read_schema->fields()));
-    array_builder_->Reset();
     std::shared_ptr<::arrow::DataType> read_data_type = arrow::struct_(arrow_read_schema->fields());
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(array_builder_,
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::unique_ptr<arrow::ArrayBuilder> array_builder,
                                       arrow::MakeBuilder(read_data_type, arrow_pool_.get()));
+    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<::avro::DataFileReaderBase> reader,
+                           CreateDataFileReader(input_stream_, pool_));
+
+    if (reader_) {
+        reader_->close();
+    }
+    reader_ = std::move(reader);
+    array_builder_ = std::move(array_builder);
+    previous_first_row_ = std::numeric_limits<uint64_t>::max();
+    previous_batch_row_count_ = 0;
+    next_row_to_read_ = std::numeric_limits<uint64_t>::max();
+    close_ = false;
     return Status::OK();
 }
 

@@ -21,6 +21,7 @@
 #include <memory>
 #include <string>
 
+#include "paimon/common/utils/fields_comparator.h"
 #include "paimon/core/mergetree/compact/aggregate/field_aggregator.h"
 
 namespace paimon {
@@ -60,15 +61,31 @@ class FieldMinAgg : public FieldAggregator {
             case arrow::Type::type::INT32:
             case arrow::Type::type::DATE32:
             case arrow::Type::type::INT64:
-            case arrow::Type::type::FLOAT:
-            case arrow::Type::type::DOUBLE:
             case arrow::Type::type::TIMESTAMP:
-            case arrow::Type::type::DECIMAL:
+            case arrow::Type::type::DECIMAL128:
             case arrow::Type::type::STRING:
             case arrow::Type::type::BINARY:
                 return FieldMinFunc([](const VariantType& accumulator,
                                        const VariantType& input_field) -> VariantType {
                     return accumulator < input_field ? accumulator : input_field;
+                });
+            case arrow::Type::type::FLOAT:
+                return FieldMinFunc([](const VariantType& accumulator,
+                                       const VariantType& input_field) -> VariantType {
+                    auto accumulator_value = DataDefine::GetVariantValue<float>(accumulator);
+                    auto input_value = DataDefine::GetVariantValue<float>(input_field);
+                    int32_t compare_result =
+                        FieldsComparator::CompareFloatingPoint(accumulator_value, input_value);
+                    return compare_result < 0 ? accumulator : input_field;
+                });
+            case arrow::Type::type::DOUBLE:
+                return FieldMinFunc([](const VariantType& accumulator,
+                                       const VariantType& input_field) -> VariantType {
+                    auto accumulator_value = DataDefine::GetVariantValue<double>(accumulator);
+                    auto input_value = DataDefine::GetVariantValue<double>(input_field);
+                    int32_t compare_result =
+                        FieldsComparator::CompareFloatingPoint(accumulator_value, input_value);
+                    return compare_result < 0 ? accumulator : input_field;
                 });
             default:
                 return Status::Invalid(

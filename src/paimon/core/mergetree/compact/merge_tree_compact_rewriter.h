@@ -32,6 +32,7 @@
 #include "paimon/core/utils/file_store_path_factory.h"
 #include "paimon/core/utils/file_store_path_factory_cache.h"
 namespace paimon {
+
 /// Default `CompactRewriter` for merge trees.
 class MergeTreeCompactRewriter : public CompactRewriter {
  public:
@@ -89,7 +90,7 @@ class MergeTreeCompactRewriter : public CompactRewriter {
     using KeyValueConsumerCreator =
         AsyncKeyValueProducerAndConsumer<KeyValue, KeyValueBatch>::ConsumerCreator;
 
-    std::unique_ptr<KeyValueRollingFileWriter> CreateRollingRowWriter(int32_t level);
+    Result<std::unique_ptr<KeyValueRollingFileWriter>> CreateRollingRowWriter(int32_t level);
 
     Result<KeyValueConsumerCreator> GenerateKeyValueConsumer() const;
 

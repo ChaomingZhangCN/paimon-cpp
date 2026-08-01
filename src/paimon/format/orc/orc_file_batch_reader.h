@@ -64,8 +64,21 @@ class OrcFileBatchReader : public PrefetchFileBatchReader {
     // OrcFileBatchReader. Therefore, we need to hold BatchReader when using output ArrowArray.
     Result<ReadBatch> NextBatch() override;
 
-    Result<uint64_t> GetPreviousBatchFirstRowNumber() const override {
-        return reader_->GetRowNumber();
+    Result<uint64_t> GetPreviousBatchFileRowId(uint64_t batch_row_id) const override {
+        uint64_t previous_first_row = reader_->GetRowNumber();
+        if (previous_batch_row_count_ == 0) {
+            if (previous_first_row == std::numeric_limits<uint64_t>::max()) {
+                return Status::Invalid("No batch has been read yet.");
+            } else {
+                return Status::Invalid("Last batch was EOF.");
+            }
+        }
+        if (batch_row_id >= previous_batch_row_count_) {
+            return Status::Invalid(
+                fmt::format("batch_row_id {} is out of range, last batch row count is {}",
+                            batch_row_id, previous_batch_row_count_));
+        }
+        return previous_first_row + batch_row_id;
     }
 
     Result<uint64_t> GetNumberOfRows() const override {
@@ -103,18 +116,15 @@ class OrcFileBatchReader : public PrefetchFileBatchReader {
                        const std::shared_ptr<arrow::MemoryPool>& arrow_pool,
                        const std::shared_ptr<::orc::MemoryPool>& orc_pool);
 
-    static void GetSubColumnIds(const ::orc::Type* type, std::vector<uint64_t>* col_ids);
-
     static Result<::orc::RowReaderOptions> CreateRowReaderOptions(
         const ::orc::Type* src_type, const ::orc::Type* target_type,
         std::unique_ptr<::orc::SearchArgument>&& search_arg,
         const std::map<std::string, std::string>& options,
         std::vector<uint64_t>* target_column_ids);
 
-    static Result<std::list<std::string>> GetAndCheckIncludedFields(
-        const ::orc::Type* src_type, const ::orc::Type* target_type,
-        std::vector<uint64_t>* target_column_ids);
-
+    static Status CollectTargetColumnIds(const ::orc::Type* src_type,
+                                         const ::orc::Type* target_type,
+                                         std::vector<uint64_t>* target_column_ids);
     std::map<std::string, std::string> options_;
 
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
@@ -125,6 +135,8 @@ class OrcFileBatchReader : public PrefetchFileBatchReader {
     std::shared_ptr<Metrics> metrics_;
     std::vector<uint64_t> target_column_ids_;
     std::vector<std::pair<uint64_t, uint64_t>> cache_ranges_;
+
+    uint64_t previous_batch_row_count_ = 0;
 };
 
 }  // namespace paimon::orc

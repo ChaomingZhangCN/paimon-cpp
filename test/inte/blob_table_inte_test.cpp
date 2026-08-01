@@ -16,12 +16,17 @@
  * limitations under the License.
  */
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdlib>
+#include <initializer_list>
 #include <map>
 #include <memory>
 #include <numeric>
+#include <optional>
+#include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -39,7 +44,12 @@
 #include "paimon/common/data/binary_array_writer.h"
 #include "paimon/common/data/binary_row.h"
 #include "paimon/common/data/binary_row_writer.h"
+#include "paimon/common/data/blob_defs.h"
+#include "paimon/common/data/blob_descriptor.h"
+#include "paimon/common/data/blob_utils.h"
+#include "paimon/common/data/blob_view_struct.h"
 #include "paimon/common/factories/io_hook.h"
+#include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
@@ -72,17 +82,25 @@
 #include "paimon/testing/utils/test_helper.h"
 #include "paimon/testing/utils/testharness.h"
 #include "paimon/write_context.h"
+
 namespace paimon {
 class DataSplit;
 class RecordBatch;
 }  // namespace paimon
 
 namespace paimon::test {
+
+struct ReadResult {
+    std::unique_ptr<BatchReader> batch_reader;
+    std::shared_ptr<arrow::ChunkedArray> chunked_array;
+};
+
 class BlobTableInteTest : public testing::Test, public ::testing::WithParamInterface<std::string> {
  public:
     void SetUp() override {
         pool_ = GetDefaultPool();
         dir_ = UniqueTestDirectory::Create("local");
+        blob_dir_ = UniqueTestDirectory::Create("local");
     }
 
     void TearDown() override {
@@ -91,7 +109,13 @@ class BlobTableInteTest : public testing::Test, public ::testing::WithParamInter
 
     void CreateTable(const std::vector<std::string>& partition_keys,
                      const std::map<std::string, std::string>& options) const {
-        auto schema = arrow::schema(fields_);
+        CreateTable(fields_, partition_keys, options);
+    }
+
+    void CreateTable(const arrow::FieldVector& fields,
+                     const std::vector<std::string>& partition_keys,
+                     const std::map<std::string, std::string>& options) const {
+        auto schema = arrow::schema(fields);
         ::ArrowSchema c_schema;
         ASSERT_TRUE(arrow::ExportSchema(*schema, &c_schema).ok());
 
@@ -151,6 +175,7 @@ class BlobTableInteTest : public testing::Test, public ::testing::WithParamInter
             }
         }
     }
+
     Status Commit(const std::string& table_path,
                   const std::vector<std::shared_ptr<CommitMessage>>& commit_msgs) const {
         // commit
@@ -162,11 +187,29 @@ class BlobTableInteTest : public testing::Test, public ::testing::WithParamInter
         return file_store_commit->Commit(commit_msgs);
     }
 
-    Status ScanAndRead(const std::string& table_path, const std::vector<std::string>& read_schema,
-                       const std::shared_ptr<arrow::StructArray>& expected_array,
-                       const std::shared_ptr<Predicate>& predicate = nullptr,
-                       const std::vector<Range>& row_ranges = {}) const {
-        // scan
+    Status WriteNextSchema(const std::string& table_path, const std::vector<DataField>& fields,
+                           int32_t highest_field_id,
+                           const std::map<std::string, std::string>& options) const {
+        SchemaManager schema_manager(dir_->GetFileSystem(), table_path);
+        PAIMON_ASSIGN_OR_RAISE(auto latest_schema_opt, schema_manager.Latest());
+        if (!latest_schema_opt) {
+            return Status::Invalid("table schema does not exist");
+        }
+        auto next_schema = std::make_shared<TableSchema>(*latest_schema_opt.value());
+        next_schema->id_ = latest_schema_opt.value()->Id() + 1;
+        next_schema->fields_ = fields;
+        next_schema->highest_field_id_ = highest_field_id;
+        next_schema->options_ = options;
+        PAIMON_ASSIGN_OR_RAISE(std::string schema_content, next_schema->ToJsonString());
+        std::string schema_path = PathUtil::JoinPath(schema_manager.SchemaDirectory(),
+                                                     "schema-" + std::to_string(next_schema->Id()));
+        return dir_->GetFileSystem()->AtomicStore(schema_path, schema_content);
+    }
+
+    /// Scan table and return the plan (without reading data).
+    Result<std::shared_ptr<Plan>> ScanTable(const std::string& table_path,
+                                            const std::shared_ptr<Predicate>& predicate = nullptr,
+                                            const std::vector<Range>& row_ranges = {}) const {
         ScanContextBuilder scan_context_builder(table_path);
         scan_context_builder.SetPredicate(predicate);
         if (!row_ranges.empty()) {
@@ -176,47 +219,72 @@ class BlobTableInteTest : public testing::Test, public ::testing::WithParamInter
         PAIMON_ASSIGN_OR_RAISE(auto scan_context, scan_context_builder.Finish());
         PAIMON_ASSIGN_OR_RAISE(auto table_scan, TableScan::Create(std::move(scan_context)));
         PAIMON_ASSIGN_OR_RAISE(auto result_plan, table_scan->CreatePlan());
-        if (!expected_array) {
-            EXPECT_TRUE(result_plan->Splits().empty());
-        }
+        return result_plan;
+    }
 
-        // read
-        auto splits = result_plan->Splits();
+    /// Read from table using a pre-scanned plan, returning the ChunkedArray and batch_reader.
+    /// The batch_reader must outlive the returned ChunkedArray (array memory depends on reader).
+    Result<ReadResult> ReadTable(const std::string& table_path,
+                                 const std::vector<std::string>& read_schema,
+                                 const std::shared_ptr<Plan>& plan,
+                                 const std::shared_ptr<Predicate>& predicate = nullptr,
+                                 const std::map<std::string, std::string>& options = {}) const {
+        auto splits = plan->Splits();
         ReadContextBuilder read_context_builder(table_path);
-        read_context_builder.SetReadSchema(read_schema).SetPredicate(predicate);
+        read_context_builder.SetReadFieldNames(read_schema).SetPredicate(predicate);
+        if (!options.empty()) {
+            read_context_builder.SetOptions(options);
+        }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context,
                                read_context_builder.Finish());
         PAIMON_ASSIGN_OR_RAISE(auto table_read, TableRead::Create(std::move(read_context)));
         PAIMON_ASSIGN_OR_RAISE(auto batch_reader, table_read->CreateReader(splits));
         PAIMON_ASSIGN_OR_RAISE(auto read_result,
                                ReadResultCollector::CollectResult(batch_reader.get()));
+        return ReadResult{std::move(batch_reader), std::move(read_result)};
+    }
 
-        if (!expected_array) {
-            EXPECT_FALSE(read_result);
-            return Status::OK();
-        }
-        // add row kind array for expected array
+    /// Convenience: scan + read in one call.
+    Result<ReadResult> ScanAndReadResult(const std::string& table_path,
+                                         const std::vector<std::string>& read_schema,
+                                         const std::shared_ptr<Predicate>& predicate = nullptr,
+                                         const std::vector<Range>& row_ranges = {}) const {
+        PAIMON_ASSIGN_OR_RAISE(auto result_plan, ScanTable(table_path, predicate, row_ranges));
+        return ReadTable(table_path, read_schema, result_plan, predicate);
+    }
+
+    /// Prepend a _VALUE_KIND (Insert) column to a StructArray.
+    static Result<std::shared_ptr<arrow::StructArray>> PrependRowKindColumn(
+        const std::shared_ptr<arrow::StructArray>& array) {
         auto row_kind_scalar =
             std::make_shared<arrow::Int8Scalar>(RowKind::Insert()->ToByteValue());
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            auto row_kind_array,
-            arrow::MakeArrayFromScalar(*row_kind_scalar, expected_array->length()));
-        arrow::ArrayVector expected_with_row_kind_fields = expected_array->fields();
-        std::vector<std::string> expected_with_row_kind_field_names =
-            arrow::schema(expected_array->type()->fields())->field_names();
-        expected_with_row_kind_fields.insert(expected_with_row_kind_fields.begin(), row_kind_array);
-        expected_with_row_kind_field_names.insert(expected_with_row_kind_field_names.begin(),
-                                                  "_VALUE_KIND");
-
-        // check read result
+            auto row_kind_array, arrow::MakeArrayFromScalar(*row_kind_scalar, array->length()));
+        arrow::ArrayVector fields_with_row_kind = array->fields();
+        std::vector<std::string> names_with_row_kind =
+            arrow::schema(array->type()->fields())->field_names();
+        fields_with_row_kind.insert(fields_with_row_kind.begin(), row_kind_array);
+        names_with_row_kind.insert(names_with_row_kind.begin(), "_VALUE_KIND");
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            auto expected_with_row_kind_array,
-            arrow::StructArray::Make(expected_with_row_kind_fields,
-                                     expected_with_row_kind_field_names));
-        auto expected_chunk_array =
-            std::make_shared<arrow::ChunkedArray>(expected_with_row_kind_array);
-        EXPECT_TRUE(expected_chunk_array->Equals(read_result))
-            << "result:" << read_result->ToString() << std::endl
+            auto result, arrow::StructArray::Make(fields_with_row_kind, names_with_row_kind));
+        return std::dynamic_pointer_cast<arrow::StructArray>(result);
+    }
+
+    Status ScanAndRead(const std::string& table_path, const std::vector<std::string>& read_schema,
+                       const std::shared_ptr<arrow::StructArray>& expected_array,
+                       const std::shared_ptr<Predicate>& predicate = nullptr,
+                       const std::vector<Range>& row_ranges = {}) const {
+        PAIMON_ASSIGN_OR_RAISE(auto scan_read,
+                               ScanAndReadResult(table_path, read_schema, predicate, row_ranges));
+
+        if (!expected_array) {
+            EXPECT_FALSE(scan_read.chunked_array);
+            return Status::OK();
+        }
+        PAIMON_ASSIGN_OR_RAISE(auto expected_with_row_kind, PrependRowKindColumn(expected_array));
+        auto expected_chunk_array = std::make_shared<arrow::ChunkedArray>(expected_with_row_kind);
+        EXPECT_TRUE(expected_chunk_array->Equals(scan_read.chunked_array))
+            << "result:" << scan_read.chunked_array->ToString() << std::endl
             << "expected:" << expected_chunk_array->ToString();
         return Status::OK();
     }
@@ -238,15 +306,222 @@ class BlobTableInteTest : public testing::Test, public ::testing::WithParamInter
                 .ValueOrDie());
     }
 
+    /// Convert a StructArray with raw blob bytes into a StructArray with serialized
+    /// BlobDescriptor bytes. Each raw blob value is written to a temporary file, and
+    /// the corresponding cell is replaced with the serialized BlobDescriptor pointing
+    /// to that file.
+    /// Common framework for transforming blob fields in a StructArray.
+    /// Non-blob fields are kept as-is; blob fields are processed row-by-row via `transform_row`.
+    /// `transform_row` receives (binary_value_view) and returns the transformed bytes via builder.
+    using BlobRowTransform =
+        std::function<Status(const std::string_view& value, arrow::LargeBinaryBuilder* builder)>;
+
+    Result<std::shared_ptr<arrow::StructArray>> TransformBlobFields(
+        const std::shared_ptr<arrow::StructArray>& input_array,
+        const std::set<std::string>& blob_fields, BlobRowTransform transform_row) const {
+        auto fields = input_array->type()->fields();
+        arrow::ArrayVector child_arrays;
+
+        for (const auto& field : fields) {
+            auto col = input_array->GetFieldByName(field->name());
+            if (blob_fields.count(field->name()) == 0) {
+                child_arrays.push_back(col);
+                continue;
+            }
+            const auto& binary_array =
+                arrow::internal::checked_cast<const arrow::LargeBinaryArray&>(*col);
+            arrow::LargeBinaryBuilder builder;
+            for (int64_t i = 0; i < binary_array.length(); ++i) {
+                if (binary_array.IsNull(i)) {
+                    PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.AppendNull());
+                    continue;
+                }
+                PAIMON_RETURN_NOT_OK(transform_row(binary_array.GetView(i), &builder));
+            }
+            std::shared_ptr<arrow::Array> result_col;
+            PAIMON_RETURN_NOT_OK_FROM_ARROW(builder.Finish(&result_col));
+            child_arrays.push_back(result_col);
+        }
+
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(auto result,
+                                          arrow::StructArray::Make(child_arrays, fields));
+        return result;
+    }
+
+    Result<std::shared_ptr<arrow::StructArray>> ConvertRawBlobToDescriptor(
+        const std::shared_ptr<arrow::StructArray>& raw_array,
+        const std::set<std::string>& blob_fields) {
+        auto fs = std::make_shared<LocalFileSystem>();
+        return TransformBlobFields(
+            raw_array, blob_fields,
+            [&](const std::string_view& raw_value, arrow::LargeBinaryBuilder* builder) -> Status {
+                std::string file_path =
+                    blob_dir_->Str() + "/blob_" + std::to_string(blob_file_counter_++) + ".bin";
+                auto raw_size = static_cast<int64_t>(raw_value.size());
+                PAIMON_ASSIGN_OR_RAISE(auto out, fs->Create(file_path, /*overwrite=*/true));
+                PAIMON_ASSIGN_OR_RAISE(auto written, out->Write(raw_value.data(), raw_size));
+                PAIMON_RETURN_NOT_OK(out->Flush());
+                PAIMON_RETURN_NOT_OK(out->Close());
+                if (written != raw_size) {
+                    return Status::Invalid("Short write: expected {}, wrote {}", raw_value.size(),
+                                           written);
+                }
+                PAIMON_ASSIGN_OR_RAISE(auto blob, Blob::FromPath(file_path));
+                auto descriptor = blob->ToDescriptor(pool_);
+                PAIMON_RETURN_NOT_OK_FROM_ARROW(
+                    builder->Append(descriptor->data(), descriptor->size()));
+                return Status::OK();
+            });
+    }
+
+    /// Delete the file referenced by the serialized BlobDescriptor at `row` of blob field
+    /// `field_name`, so that a subsequent table write observes a missing file.
+    Status DeleteDescriptorTarget(const std::shared_ptr<arrow::StructArray>& desc_array,
+                                  const std::string& field_name, int64_t row) const {
+        const auto& blob_col = arrow::internal::checked_cast<const arrow::LargeBinaryArray&>(
+            *desc_array->GetFieldByName(field_name));
+        std::string_view descriptor_bytes = blob_col.GetView(row);
+        PAIMON_ASSIGN_OR_RAISE(
+            std::unique_ptr<BlobDescriptor> descriptor,
+            BlobDescriptor::Deserialize(descriptor_bytes.data(), descriptor_bytes.size()));
+        LocalFileSystem fs;
+        return fs.Delete(descriptor->Uri(), /*recursive=*/false);
+    }
+
+    /// Rewrite the serialized BlobDescriptor at `row` of blob field `field_name` to reference
+    /// an offset beyond the end of the target file, so that a subsequent table write observes
+    /// a fetch failure that is not a missing file. `row` counts non-null rows.
+    Result<std::shared_ptr<arrow::StructArray>> CorruptDescriptorOffset(
+        const std::shared_ptr<arrow::StructArray>& desc_array, const std::string& field_name,
+        int64_t row) const {
+        int64_t current_row = 0;
+        return TransformBlobFields(
+            desc_array, {field_name},
+            [&](const std::string_view& descriptor_bytes,
+                arrow::LargeBinaryBuilder* builder) -> Status {
+                if (current_row++ != row) {
+                    PAIMON_RETURN_NOT_OK_FROM_ARROW(
+                        builder->Append(descriptor_bytes.data(), descriptor_bytes.size()));
+                    return Status::OK();
+                }
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::unique_ptr<BlobDescriptor> descriptor,
+                    BlobDescriptor::Deserialize(descriptor_bytes.data(), descriptor_bytes.size()));
+                PAIMON_ASSIGN_OR_RAISE(
+                    std::unique_ptr<BlobDescriptor> corrupted,
+                    BlobDescriptor::Create(descriptor->Version(), descriptor->Uri(),
+                                           /*offset=*/1 << 20, descriptor->Length()));
+                auto corrupted_bytes = corrupted->Serialize(pool_);
+                PAIMON_RETURN_NOT_OK_FROM_ARROW(
+                    builder->Append(corrupted_bytes->data(), corrupted_bytes->size()));
+                return Status::OK();
+            });
+    }
+
+    struct BlobDescriptorPathRewrite {
+        std::string table_path;
+        std::vector<std::string> table_relative_blob_dirs;
+    };
+
+    static std::optional<std::string> TryRewriteDescriptorUri(
+        const std::string& descriptor_uri, const BlobDescriptorPathRewrite& rewrite,
+        const std::shared_ptr<LocalFileSystem>& fs) {
+        if (rewrite.table_path.empty()) {
+            return std::nullopt;
+        }
+
+        for (const auto& blob_dir : rewrite.table_relative_blob_dirs) {
+            const std::string marker = "/" + blob_dir + "/";
+            auto marker_pos = descriptor_uri.find(marker);
+            if (marker_pos != std::string::npos) {
+                std::string relative_blob_path = descriptor_uri.substr(marker_pos + 1);
+                return PathUtil::JoinPath(rewrite.table_path, relative_blob_path);
+            }
+        }
+        return std::nullopt;
+    }
+
+    /// Convert a StructArray with serialized BlobDescriptor bytes back to a StructArray
+    /// with raw blob bytes. Only blob fields are resolved; other columns (including
+    /// _VALUE_KIND) are kept as-is.
+    Result<std::shared_ptr<arrow::StructArray>> ConvertDescriptorToRawBlob(
+        const std::shared_ptr<arrow::StructArray>& desc_array,
+        const std::set<std::string>& blob_fields,
+        const BlobDescriptorPathRewrite& rewrite = {}) const {
+        auto fs = std::make_shared<LocalFileSystem>();
+        return TransformBlobFields(
+            desc_array, blob_fields,
+            [&](const std::string_view& descriptor_bytes,
+                arrow::LargeBinaryBuilder* builder) -> Status {
+                PAIMON_ASSIGN_OR_RAISE(
+                    auto descriptor,
+                    BlobDescriptor::Deserialize(descriptor_bytes.data(), descriptor_bytes.size()));
+                std::string descriptor_uri = descriptor->Uri();
+                auto rewritten_uri = TryRewriteDescriptorUri(descriptor_uri, rewrite, fs);
+                if (rewritten_uri.has_value()) {
+                    descriptor_uri = rewritten_uri.value();
+                }
+
+                PAIMON_ASSIGN_OR_RAISE(
+                    auto rewritten_descriptor,
+                    BlobDescriptor::Create(descriptor->Version(), descriptor_uri,
+                                           descriptor->Offset(), descriptor->Length()));
+                auto rewritten_descriptor_bytes = rewritten_descriptor->Serialize(pool_);
+                PAIMON_ASSIGN_OR_RAISE(auto blob,
+                                       Blob::FromDescriptor(rewritten_descriptor_bytes->data(),
+                                                            rewritten_descriptor_bytes->size()));
+                PAIMON_ASSIGN_OR_RAISE(auto data, blob->ToData(fs, pool_));
+                PAIMON_RETURN_NOT_OK_FROM_ARROW(builder->Append(data->data(), data->size()));
+                return Status::OK();
+            });
+    }
+
+    /// Verify DataFileMeta properties from a scan plan.
+    /// Each vector element corresponds to one expected DataFileMeta (ordered by file index).
+    static void VerifyDataFileMetas(
+        const std::shared_ptr<Plan>& plan, size_t expected_file_count,
+        const std::vector<int64_t>& expected_row_counts,
+        const std::vector<int64_t>& expected_min_seqs,
+        const std::vector<int64_t>& expected_max_seqs,
+        const std::vector<int64_t>& expected_first_row_ids,
+        const std::vector<std::optional<std::vector<std::string>>>& expected_write_cols) {
+        std::vector<std::shared_ptr<DataFileMeta>> all_files;
+        for (const auto& split : plan->Splits()) {
+            auto data_split = std::dynamic_pointer_cast<DataSplitImpl>(split);
+            ASSERT_TRUE(data_split);
+            for (const auto& file : data_split->DataFiles()) {
+                all_files.push_back(file);
+            }
+        }
+        ASSERT_EQ(all_files.size(), expected_file_count);
+        ASSERT_EQ(expected_row_counts.size(), expected_file_count);
+        ASSERT_EQ(expected_min_seqs.size(), expected_file_count);
+        ASSERT_EQ(expected_max_seqs.size(), expected_file_count);
+        ASSERT_EQ(expected_first_row_ids.size(), expected_file_count);
+        ASSERT_EQ(expected_write_cols.size(), expected_file_count);
+        for (size_t i = 0; i < all_files.size(); ++i) {
+            const auto& file = all_files[i];
+            EXPECT_EQ(file->row_count, expected_row_counts[i]);
+            EXPECT_EQ(file->min_sequence_number, expected_min_seqs[i]);
+            EXPECT_EQ(file->max_sequence_number, expected_max_seqs[i]);
+            ASSERT_TRUE(file->first_row_id.has_value());
+            EXPECT_EQ(file->first_row_id.value(), expected_first_row_ids[i]);
+            EXPECT_EQ(file->write_cols, expected_write_cols[i]);
+        }
+    }
+
  private:
     std::shared_ptr<MemoryPool> pool_;
     std::unique_ptr<UniqueTestDirectory> dir_;
+    std::unique_ptr<UniqueTestDirectory> blob_dir_;
+    int blob_file_counter_ = 0;
     arrow::FieldVector fields_ = {arrow::field("f0", arrow::int32()), BlobUtils::ToArrowField("f1"),
                                   arrow::field("f2", arrow::utf8())};
 };
 
 std::vector<std::string> GetTestValuesForBlobTableInteTest() {
-    std::vector<std::string> values = {"parquet"};
+    std::vector<std::string> values;
+    values.emplace_back("parquet");
 #ifdef PAIMON_ENABLE_ORC
     values.emplace_back("orc");
 #endif
@@ -260,142 +535,297 @@ INSTANTIATE_TEST_SUITE_P(FileFormat, BlobTableInteTest,
                          ::testing::ValuesIn(GetTestValuesForBlobTableInteTest()));
 
 TEST_P(BlobTableInteTest, TestAppendTableWriteWithBlobAsDescriptorTrue) {
-    auto dir = UniqueTestDirectory::Create();
     arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
                                  arrow::field("f1", arrow::int32()),
                                  BlobUtils::ToArrowField("blob", true)};
-    auto schema = arrow::schema(fields);
 
-    auto file_format = GetParam();
     std::map<std::string, std::string> options = {
-        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, file_format},
+        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, GetParam()},
         {Options::TARGET_FILE_SIZE, "700"},      {Options::BUCKET, "-1"},
         {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
         {Options::BLOB_AS_DESCRIPTOR, "true"},   {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
 
-    ASSERT_OK_AND_ASSIGN(
-        auto helper, TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{},
-                                        /*primary_keys=*/{}, options, /*is_streaming_mode=*/true));
-    int64_t commit_identifier = 0;
-
-    auto generate_blob_array = [&](const std::vector<PAIMON_UNIQUE_PTR<Bytes>>& blob_descriptors)
-        -> std::shared_ptr<arrow::Array> {
-        arrow::StructBuilder struct_builder(
-            arrow::struct_(fields), arrow::default_memory_pool(),
-            {std::make_shared<arrow::StringBuilder>(), std::make_shared<arrow::Int32Builder>(),
-             std::make_shared<arrow::LargeBinaryBuilder>()});
-        auto string_builder = static_cast<arrow::StringBuilder*>(struct_builder.field_builder(0));
-        auto int_builder = static_cast<arrow::Int32Builder*>(struct_builder.field_builder(1));
-        auto binary_builder =
-            static_cast<arrow::LargeBinaryBuilder*>(struct_builder.field_builder(2));
-        for (size_t i = 0; i < blob_descriptors.size(); ++i) {
-            EXPECT_TRUE(struct_builder.Append().ok());
-            EXPECT_TRUE(string_builder->Append("str_" + std::to_string(i)).ok());
-            if (i % 3 == 0) {
-                // test null
-                EXPECT_TRUE(int_builder->AppendNull().ok());
-            } else {
-                EXPECT_TRUE(int_builder->Append(i).ok());
-            }
-            EXPECT_TRUE(
-                binary_builder->Append(blob_descriptors[i]->data(), blob_descriptors[i]->size())
-                    .ok());
-        }
-        std::shared_ptr<arrow::Array> array;
-        EXPECT_TRUE(struct_builder.Finish(&array).ok());
-        return array;
-    };
-
-    // prepare data
-    std::vector<PAIMON_UNIQUE_PTR<Bytes>> expected_blob_descriptors;
-    std::string file1 = paimon::test::GetDataDir() + "/avro/data/avro_with_null";
-    ASSERT_OK_AND_ASSIGN(auto blob1, Blob::FromPath(file1));
-    expected_blob_descriptors.emplace_back(blob1->ToDescriptor(pool_));
-
-    std::string file2 = paimon::test::GetDataDir() + "/xxhash.data";
-    ASSERT_OK_AND_ASSIGN(auto blob2, Blob::FromPath(file2, /*offset=*/0, /*length=*/91));
-    expected_blob_descriptors.emplace_back(blob2->ToDescriptor(pool_));
-    ASSERT_OK_AND_ASSIGN(auto blob3, Blob::FromPath(file2, /*offset=*/92, /*length=*/85));
-    expected_blob_descriptors.emplace_back(blob3->ToDescriptor(pool_));
-    ASSERT_OK_AND_ASSIGN(auto blob4, Blob::FromPath(file2, /*offset=*/300, /*length=*/3000));
-    expected_blob_descriptors.emplace_back(blob4->ToDescriptor(pool_));
-
-    auto array = generate_blob_array(expected_blob_descriptors);
-    ::ArrowArray arrow_array;
-    ASSERT_TRUE(arrow::ExportArray(*array, &arrow_array).ok());
-    RecordBatchBuilder batch_builder(&arrow_array);
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch, batch_builder.Finish());
-
-    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
-                         helper->WriteAndCommit(std::move(batch), commit_identifier++,
-                                                /*expected_commit_messages=*/std::nullopt));
-
-    arrow::FieldVector fields_with_row_kind = fields;
-    fields_with_row_kind.insert(fields_with_row_kind.begin(),
-                                arrow::field("_VALUE_KIND", arrow::int8()));
-    auto schema_with_row_kind = arrow::schema(fields_with_row_kind);
-    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
-                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
-    std::string expected_data = R"([
-        [0, "str_0", null],
-        [0, "str_1", 1],
-        [0, "str_2", 2],
-        [0, "str_3", null]
+    // prepare data: input uses plain raw blob bytes for readability
+    std::string raw_json = R"([
+        ["str_0", null, "hello_blob_0"],
+        ["str_1", 1,    "blob_data_1"],
+        ["str_2", 2,    "blob_data_2"],
+        ["str_3", null, "blob_data_3"]
     ])";
-    ASSERT_OK_AND_ASSIGN(bool success, helper->ReadAndCheckResultForBlobTable(
-                                           schema_with_row_kind, data_splits, expected_data,
-                                           expected_blob_descriptors));
-    ASSERT_TRUE(success);
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"blob"}));
+
+    // write descriptor array
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // read result contains descriptors pointing to paimon internal blob files
+    // resolve descriptors back to raw bytes, then prepend _VALUE_KIND and compare
+    ASSERT_OK_AND_ASSIGN(auto result, ScanAndReadResult(table_path, schema->field_names()));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"blob"}));
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(raw_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk));
 }
 
 TEST_P(BlobTableInteTest, TestAppendTableWriteWithBlobAsDescriptorFalse) {
-    auto dir = UniqueTestDirectory::Create();
     arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
                                  arrow::field("f1", arrow::int32()),
                                  BlobUtils::ToArrowField("blob", true)};
-    auto schema = arrow::schema(fields);
 
-    auto file_format = GetParam();
     std::map<std::string, std::string> options = {
-        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, file_format},
+        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, GetParam()},
         {Options::TARGET_FILE_SIZE, "700"},      {Options::BUCKET, "-1"},
         {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
         {Options::BLOB_AS_DESCRIPTOR, "false"},  {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
 
-    ASSERT_OK_AND_ASSIGN(
-        auto helper, TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{},
-                                        /*primary_keys=*/{}, options, /*is_streaming_mode=*/true));
-    int64_t commit_identifier = 0;
-
-    std::string data = R"([
+    std::string data_json = R"([
         ["str_0", null, "apple"],
         ["str_1", 1,    "banana"],
         ["str_2", 2,    "cat"],
         ["str_3", null, "dog"]
     ])";
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         TestHelper::MakeRecordBatch(arrow::struct_(fields), data,
-                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    auto write_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), data_json).ValueOrDie());
 
+    auto schema = arrow::schema(fields);
     ASSERT_OK_AND_ASSIGN(auto commit_msgs,
-                         helper->WriteAndCommit(std::move(batch), commit_identifier++,
-                                                /*expected_commit_messages=*/std::nullopt));
+                         WriteArray(table_path, {}, schema->field_names(), {write_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
 
-    arrow::FieldVector fields_with_row_kind = fields;
-    fields_with_row_kind.insert(fields_with_row_kind.begin(),
-                                arrow::field("_VALUE_KIND", arrow::int8()));
-    auto data_type = arrow::struct_(fields_with_row_kind);
-    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
-                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
-    std::string expected_data = R"([
-        [0, "str_0", null, "apple"],
-        [0, "str_1", 1,    "banana"],
-        [0, "str_2", 2,    "cat"],
-        [0, "str_3", null, "dog"]
+    // BLOB_AS_DESCRIPTOR=false: blob data is stored inline, read result should match input
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), write_array));
+}
+
+TEST_P(BlobTableInteTest, TestWriteNullOnMissingFile) {
+    // blob-write-null-on-missing-file=true: a descriptor whose file is gone at write time
+    // becomes a NULL blob element, while the row itself is still written and merged with
+    // the data file on read.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
+                                 arrow::field("f1", arrow::int32()),
+                                 BlobUtils::ToArrowField("blob", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},      {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_AS_DESCRIPTOR, "true"},   {Options::BLOB_WRITE_NULL_ON_MISSING_FILE, "true"},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    std::string raw_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, "blob_data_1"],
+        ["str_2", 2, "blob_data_2"]
     ])";
-    ASSERT_OK_AND_ASSIGN(bool success,
-                         helper->ReadAndCheckResult(data_type, data_splits, expected_data));
-    ASSERT_TRUE(success);
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"blob"}));
+
+    // Remove the file behind row 1's descriptor so the write observes a missing file.
+    ASSERT_OK(DeleteDescriptorTarget(desc_array, "blob", /*row=*/1));
+
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Both the main data file and the .blob file keep the full row count; the read path
+    // merges them back into rows where row 1's blob is NULL.
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    VerifyDataFileMetas(plan, /*expected_file_count=*/2, /*expected_row_counts=*/{3, 3},
+                        /*expected_min_seqs=*/{1, 1}, /*expected_max_seqs=*/{1, 1},
+                        /*expected_first_row_ids=*/{0, 0},
+                        /*expected_write_cols=*/
+                        {std::vector<std::string>{"f0", "f1"}, std::vector<std::string>{"blob"}});
+
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, schema->field_names(), plan));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"blob"}));
+
+    std::string expected_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, null],
+        ["str_2", 2, "blob_data_2"]
+    ])";
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk))
+        << "result:" << resolved->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestMissingFileFailsWriteWhenWriteNullDisabled) {
+    // Without blob-write-null-on-missing-file, a missing descriptor file fails the write.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
+                                 arrow::field("f1", arrow::int32()),
+                                 BlobUtils::ToArrowField("blob", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},      {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_AS_DESCRIPTOR, "true"},   {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    std::string raw_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, "blob_data_1"]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"blob"}));
+    ASSERT_OK(DeleteDescriptorTarget(desc_array, "blob", /*row=*/1));
+
+    auto schema = arrow::schema(fields);
+    ASSERT_NOK_WITH_MSG(WriteArray(table_path, {}, schema->field_names(), {desc_array}),
+                        "not exists");
+}
+
+TEST_P(BlobTableInteTest, TestWriteNullOnFetchFailure) {
+    // blob-write-null-on-fetch-failure=true: a descriptor whose data cannot be fetched for a
+    // reason other than a missing file (here: offset beyond the end of the file) becomes a
+    // NULL blob element, while the row itself is still written and merged with the data file
+    // on read.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
+                                 arrow::field("f1", arrow::int32()),
+                                 BlobUtils::ToArrowField("blob", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_AS_DESCRIPTOR, "true"},
+        {Options::BLOB_WRITE_NULL_ON_FETCH_FAILURE, "true"},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    std::string raw_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, "blob_data_1"],
+        ["str_2", 2, "blob_data_2"]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"blob"}));
+
+    // Point row 1's descriptor at an offset beyond the end of its file so the write observes
+    // a fetch failure that is not a missing file.
+    ASSERT_OK_AND_ASSIGN(desc_array, CorruptDescriptorOffset(desc_array, "blob", /*row=*/1));
+
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Both the main data file and the .blob file keep the full row count; the read path
+    // merges them back into rows where row 1's blob is NULL.
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    VerifyDataFileMetas(plan, /*expected_file_count=*/2, /*expected_row_counts=*/{3, 3},
+                        /*expected_min_seqs=*/{1, 1}, /*expected_max_seqs=*/{1, 1},
+                        /*expected_first_row_ids=*/{0, 0},
+                        /*expected_write_cols=*/
+                        {std::vector<std::string>{"f0", "f1"}, std::vector<std::string>{"blob"}});
+
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, schema->field_names(), plan));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"blob"}));
+
+    std::string expected_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, null],
+        ["str_2", 2, "blob_data_2"]
+    ])";
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk))
+        << "result:" << resolved->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestWriteNullOnFetchFailureCoversMissingFile) {
+    // The existence check runs only under blob-write-null-on-missing-file, so with only
+    // blob-write-null-on-fetch-failure a missing file is converted as an ordinary fetch failure.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::utf8()),
+                                 arrow::field("f1", arrow::int32()),
+                                 BlobUtils::ToArrowField("blob", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_AS_DESCRIPTOR, "true"},
+        {Options::BLOB_WRITE_NULL_ON_FETCH_FAILURE, "true"},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    std::string raw_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, "blob_data_1"],
+        ["str_2", 2, "blob_data_2"]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"blob"}));
+    ASSERT_OK(DeleteDescriptorTarget(desc_array, "blob", /*row=*/1));
+
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    VerifyDataFileMetas(plan, /*expected_file_count=*/2, /*expected_row_counts=*/{3, 3},
+                        /*expected_min_seqs=*/{1, 1}, /*expected_max_seqs=*/{1, 1},
+                        /*expected_first_row_ids=*/{0, 0},
+                        /*expected_write_cols=*/
+                        {std::vector<std::string>{"f0", "f1"}, std::vector<std::string>{"blob"}});
+
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, schema->field_names(), plan));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"blob"}));
+
+    std::string expected_json = R"([
+        ["str_0", 0, "blob_data_0"],
+        ["str_1", 1, null],
+        ["str_2", 2, "blob_data_2"]
+    ])";
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk))
+        << "result:" << resolved->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
 }
 
 TEST_P(BlobTableInteTest, TestBasic) {
@@ -431,20 +861,74 @@ TEST_P(BlobTableInteTest, TestBasic) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[1], fields_[0], SpecialFields::SequenceNumber().field_,
-                                SpecialFields::RowId().field_, fields_[2]}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[1], fields_[0], SpecialFields::SequenceNumber().field_,
+                            SpecialFields::RowId().field_, fields_[2]}),
+            R"([
         ["new_blob", 1, 2, 0, "c"]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "_SEQUENCE_NUMBER", "_ROW_ID", "f2"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "_SEQUENCE_NUMBER", "_ROW_ID", "f2"},
+                          expected_row_tracking_array));
+}
+
+TEST_P(BlobTableInteTest, TestBlobFilesAcrossSchemaIds) {
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(/*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Simulate the post-compaction layout: one normal file bridges blob files across schema ids.
+    std::vector<std::string> write_cols0 = {"f0", "f2"};
+    auto src_array0 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[0], fields_[2]}), R"([
+        [1, "a"],
+        [2, "b"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0, WriteArray(table_path, {}, write_cols0, {src_array0}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    std::vector<std::string> blob_write_cols = {"f1"};
+    auto src_array1 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[1]}), R"([
+        ["c"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1,
+                         WriteArray(table_path, {}, blob_write_cols, {src_array1}));
+    SetFirstRowId(0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    auto f3 = arrow::field("f3", arrow::int64());
+    ASSERT_OK(WriteNextSchema(table_path,
+                              {DataField(0, fields_[0]), DataField(1, fields_[1]),
+                               DataField(2, fields_[2]), DataField(3, f3)},
+                              /*highest_field_id=*/3, options));
+
+    auto src_array2 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[1]}), R"([
+        ["d"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs2,
+                         WriteArray(table_path, {}, blob_write_cols, {src_array2}));
+    SetFirstRowId(1, commit_msgs2);
+    ASSERT_OK(Commit(table_path, commit_msgs2));
+
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_), R"([
+        [1, "c", "a"],
+        [2, "d", "b"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields_)->field_names(), expected_array));
 }
 
 TEST_P(BlobTableInteTest, TestMultipleAppends) {
@@ -536,17 +1020,16 @@ TEST_P(BlobTableInteTest, TestMultipleAppends) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
-                                                          fields_[0],
-                                                          fields_[1],
-                                                          fields_[2],
-                                                          SpecialFields::RowId().field_,
-                                                          SpecialFields::SequenceNumber().field_,
-                                                      }),
-                                                      R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
+                                                      fields_[0],
+                                                      fields_[1],
+                                                      fields_[2],
+                                                      SpecialFields::RowId().field_,
+                                                      SpecialFields::SequenceNumber().field_,
+                                                  }),
+                                                  R"([
         [1, "a", "b", 0, 1],
         [1, "a", "b", 1, 1],
         [1, "a", "b", 2, 1],
@@ -560,37 +1043,685 @@ TEST_P(BlobTableInteTest, TestMultipleAppends) {
         [1, "a", "b", 10, 2],
         [2, "c", "d", 11, 4]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
+}
+
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobOnlyWriteWithFirstRowId) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()), BlobUtils::ToArrowField("b0")};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+
+    // Initial full-row write assigns row ids 0 and 1.
+    auto src_array0 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", "old_blob_0"],
+        [2, "b", "old_blob_1"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {src_array0}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // Update only b0 and align it with the existing row ids.
+    std::vector<std::string> blob_write_cols = {"b0"};
+    auto src_array1 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[2]}), R"([
+        ["new_blob_0"],
+        ["new_blob_1"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1,
+                         WriteArray(table_path, {}, blob_write_cols, {src_array1}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", "new_blob_0"],
+        [2, "b", "new_blob_1"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
+
+    auto expected_with_row_id = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields[0], fields[1], fields[2], SpecialFields::RowId().field_}),
+            R"([
+        [1, "a", "new_blob_0", 0],
+        [2, "b", "new_blob_1", 1]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "b0", "_ROW_ID"}, expected_with_row_id));
+}
+
+/// Build a single-blob-column StructArray for a data-evolution partial update: "PH" marks a row
+/// whose blob is not updated (persisted as a placeholder entry), std::nullopt a null blob.
+std::shared_ptr<arrow::StructArray> MakeBlobUpdateArray(
+    const std::shared_ptr<arrow::Field>& blob_field,
+    const std::vector<std::optional<std::string>>& rows) {
+    auto struct_type = arrow::struct_({blob_field});
+    arrow::StructBuilder struct_builder(struct_type, arrow::default_memory_pool(),
+                                        {std::make_shared<arrow::LargeBinaryBuilder>()});
+    auto blob_builder = static_cast<arrow::LargeBinaryBuilder*>(struct_builder.field_builder(0));
+    for (const auto& row : rows) {
+        EXPECT_TRUE(struct_builder.Append().ok());
+        if (!row) {
+            EXPECT_TRUE(blob_builder->AppendNull().ok());
+        } else if (*row == "PH") {
+            std::string_view sentinel = BlobDefs::PlaceholderSentinelView();
+            EXPECT_TRUE(blob_builder->Append(sentinel.data(), sentinel.size()).ok());
+        } else {
+            EXPECT_TRUE(blob_builder->Append(row->data(), row->size()).ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> array;
+    EXPECT_TRUE(struct_builder.Finish(&array).ok());
+    return std::dynamic_pointer_cast<arrow::StructArray>(array);
+}
+
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateFallback) {
+    // the blob column is updated to null below, so it must be nullable
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()),
+                                 BlobUtils::ToArrowField("b0", /*nullable=*/true)};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+
+    // Initial full-row write assigns row ids 0-2.
+    auto src_array0 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", "blob_a"],
+        [2, "b", "blob_b"],
+        [3, "c", "blob_c"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {src_array0}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // Partial update: only row 1 gets a new blob, the untouched rows are written as
+    // placeholder entries and must fall back to the previous blob file when read.
+    auto update_array = MakeBlobUpdateArray(fields[2], {"PH", "updated_b", "PH"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", "blob_a"],
+        [2, "b", "updated_b"],
+        [3, "c", "blob_c"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
+
+    // updating a blob to null is not a placeholder: the null must win over older layers
+    auto null_update_array = MakeBlobUpdateArray(fields[2], {std::nullopt, "PH", "PH"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs2,
+                         WriteArray(table_path, {}, {"b0"}, {null_update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs2);
+    ASSERT_OK(Commit(table_path, commit_msgs2));
+
+    auto expected_array2 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", null],
+        [2, "b", "updated_b"],
+        [3, "c", "blob_c"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array2));
+
+    // row ids still come from the data files and stay aligned with the fallback result
+    auto expected_with_row_id = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields[0], fields[1], fields[2], SpecialFields::RowId().field_}),
+            R"([
+        [1, "a", null, 0],
+        [2, "b", "updated_b", 1],
+        [3, "c", "blob_c", 2]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "b0", "_ROW_ID"}, expected_with_row_id));
+
+    // blob_as_descriptor read mode: the fallback-merged values come back as descriptors and
+    // must still resolve to the same bytes
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    std::map<std::string, std::string> read_options = {{Options::BLOB_AS_DESCRIPTOR, "true"}};
+    ASSERT_OK_AND_ASSIGN(auto desc_result, ReadTable(table_path, schema->field_names(), plan,
+                                                     /*predicate=*/nullptr, read_options));
+    ASSERT_TRUE(desc_result.chunked_array);
+    auto desc_concat = arrow::Concatenate(desc_result.chunked_array->chunks()).ValueOrDie();
+    auto desc_struct = std::dynamic_pointer_cast<arrow::StructArray>(desc_concat);
+    ASSERT_TRUE(desc_struct);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(desc_struct, {"b0"}));
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array2));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk))
+        << "result:" << resolved->ToString() << "\nexpected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateMultipleLayers) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()), BlobUtils::ToArrowField("b0")};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+
+    auto src_array0 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", "blob_0"],
+        [2, "b", "blob_1"],
+        [3, "c", "blob_2"],
+        [4, "d", "blob_3"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {src_array0}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // second layer updates row 0 within rows [0, 1]
+    auto update_array1 = MakeBlobUpdateArray(fields[2], {"update1_0", "PH"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array1}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    // third layer updates row 3 within rows [2, 3]; each layer only partially covers the
+    // range, the uncovered parts behave as placeholders
+    auto update_array2 = MakeBlobUpdateArray(fields[2], {"PH", "update2_3"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs2, WriteArray(table_path, {}, {"b0"}, {update_array2}));
+    SetFirstRowId(/*reset_first_row_id=*/2, commit_msgs2);
+    ASSERT_OK(Commit(table_path, commit_msgs2));
+
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", "update1_0"],
+        [2, "b", "blob_1"],
+        [3, "c", "blob_2"],
+        [4, "d", "update2_3"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
+
+    // row-range pushdown where the selected rows fall in one layer's file and in another
+    // layer's uncovered gap: row 1 is a gap row for the third layer, row 2 for the second
+    auto expected_middle = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [2, "b", "blob_1"],
+        [3, "c", "blob_2"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_middle,
+                          /*predicate=*/nullptr, /*row_ranges=*/{Range(1, 2)}));
+
+    // per-row reads resolve every row independently
+    const std::vector<std::string> expected_rows = {
+        R"([[1, "a", "update1_0"]])", R"([[2, "b", "blob_1"]])", R"([[3, "c", "blob_2"]])",
+        R"([[4, "d", "update2_3"]])"};
+    for (int32_t i = 0; i < static_cast<int32_t>(expected_rows.size()); i++) {
+        auto expected_single = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_rows[i])
+                .ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_single,
+                              /*predicate=*/nullptr, /*row_ranges=*/{Range(i, i)}));
     }
 }
 
-TEST_P(BlobTableInteTest, TestOnlySomeColumns) {
-    CreateTable();
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateCompactedLayers) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()), BlobUtils::ToArrowField("b0")};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
-    auto schema = arrow::schema(fields_);
+    auto schema = arrow::schema(fields);
 
-    // write field: f0
-    std::vector<std::string> write_cols0 = {"f0"};
-    auto src_array0 = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[0]}), R"([
-        [1]
+    // Mirrors the layer shapes of Java's BlobUpdateTest.testReadCompactedBlobSequenceGroups
+    // (with a single base write, as the C++ write path assigns one sequence per commit):
+    //   row id:  0    1    2    3    4    5    6    7    8    9
+    //   seq1:   [b0   b1   b2   b3   b4   b5   b6   b7   b8   b9]
+    //   seq2:   [u20  P    P    u23  u24] .    .    .    .    .
+    //   seq3:    .    .    .    .    .   [P    u46  P    u48  P]
+    //   seq4:   [P    u61  P    P    P    P    P    P    P    u69]
+    //   result:  u20  u61  b2   u23  u24  b5   u46  b7   u48  u69
+    auto base_array = PrepareBulkData(
+        10,
+        [](int32_t i) {
+            return std::to_string(i) + ", \"name_" + std::to_string(i) + "\", \"blob_" +
+                   std::to_string(i) + "\"";
+        },
+        fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {base_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    auto update_array1 = MakeBlobUpdateArray(fields[2], {"u20", "PH", "PH", "u23", "u24"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array1}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    auto update_array2 = MakeBlobUpdateArray(fields[2], {"PH", "u46", "PH", "u48", "PH"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs2, WriteArray(table_path, {}, {"b0"}, {update_array2}));
+    SetFirstRowId(/*reset_first_row_id=*/5, commit_msgs2);
+    ASSERT_OK(Commit(table_path, commit_msgs2));
+
+    auto update_array3 = MakeBlobUpdateArray(
+        fields[2], {"PH", "u61", "PH", "PH", "PH", "PH", "PH", "PH", "PH", "u69"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs3, WriteArray(table_path, {}, {"b0"}, {update_array3}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs3);
+    ASSERT_OK(Commit(table_path, commit_msgs3));
+
+    const std::vector<std::string> expected_blobs = {"u20",    "u61", "blob_2", "u23", "u24",
+                                                     "blob_5", "u46", "blob_7", "u48", "u69"};
+    auto expected_row = [&](int32_t i) {
+        return std::to_string(i) + ", \"name_" + std::to_string(i) + "\", \"" + expected_blobs[i] +
+               "\"";
+    };
+    auto expected_full = PrepareBulkData(10, expected_row, fields);
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_full));
+
+    // every row resolves independently under row-range pushdown
+    for (int32_t i = 0; i < 10; i++) {
+        auto expected_single = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                      "[[" + expected_row(i) + "]]")
+                .ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_single,
+                              /*predicate=*/nullptr, /*row_ranges=*/{Range(i, i)}));
+    }
+}
+
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateWithRowRanges) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()), BlobUtils::ToArrowField("b0")};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+
+    auto base_array = PrepareBulkData(
+        10,
+        [](int32_t i) {
+            return std::to_string(i) + ", \"name_" + std::to_string(i) + "\", \"blob_" +
+                   std::to_string(i) + "\"";
+        },
+        fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {base_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // partial update touching rows 1 and 9 only
+    auto update_array = MakeBlobUpdateArray(
+        fields[2], {"PH", "update_1", "PH", "PH", "PH", "PH", "PH", "PH", "PH", "update_9"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    // push down row ranges hitting updated and untouched rows
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "name_1", "update_1"],
+        [5, "name_5", "blob_5"],
+        [9, "name_9", "update_9"]
     ])")
             .ValueOrDie());
-    ASSERT_OK_AND_ASSIGN(auto commit_msgs, WriteArray(table_path, {}, write_cols0, {src_array0}));
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array,
+                          /*predicate=*/nullptr,
+                          /*row_ranges=*/{Range(1, 1), Range(5, 5), Range(9, 9)}));
+
+    // full read still resolves every row
+    auto expected_full = PrepareBulkData(
+        10,
+        [](int32_t i) {
+            std::string blob = (i == 1 || i == 9) ? "\"update_" + std::to_string(i) + "\""
+                                                  : "\"blob_" + std::to_string(i) + "\"";
+            return std::to_string(i) + ", \"name_" + std::to_string(i) + "\", " + blob;
+        },
+        fields);
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_full));
+}
+
+/// A BLOB sequence layer whose physical file covers only a strict subrange of the full row id
+/// range: the newest group is internally Gap(2), File([u2, u3]), Gap(6). The table needs a
+/// normal column to be creatable, but only the blob column is ever written, so the split
+/// contains only blob files and the blob bunch itself carries the row-tracking fields: the
+/// fallback reader must keep _ROW_ID correct and report each row's _SEQUENCE_NUMBER from the
+/// layer that resolved it, without ever exposing the internal placeholder sentinel.
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateRowTrackingWithSubrangeLayer) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("b0", /*nullable=*/true)};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // old layer: rows 0-9 all real
+    std::vector<std::optional<std::string>> base_rows;
+    for (int32_t i = 0; i < 10; i++) {
+        base_rows.emplace_back("b" + std::to_string(i));
+    }
+    auto base_array = MakeBlobUpdateArray(fields[1], base_rows);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0, WriteArray(table_path, {}, {"b0"}, {base_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs0);
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // new layer: first_row_id=2, row_count=2, covering only rows 2-3
+    auto update_array = MakeBlobUpdateArray(fields[1], {"u2", "u3"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/2, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    ASSERT_OK_AND_ASSIGN(auto scan_read,
+                         ScanAndReadResult(table_path, {"b0", "_ROW_ID", "_SEQUENCE_NUMBER"}));
+    ASSERT_TRUE(scan_read.chunked_array);
+    auto concat_array = arrow::Concatenate(scan_read.chunked_array->chunks()).ValueOrDie();
+    auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(concat_array);
+    ASSERT_TRUE(struct_array);
+    ASSERT_EQ(struct_array->length(), 10);
+    auto blob_col =
+        std::dynamic_pointer_cast<arrow::LargeBinaryArray>(struct_array->GetFieldByName("b0"));
+    auto row_id_col = std::dynamic_pointer_cast<arrow::Int64Array>(
+        struct_array->GetFieldByName(SpecialFields::RowId().Name()));
+    auto seq_col = std::dynamic_pointer_cast<arrow::Int64Array>(
+        struct_array->GetFieldByName(SpecialFields::SequenceNumber().Name()));
+    ASSERT_TRUE(blob_col && row_id_col && seq_col);
+    int64_t old_layer_seq = seq_col->Value(0);
+    int64_t new_layer_seq = seq_col->Value(2);
+    ASSERT_GT(new_layer_seq, old_layer_seq);
+    for (int64_t i = 0; i < 10; i++) {
+        ASSERT_FALSE(blob_col->IsNull(i));
+        std::string expected_blob =
+            (i == 2 || i == 3) ? "u" + std::to_string(i) : "b" + std::to_string(i);
+        // the leading and trailing gaps never expose the internal placeholder sentinel
+        ASSERT_EQ(blob_col->GetString(i), expected_blob) << "row " << i;
+        ASSERT_EQ(row_id_col->Value(i), i);
+        ASSERT_EQ(seq_col->Value(i), (i == 2 || i == 3) ? new_layer_seq : old_layer_seq)
+            << "row " << i;
+    }
+
+    // row-range pushdown with the row-tracking projection: the selection removes rows inside
+    // the blob files, so batch positions must still map back to the right file row indexes
+    ASSERT_OK_AND_ASSIGN(auto range_read,
+                         ScanAndReadResult(table_path, {"b0", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                                           /*predicate=*/nullptr,
+                                           /*row_ranges=*/{Range(1, 2), Range(8, 8)}));
+    ASSERT_TRUE(range_read.chunked_array);
+    auto range_concat = arrow::Concatenate(range_read.chunked_array->chunks()).ValueOrDie();
+    auto range_struct = std::dynamic_pointer_cast<arrow::StructArray>(range_concat);
+    ASSERT_TRUE(range_struct);
+    ASSERT_EQ(range_struct->length(), 3);
+    auto range_blob_col =
+        std::dynamic_pointer_cast<arrow::LargeBinaryArray>(range_struct->GetFieldByName("b0"));
+    auto range_row_id_col = std::dynamic_pointer_cast<arrow::Int64Array>(
+        range_struct->GetFieldByName(SpecialFields::RowId().Name()));
+    auto range_seq_col = std::dynamic_pointer_cast<arrow::Int64Array>(
+        range_struct->GetFieldByName(SpecialFields::SequenceNumber().Name()));
+    ASSERT_TRUE(range_blob_col && range_row_id_col && range_seq_col);
+    const std::vector<int64_t> expected_row_ids = {1, 2, 8};
+    const std::vector<std::string> expected_blobs = {"b1", "u2", "b8"};
+    for (int64_t i = 0; i < 3; i++) {
+        ASSERT_EQ(range_blob_col->GetString(i), expected_blobs[i]) << "row " << i;
+        ASSERT_EQ(range_row_id_col->Value(i), expected_row_ids[i]) << "row " << i;
+        ASSERT_EQ(range_seq_col->Value(i), expected_row_ids[i] == 2 ? new_layer_seq : old_layer_seq)
+            << "row " << i;
+    }
+}
+
+/// A row that is a placeholder in every BLOB layer degrades to a null blob but keeps its
+/// _ROW_ID and reports -1 as its _SEQUENCE_NUMBER. Only the blob column is ever written, so
+/// the blob bunch itself carries the row-tracking fields.
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateAllPlaceholderRowTracking) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("b0", /*nullable=*/true)};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // the base layer itself holds a placeholder at row 1, so after the second layer also
+    // leaves it untouched, row 1 is a placeholder in every layer
+    auto base_array = MakeBlobUpdateArray(fields[1], {"blob_a", "PH", "blob_c"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0, WriteArray(table_path, {}, {"b0"}, {base_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs0);
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    auto update_array = MakeBlobUpdateArray(fields[1], {"PH", "PH", "update_c"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    ASSERT_OK_AND_ASSIGN(auto scan_read,
+                         ScanAndReadResult(table_path, {"b0", "_ROW_ID", "_SEQUENCE_NUMBER"}));
+    ASSERT_TRUE(scan_read.chunked_array);
+    auto concat_array = arrow::Concatenate(scan_read.chunked_array->chunks()).ValueOrDie();
+    auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(concat_array);
+    ASSERT_TRUE(struct_array);
+    ASSERT_EQ(struct_array->length(), 3);
+    auto blob_col =
+        std::dynamic_pointer_cast<arrow::LargeBinaryArray>(struct_array->GetFieldByName("b0"));
+    auto row_id_col = std::dynamic_pointer_cast<arrow::Int64Array>(
+        struct_array->GetFieldByName(SpecialFields::RowId().Name()));
+    auto seq_col = std::dynamic_pointer_cast<arrow::Int64Array>(
+        struct_array->GetFieldByName(SpecialFields::SequenceNumber().Name()));
+    ASSERT_TRUE(blob_col && row_id_col && seq_col);
+
+    ASSERT_EQ(blob_col->GetString(0), "blob_a");
+    ASSERT_EQ(blob_col->GetString(2), "update_c");
+    // the all-placeholder row: null blob, row id kept, sequence number -1
+    ASSERT_TRUE(blob_col->IsNull(1));
+    ASSERT_EQ(row_id_col->Value(1), 1);
+    ASSERT_EQ(seq_col->Value(1), -1);
+    for (int64_t i : {static_cast<int64_t>(0), static_cast<int64_t>(2)}) {
+        ASSERT_EQ(row_id_col->Value(i), i);
+        ASSERT_GE(seq_col->Value(i), 0);
+    }
+    ASSERT_GT(seq_col->Value(2), seq_col->Value(0));
+}
+
+/// A normal (full-row) write never interprets blob bytes: a user value whose bytes exactly
+/// equal the placeholder sentinel must be stored verbatim (not persisted as a bin_length -2
+/// entry) and read back unchanged. The sentinel is reserved only inside the data-evolution
+/// partial-update channels (see BlobDefs::kPlaceholderSentinel).
+TEST_P(BlobTableInteTest, TestBlobValueEqualToPlaceholderSentinelBytes) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()),
+                                 BlobUtils::ToArrowField("b0", /*nullable=*/true)};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+    std::string sentinel_bytes = std::string(BlobDefs::PlaceholderSentinelView());
+
+    // full-row write: row 0's blob is exactly the sentinel bytes
+    auto struct_type = arrow::struct_(fields);
+    arrow::StructBuilder struct_builder(
+        struct_type, arrow::default_memory_pool(),
+        {std::make_shared<arrow::Int32Builder>(), std::make_shared<arrow::StringBuilder>(),
+         std::make_shared<arrow::LargeBinaryBuilder>()});
+    auto f0_builder = static_cast<arrow::Int32Builder*>(struct_builder.field_builder(0));
+    auto f1_builder = static_cast<arrow::StringBuilder*>(struct_builder.field_builder(1));
+    auto b0_builder = static_cast<arrow::LargeBinaryBuilder*>(struct_builder.field_builder(2));
+    ASSERT_TRUE(struct_builder.Append().ok());
+    ASSERT_TRUE(f0_builder->Append(1).ok());
+    ASSERT_TRUE(f1_builder->Append("a").ok());
+    ASSERT_TRUE(b0_builder->Append(sentinel_bytes.data(), sentinel_bytes.size()).ok());
+    ASSERT_TRUE(struct_builder.Append().ok());
+    ASSERT_TRUE(f0_builder->Append(2).ok());
+    ASSERT_TRUE(f1_builder->Append("b").ok());
+    ASSERT_TRUE(b0_builder->Append("normal", 6).ok());
+    std::shared_ptr<arrow::Array> src_array;
+    ASSERT_TRUE(struct_builder.Finish(&src_array).ok());
+    auto src_struct = std::dynamic_pointer_cast<arrow::StructArray>(src_array);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {src_struct}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // read back unchanged: the sentinel-equal bytes are a normal value
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), src_struct));
+
+    // a value that merely starts with the sentinel bytes stays a normal value even through a
+    // partial-update fallback (placeholders are identified by exact equality only)
+    std::string prefixed_bytes = sentinel_bytes + "suffix";
+    auto update_array = MakeBlobUpdateArray(fields[2], {prefixed_bytes, "updated_b"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    ASSERT_OK_AND_ASSIGN(auto scan_read, ScanAndReadResult(table_path, schema->field_names()));
+    ASSERT_TRUE(scan_read.chunked_array);
+    auto concat_array = arrow::Concatenate(scan_read.chunked_array->chunks()).ValueOrDie();
+    auto struct_result = std::dynamic_pointer_cast<arrow::StructArray>(concat_array);
+    ASSERT_TRUE(struct_result);
+    ASSERT_EQ(struct_result->length(), 2);
+    auto blob_col =
+        std::dynamic_pointer_cast<arrow::LargeBinaryArray>(struct_result->GetFieldByName("b0"));
+    ASSERT_TRUE(blob_col);
+    ASSERT_FALSE(blob_col->IsNull(0));
+    ASSERT_EQ(blob_col->GetString(0), prefixed_bytes);
+    ASSERT_EQ(blob_col->GetString(1), "updated_b");
+}
+
+TEST_P(BlobTableInteTest, TestBlobSentinelValueInBaseLayerDegradesToNull) {
+    // Pins the accepted collision of the byte-identified placeholder protocol (see
+    // BlobDefs::kPlaceholderSentinel): the fallback merge byte-compares every layer, so a user
+    // blob equal to the sentinel bytes that a later partial update leaves untouched reads as a
+    // placeholder in every layer and degrades to a null blob instead of falling back.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()),
+                                 BlobUtils::ToArrowField("b0", /*nullable=*/true)};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+    std::string sentinel_bytes = std::string(BlobDefs::PlaceholderSentinelView());
+
+    // the full-row write stores row 0's sentinel-equal bytes verbatim (the write channel is off)
+    std::string src_json =
+        std::string(R"([[1, "a", ")") + sentinel_bytes + R"("], [2, "b", "blob_b"]])";
+    auto src_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), src_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0,
+                         WriteArray(table_path, {}, schema->field_names(), {src_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    // the partial update leaves row 0 untouched, so its base value collides with the
+    // placeholder markers of the newer layer
+    auto update_array = MakeBlobUpdateArray(fields[2], {"PH", "updated_b"});
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, {}, {"b0"}, {update_array}));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    // row 0's non-blob fields survive (they come from the data file); only the blob degrades
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [1, "a", null],
+        [2, "b", "updated_b"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
+}
+
+TEST_P(BlobTableInteTest, TestUserSuppliedInternalPlaceholderOptionsIgnored) {
+    // blob.internal.* options are reserved for the data-evolution write and read paths. Set in
+    // the user table options they must be ignored: were the write key honored, this full-row
+    // write would persist the sentinel-equal user value as a placeholder entry that no older
+    // layer can resolve, making the table unreadable.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()),
+                                 BlobUtils::ToArrowField("b0", /*nullable=*/true)};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"},
+                                                  {BlobDefs::kWritePlaceholderKey, "true"},
+                                                  {BlobDefs::kEmitPlaceholderSentinelKey, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+    std::string sentinel_bytes = std::string(BlobDefs::PlaceholderSentinelView());
+
+    std::string src_json =
+        std::string(R"([[1, "a", ")") + sentinel_bytes + R"("], [2, "b", "blob_b"]])";
+    auto src_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), src_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {src_array}));
     ASSERT_OK(Commit(table_path, commit_msgs));
 
-    // write field: f1
-    std::vector<std::string> write_cols1 = {"f1"};
-    auto src_array1 = std::dynamic_pointer_cast<arrow::StructArray>(
-        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[1]}), R"([
-        ["a"]
+    // the sentinel-equal value round-trips verbatim: the user-supplied keys were stripped
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), src_array));
+}
+
+TEST_P(BlobTableInteTest, TestDataEvolutionBlobOnlyFirstCommitFailsWithoutFirstRowId) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 arrow::field("f1", arrow::utf8()), BlobUtils::ToArrowField("b0")};
+    std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_SYSTEM, "local"},
+                                                  {Options::ROW_TRACKING_ENABLED, "true"},
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto blob_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[2]}), R"([
+        ["blob_0"]
     ])")
             .ValueOrDie());
-    ASSERT_NOK_WITH_MSG(WriteArray(table_path, {}, write_cols1, {src_array1}),
-                        "Can't infer struct array length with 0 child arrays");
+    std::vector<std::string> blob_write_cols = {"b0"};
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, blob_write_cols, {blob_array}));
+
+    ASSERT_EQ(commit_msgs.size(), 1);
+    auto commit_msg = std::dynamic_pointer_cast<CommitMessageImpl>(commit_msgs[0]);
+    ASSERT_TRUE(commit_msg);
+    ASSERT_EQ(commit_msg->data_increment_.new_files_.size(), 1);
+    const auto& blob_file = commit_msg->data_increment_.new_files_[0];
+    ASSERT_TRUE(BlobUtils::IsBlobFile(blob_file->file_name));
+    ASSERT_FALSE(blob_file->first_row_id.has_value());
+
+    ASSERT_NOK_WITH_MSG(Commit(table_path, commit_msgs), "blobStart 0 should be less than start 0");
 }
 
 TEST_P(BlobTableInteTest, TestMultipleAppendsDifferentFirstRowIds) {
@@ -656,25 +1787,23 @@ TEST_P(BlobTableInteTest, TestMultipleAppendsDifferentFirstRowIds) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
-                                                          fields_[0],
-                                                          fields_[1],
-                                                          fields_[2],
-                                                          SpecialFields::RowId().field_,
-                                                          SpecialFields::SequenceNumber().field_,
-                                                      }),
-                                                      R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
+                                                      fields_[0],
+                                                      fields_[1],
+                                                      fields_[2],
+                                                      SpecialFields::RowId().field_,
+                                                      SpecialFields::SequenceNumber().field_,
+                                                  }),
+                                                  R"([
         [1, "a", "b", 0, 1],
         [2, "c", "d", 1, 3]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(BlobTableInteTest, TestMoreDataWithDataEvolution) {
@@ -811,21 +1940,19 @@ TEST_P(BlobTableInteTest, TestExternalPath) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[1], fields_[0], fields_[2], SpecialFields::RowId().field_,
-                                SpecialFields::SequenceNumber().field_}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[1], fields_[0], fields_[2], SpecialFields::RowId().field_,
+                            SpecialFields::SequenceNumber().field_}),
+            R"([
         ["a", 10, "b", 0, 2],
         ["c", 20, "d", 1, 2]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(BlobTableInteTest, TestPartitionWithPredicate) {
@@ -1053,10 +2180,9 @@ TEST_P(BlobTableInteTest, TestIOException) {
                 .ValueOrDie());
         auto commit_msgs1_result = WriteArray(table_path, {}, write_cols1, {src_array1});
         CHECK_HOOK_STATUS(commit_msgs1_result.status(), i);
-        SetFirstRowId(/*reset_first_row_id=*/0,
-                      const_cast<std::vector<std::shared_ptr<paimon::CommitMessage>>&>(
-                          commit_msgs1_result.value()));
-        CHECK_HOOK_STATUS(Commit(table_path, commit_msgs1_result.value()), i);
+        auto commit_msgs1 = std::move(commit_msgs1_result).value();
+        SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+        CHECK_HOOK_STATUS(Commit(table_path, commit_msgs1), i);
         write_run_complete = true;
         break;
     }
@@ -1167,7 +2293,7 @@ TEST_P(BlobTableInteTest, TestDataEvolutionAndAlterTable) {
         DataField(3, arrow::field("f1", arrow::utf8())),
         DataField(4, arrow::field("f2", arrow::decimal128(6, 3))),
         DataField(5, arrow::field("f0", arrow::boolean())),
-        DataField(8, BlobUtils::ToArrowField("f5")),
+        DataField(8, BlobUtils::ToArrowField("blob")),
         DataField(9, arrow::field("f6", arrow::int32())),
         SpecialFields::RowId(),
         SpecialFields::SequenceNumber()};
@@ -1179,7 +2305,7 @@ TEST_P(BlobTableInteTest, TestDataEvolutionAndAlterTable) {
         // only read blob column
         auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
             arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({BlobUtils::ToArrowField("f5")}), R"([
+                arrow::struct_({BlobUtils::ToArrowField("blob")}), R"([
             ["Lily"],
             ["Alice"],
             ["Bob"],
@@ -1192,7 +2318,7 @@ TEST_P(BlobTableInteTest, TestDataEvolutionAndAlterTable) {
             ["Elderberry"]
         ])")
                 .ValueOrDie());
-        ASSERT_OK(ScanAndRead(table_path, {"f5"}, expected_array));
+        ASSERT_OK(ScanAndRead(table_path, {"blob"}, expected_array));
     }
     {
         auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
@@ -1291,7 +2417,6 @@ TEST_P(BlobTableInteTest, TestWithRowIdsForMultipleBlobFiles) {
                                                   {Options::BUCKET, "-1"},
                                                   {Options::ROW_TRACKING_ENABLED, "true"},
                                                   {Options::DATA_EVOLUTION_ENABLED, "true"},
-                                                  {Options::BLOB_AS_DESCRIPTOR, "false"},
                                                   {Options::FILE_SYSTEM, "local"}};
     CreateTable(/*partition_keys=*/{}, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
@@ -1377,7 +2502,7 @@ TEST_P(BlobTableInteTest, TestWithRowIdsForMultipleBlobFiles) {
                               /*row_ranges=*/{Range(1l, 1l), Range(5l, 5l)}));
     }
     {
-        // test ont read blob field
+        // test not read blob field
         auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
             arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[1]}), R"([
         ["aaa1"],
@@ -1391,107 +2516,60 @@ TEST_P(BlobTableInteTest, TestWithRowIdsForMultipleBlobFiles) {
 }
 
 TEST_P(BlobTableInteTest, TestAppendTableWriteWithMultipleBlobFields) {
-    auto dir = UniqueTestDirectory::Create();
     arrow::FieldVector fields = {
         arrow::field("f0", arrow::utf8()), arrow::field("f1", arrow::int32()),
         BlobUtils::ToArrowField("blob1", true), BlobUtils::ToArrowField("blob2", true)};
-    auto schema = arrow::schema(fields);
 
-    auto file_format = GetParam();
     std::map<std::string, std::string> options = {
-        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, file_format},
+        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, GetParam()},
         {Options::TARGET_FILE_SIZE, "700"},      {Options::BUCKET, "-1"},
         {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
-        {Options::BLOB_AS_DESCRIPTOR, "false"},  {Options::FILE_SYSTEM, "local"}};
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
 
-    ASSERT_OK_AND_ASSIGN(
-        auto helper, TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{},
-                                        /*primary_keys=*/{}, options, /*is_streaming_mode=*/true));
-    int64_t commit_identifier = 0;
-
-    std::string data = R"([
+    std::string data_json = R"([
         ["str_0", null, "apple",  "red"],
         ["str_1", 1,    "banana", "yellow"],
         ["str_2", 2,    "cat",    "black"]
     ])";
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         TestHelper::MakeRecordBatch(arrow::struct_(fields), data,
-                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    auto write_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), data_json).ValueOrDie());
 
+    auto schema = arrow::schema(fields);
     ASSERT_OK_AND_ASSIGN(auto commit_msgs,
-                         helper->WriteAndCommit(std::move(batch), commit_identifier++,
-                                                /*expected_commit_messages=*/std::nullopt));
-    ASSERT_EQ(commit_msgs.size(), 1);
-
-    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot, helper->LatestSnapshot());
-    ASSERT_TRUE(snapshot);
-    ASSERT_EQ(1, snapshot.value().Id());
-    ASSERT_EQ(3, snapshot.value().NextRowId().value());
-
-    // Scan and read: verify all fields including multiple blob fields
-    arrow::FieldVector fields_with_row_kind = fields;
-    fields_with_row_kind.insert(fields_with_row_kind.begin(),
-                                arrow::field("_VALUE_KIND", arrow::int8()));
-    auto data_type = arrow::struct_(fields_with_row_kind);
-    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
-                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
-    std::string expected_data = R"([
-        [0, "str_0", null, "apple",  "red"],
-        [0, "str_1", 1,    "banana", "yellow"],
-        [0, "str_2", 2,    "cat",    "black"]
-    ])";
-    ASSERT_OK_AND_ASSIGN(bool success,
-                         helper->ReadAndCheckResult(data_type, data_splits, expected_data));
-    ASSERT_TRUE(success);
+                         WriteArray(table_path, {}, schema->field_names(), {write_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), write_array));
 }
 
 TEST_P(BlobTableInteTest, TestAppendWriteWithNullBlob) {
-    auto dir = UniqueTestDirectory::Create();
     arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
                                  BlobUtils::ToArrowField("blob", true)};
-    auto schema = arrow::schema(fields);
 
-    auto file_format = GetParam();
     std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
-                                                  {Options::FILE_FORMAT, file_format},
+                                                  {Options::FILE_FORMAT, GetParam()},
                                                   {Options::BUCKET, "-1"},
                                                   {Options::FILE_SYSTEM, "local"},
                                                   {Options::ROW_TRACKING_ENABLED, "true"},
-                                                  {Options::DATA_EVOLUTION_ENABLED, "true"},
-                                                  {Options::BLOB_AS_DESCRIPTOR, "false"}};
-
-    ASSERT_OK_AND_ASSIGN(
-        auto helper, TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{},
-                                        /*primary_keys=*/{}, options, /*is_streaming_mode=*/true));
+                                                  {Options::DATA_EVOLUTION_ENABLED, "true"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
 
     // Write: row 0 non-null blob, row 1 null blob, row 2 non-null blob
-    std::string data = R"([
+    std::string data_json = R"([
         [1, "hello"],
         [2, null],
         [3, "world"]
     ])";
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
-                         TestHelper::MakeRecordBatch(arrow::struct_(fields), data,
-                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
-    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
-                         helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
-                                                /*expected_commit_messages=*/std::nullopt));
+    auto write_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), data_json).ValueOrDie());
 
-    // Read and verify
-    arrow::FieldVector fields_with_row_kind = fields;
-    fields_with_row_kind.insert(fields_with_row_kind.begin(),
-                                arrow::field("_VALUE_KIND", arrow::int8()));
-    auto data_type = arrow::struct_(fields_with_row_kind);
-    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
-                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
-    std::string expected_data = R"([
-        [0, 1, "hello"],
-        [0, 2, null],
-        [0, 3, "world"]
-    ])";
-    ASSERT_OK_AND_ASSIGN(bool success,
-                         helper->ReadAndCheckResult(data_type, data_splits, expected_data));
-    ASSERT_TRUE(success);
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {write_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), write_array));
 }
 
 TEST_P(BlobTableInteTest, TestReadTableWithMultiBlobFields) {
@@ -1565,6 +2643,1450 @@ TEST_P(BlobTableInteTest, TestReadTableWithMultiBlobFields) {
                               expected_rr, /*predicate=*/nullptr,
                               /*row_ranges=*/{Range(0l, 0l), Range(2l, 2l), Range(5l, 5l)}));
     }
+}
+
+TEST_P(BlobTableInteTest, TestBlobDescriptorField) {
+    // Two blob fields configured via BLOB_DESCRIPTOR_FIELD and stored inline as descriptors.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("b0", true),
+                                 BlobUtils::ToArrowField("b1", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},   {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_DESCRIPTOR_FIELD, "b0,b1"}, {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Input uses plain raw bytes for readability
+    std::string raw_json = R"([
+        [1, "image_data_0", "video_data_0"],
+        [2, "image_data_1", "video_data_1"],
+        [3, "image_data_2", "video_data_2"]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"b0", "b1"}));
+
+    // write descriptor array
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Scan and verify DataFileMeta: all blob fields are inline descriptors, so write_cols is unset.
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    VerifyDataFileMetas(plan, /*expected_file_count=*/1, /*expected_row_counts=*/{3},
+                        /*expected_min_seqs=*/{1}, /*expected_max_seqs=*/{1},
+                        /*expected_first_row_ids=*/{0},
+                        /*expected_write_cols=*/{std::nullopt});
+
+    // Read and resolve descriptors back to raw bytes
+    std::map<std::string, std::string> read_options = {};
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, schema->field_names(), plan,
+                                                /*predicate=*/nullptr, read_options));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"b0", "b1"}));
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(raw_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk));
+
+    // Descriptor bytes should be unchanged (inline, not repacked)
+    ASSERT_TRUE(read_struct->GetFieldByName("b0")->Equals(desc_array->GetFieldByName("b0")));
+    ASSERT_TRUE(read_struct->GetFieldByName("b1")->Equals(desc_array->GetFieldByName("b1")));
+}
+
+TEST_P(BlobTableInteTest, TestBlobDescriptorFieldPartialInline) {
+    // 4 blob fields: b0,b1 are inline descriptors; b2,b3 are regular blob fields written to
+    // .blob files.
+    arrow::FieldVector fields = {
+        arrow::field("f0", arrow::int32()), BlobUtils::ToArrowField("b0", true),
+        BlobUtils::ToArrowField("b1", true), BlobUtils::ToArrowField("b2", true),
+        BlobUtils::ToArrowField("b3", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},   {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_DESCRIPTOR_FIELD, "b0,b1"}, {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Input uses plain raw bytes:
+    // b0: all non-null, b1: has nulls, b2: all non-null, b3: has nulls
+    std::string raw_json = R"([
+        [1, "img_0", null,    "raw_2_0", "raw_3_0"],
+        [2, "img_1", "vid_1", "raw_2_1", null      ],
+        [3, "img_2", null,    "raw_2_2", "raw_3_2" ]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array,
+                         ConvertRawBlobToDescriptor(raw_array, {"b0", "b1", "b2", "b3"}));
+
+    // write: b0,b1 as descriptor bytes; b2,b3 as raw bytes (paimon writes them to .blob files)
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Scan and verify DataFileMeta: b2,b3 go to .blob files, "f0", "b0", "b1" go to main files.
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    VerifyDataFileMetas(plan, /*expected_file_count=*/3, /*expected_row_counts=*/{3, 3, 3},
+                        /*expected_min_seqs=*/{1, 1, 1}, /*expected_max_seqs=*/{1, 1, 1},
+                        /*expected_first_row_ids=*/{0, 0, 0},
+                        /*expected_write_cols=*/
+                        {std::vector<std::string>{"f0", "b0", "b1"}, std::vector<std::string>{"b2"},
+                         std::vector<std::string>{"b3"}});
+
+    std::map<std::string, std::string> read_options = {{Options::BLOB_AS_DESCRIPTOR, "true"}};
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, schema->field_names(), plan,
+                                                /*predicate=*/nullptr, read_options));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+
+    // b0,b1 inline descriptor (not repacked), should match input
+    ASSERT_TRUE(read_struct->GetFieldByName("b0")->Equals(desc_array->GetFieldByName("b0")));
+    ASSERT_TRUE(read_struct->GetFieldByName("b1")->Equals(desc_array->GetFieldByName("b1")));
+
+    // Resolve b0,b1 descriptors back to raw bytes, then compare full struct
+    ASSERT_OK_AND_ASSIGN(auto resolved,
+                         ConvertDescriptorToRawBlob(read_struct, {"b0", "b1", "b2", "b3"}));
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(raw_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk));
+}
+
+TEST_P(BlobTableInteTest, TestBlobDescriptorMultiCommitAndShuffledReadSchema) {
+    // Multiple write+commit rounds with a shuffled read schema: b3, b2, b1, b0, f0.
+    arrow::FieldVector fields = {
+        arrow::field("f0", arrow::int32()), BlobUtils::ToArrowField("b0", true),
+        BlobUtils::ToArrowField("b1", true), BlobUtils::ToArrowField("b2", true),
+        BlobUtils::ToArrowField("b3", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},   {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_DESCRIPTOR_FIELD, "b0,b1"}, {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+
+    // --- First write+commit ---
+    std::string raw_json_1 = R"([
+        [1, "img_0", null,    "raw_2_0", "raw_3_0"],
+        [2, "img_1", "vid_1", "raw_2_1", null      ]
+    ])";
+    auto raw_array_1 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json_1).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array_1, ConvertRawBlobToDescriptor(raw_array_1, {"b0", "b1"}));
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_1,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array_1}));
+    ASSERT_OK(Commit(table_path, commit_msgs_1));
+
+    // --- Second write+commit ---
+    std::string raw_json_2 = R"([
+        [3, "img_2", "vid_2", "raw_2_2", "raw_3_2"],
+        [4, null,    "vid_3", "raw_2_3", "raw_3_3"]
+    ])";
+    auto raw_array_2 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json_2).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array_2, ConvertRawBlobToDescriptor(raw_array_2, {"b0", "b1"}));
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_2,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array_2}));
+    ASSERT_OK(Commit(table_path, commit_msgs_2));
+
+    // --- Third write+commit ---
+    std::string raw_json_3 = R"([
+        [5, "img_4", null,    "raw_2_4", null     ],
+        [6, "img_5", "vid_5", null,      "raw_3_5"]
+    ])";
+    auto raw_array_3 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json_3).ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto desc_array_3, ConvertRawBlobToDescriptor(raw_array_3, {"b0", "b1"}));
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_3,
+                         WriteArray(table_path, {}, schema->field_names(), {desc_array_3}));
+    ASSERT_OK(Commit(table_path, commit_msgs_3));
+
+    // test read
+    {
+        // --- Read with shuffled schema: b3, b2, b1, b0, f0 ---
+        std::vector<std::string> shuffled_read_schema = {"b3", "b2", "b1", "b0", "f0"};
+        ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+
+        std::map<std::string, std::string> read_options = {{Options::BLOB_AS_DESCRIPTOR, "false"}};
+        ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, shuffled_read_schema, plan,
+                                                    /*predicate=*/nullptr, read_options));
+        ASSERT_TRUE(result.chunked_array);
+        auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+        auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+
+        // Build expected array in shuffled order from all 3 batches
+        arrow::FieldVector shuffled_fields = {
+            BlobUtils::ToArrowField("b3", true), BlobUtils::ToArrowField("b2", true),
+            BlobUtils::ToArrowField("b1", true), BlobUtils::ToArrowField("b0", true),
+            arrow::field("f0", arrow::int32())};
+        std::string expected_json = R"([
+        ["raw_3_0", "raw_2_0", null,    "img_0", 1],
+        [null,      "raw_2_1", "vid_1", "img_1", 2],
+        ["raw_3_2", "raw_2_2", "vid_2", "img_2", 3],
+        ["raw_3_3", "raw_2_3", "vid_3", null,    4],
+        [null,      "raw_2_4", null,    "img_4", 5],
+        ["raw_3_5", null,      "vid_5", "img_5", 6]
+    ])";
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(shuffled_fields),
+                                                      expected_json)
+                .ValueOrDie());
+
+        // Resolve descriptors (b0, b1 are descriptor fields) back to raw bytes
+        ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"b0", "b1"}));
+        ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array));
+        ASSERT_TRUE(resolved->Equals(expected_with_rk));
+    }
+    {
+        // test scan and read with GlobalIndexResult
+        std::vector<std::string> shuffled_read_schema = {"b3", "b2", "b1", "b0", "f0"};
+        ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path, /*predicate=*/nullptr,
+                                                  /*row_ranges=*/{Range(1, 3), Range(5, 5)}));
+        std::map<std::string, std::string> read_options = {{Options::BLOB_AS_DESCRIPTOR, "false"}};
+        ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, shuffled_read_schema, plan,
+                                                    /*predicate=*/nullptr, read_options));
+        ASSERT_TRUE(result.chunked_array);
+        auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+        auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+
+        // Build expected array in shuffled order from all 3 batches
+        arrow::FieldVector shuffled_fields = {
+            BlobUtils::ToArrowField("b3", true), BlobUtils::ToArrowField("b2", true),
+            BlobUtils::ToArrowField("b1", true), BlobUtils::ToArrowField("b0", true),
+            arrow::field("f0", arrow::int32())};
+        std::string expected_json = R"([
+        [null,      "raw_2_1", "vid_1", "img_1", 2],
+        ["raw_3_2", "raw_2_2", "vid_2", "img_2", 3],
+        ["raw_3_3", "raw_2_3", "vid_3", null,    4],
+        ["raw_3_5", null,      "vid_5", "img_5", 6]
+    ])";
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(shuffled_fields),
+                                                      expected_json)
+                .ValueOrDie());
+
+        // Resolve descriptors (b0, b1 are descriptor fields) back to raw bytes
+        ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"b0", "b1"}));
+        ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array));
+        ASSERT_TRUE(resolved->Equals(expected_with_rk));
+    }
+}
+
+// The shared-shredding map is read from one main data file while the blob payload is read from a
+// separate blob file with the same row-id range.
+TEST_P(BlobTableInteTest, TestSharedShreddingWithBlobDataEvolution) {
+    if (GetParam() == "avro") {
+        return;
+    }
+
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("tags", arrow::map(arrow::utf8(), arrow::int64())),
+        BlobUtils::ToArrowField("payload"),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, GetParam()},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::FILE_SYSTEM, "local"},
+        {"fields.tags.map.storage-layout", "shared-shredding"},
+        {"fields.tags.map.shared-shredding.max-columns", "1"},
+    };
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto map_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[0], fields[1]}),
+                                                  R"([
+                [1, [["a", 10], ["z", 11]]],
+                [2, [["a", 20]]],
+                [3, null]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto map_msgs, WriteArray(table_path, {}, {"id", "tags"}, {map_array}));
+    ASSERT_OK(Commit(table_path, map_msgs));
+
+    auto blob_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[0], fields[2]}),
+                                                  R"([
+                [1, "payload-1"],
+                [2, "payload-2"],
+                [3, "payload-3"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto blob_msgs,
+                         WriteArray(table_path, {}, {"id", "payload"}, {blob_array}));
+    SetFirstRowId(0, blob_msgs);
+    ASSERT_OK(Commit(table_path, blob_msgs));
+
+    auto expected = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [1, [["a", 10], ["z", 11]], "payload-1"],
+                [2, [["a", 20]], "payload-2"],
+                [3, null, "payload-3"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields)->field_names(), expected));
+}
+
+// Two independent shared-shredding map columns are written into different main files.
+TEST_P(BlobTableInteTest, TestMultipleSharedShreddingMapsWithBlobDataEvolution) {
+    if (GetParam() == "avro") {
+        return;
+    }
+
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("f0", arrow::map(arrow::utf8(), arrow::int64())),
+        arrow::field("f1", arrow::map(arrow::utf8(), arrow::utf8())),
+        BlobUtils::ToArrowField("payload"),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, GetParam()},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::FILE_SYSTEM, "local"},
+        {"fields.f0.map.storage-layout", "shared-shredding"},
+        {"fields.f0.map.shared-shredding.max-columns", "1"},
+        {"fields.f1.map.storage-layout", "shared-shredding"},
+        {"fields.f1.map.shared-shredding.max-columns", "1"},
+    };
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto f0_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[0], fields[1]}),
+                                                  R"([
+                [1, [["a", 10], ["z", 11]]],
+                [2, [["a", 20]]],
+                [3, null]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto f0_msgs, WriteArray(table_path, {}, {"id", "f0"}, {f0_array}));
+    ASSERT_OK(Commit(table_path, f0_msgs));
+
+    auto f1_blob_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[2], fields[3]}),
+                                                  R"([
+                [[["b", "red"], ["y", "blue"]], "payload-1"],
+                [[["b", "green"]], "payload-2"],
+                [[], "payload-3"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto f1_blob_msgs,
+                         WriteArray(table_path, {}, {"f1", "payload"}, {f1_blob_array}));
+    SetFirstRowId(0, f1_blob_msgs);
+    ASSERT_OK(Commit(table_path, f1_blob_msgs));
+
+    auto expected = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [1, [["a", 10], ["z", 11]], [["b", "red"], ["y", "blue"]], "payload-1"],
+                [2, [["a", 20]], [["b", "green"]], "payload-2"],
+                [3, null, [], "payload-3"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields)->field_names(), expected));
+}
+
+// A newer partial data file rewrites only the shared-shredding map for the same row-id range.
+TEST_P(BlobTableInteTest, TestSharedShreddingMapOverrideWithBlobDataEvolution) {
+    if (GetParam() == "avro") {
+        return;
+    }
+
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("tags", arrow::map(arrow::utf8(), arrow::int64())),
+        BlobUtils::ToArrowField("payload"),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, GetParam()},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::FILE_SYSTEM, "local"},
+        {"fields.tags.map.storage-layout", "shared-shredding"},
+        {"fields.tags.map.shared-shredding.max-columns", "1"},
+    };
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto old_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [1, [["a", 10], ["z", 11]], "payload-1"],
+                [2, [["a", 20]], "payload-2"],
+                [3, [["a", 30]], "payload-3"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(
+        auto old_msgs,
+        WriteArray(table_path, {}, arrow::schema(fields)->field_names(), {old_array}));
+    ASSERT_OK(Commit(table_path, old_msgs));
+
+    auto new_map_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[1]}),
+                                                  R"([
+                [[["a", 100], ["z", 101]]],
+                [null],
+                [[]]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto new_map_msgs, WriteArray(table_path, {}, {"tags"}, {new_map_array}));
+    SetFirstRowId(0, new_map_msgs);
+    ASSERT_OK(Commit(table_path, new_map_msgs));
+
+    auto expected = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [1, [["a", 100], ["z", 101]], "payload-1"],
+                [2, null, "payload-2"],
+                [3, [], "payload-3"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields)->field_names(), expected));
+}
+
+TEST_P(BlobTableInteTest, TestOrcMapStorageLayoutEvolutionWithBlobDataEvolution) {
+    if (GetParam() != "orc") {
+        return;
+    }
+
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("tags", arrow::map(arrow::utf8(), arrow::utf8())),
+        BlobUtils::ToArrowField("payload"),
+    };
+    std::map<std::string, std::string> options_v0 = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, "orc"},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::FILE_SYSTEM, "local"},
+        {"fields.tags.map.storage-layout", "default"},
+        {"orc.read.enable-lazy-decoding", "true"},
+        {"orc.dictionary-key-size-threshold", "1"},
+    };
+    CreateTable(fields, /*partition_keys=*/{}, options_v0);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto array_v0 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [1, [["a", "red"], ["z", "blue"]], "payload-1"],
+                [2, [["a", "red"], ["z", "green"]], "payload-2"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(
+        auto msgs_v0, WriteArray(table_path, {}, arrow::schema(fields)->field_names(), {array_v0}));
+    ASSERT_OK(Commit(table_path, msgs_v0));
+
+    std::map<std::string, std::string> options_v1 = options_v0;
+    options_v1["fields.tags.map.storage-layout"] = "shared-shredding";
+    options_v1["fields.tags.map.shared-shredding.max-columns"] = "1";
+    ASSERT_OK(WriteNextSchema(
+        table_path, {DataField(0, fields[0]), DataField(1, fields[1]), DataField(2, fields[2])},
+        /*highest_field_id=*/2, options_v1));
+
+    auto array_v1 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [3, [["a", "red"], ["z", "yellow"]], "payload-3"],
+                [4, [["a", "red"]], "payload-4"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(
+        auto msgs_v1, WriteArray(table_path, {}, arrow::schema(fields)->field_names(), {array_v1}));
+    ASSERT_OK(Commit(table_path, msgs_v1));
+
+    auto expected = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields),
+                                                  R"([
+                [1, [["a", "red"], ["z", "blue"]], "payload-1"],
+                [2, [["a", "red"], ["z", "green"]], "payload-2"],
+                [3, [["a", "red"], ["z", "yellow"]], "payload-3"],
+                [4, [["a", "red"]], "payload-4"]
+            ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields)->field_names(), expected));
+}
+
+TEST_P(BlobTableInteTest, TestDataEvolutionWithBlobDescriptorField) {
+    // Test DataEvolution (split-column write) combined with blob descriptor fields.
+    // Schema: f0(int32), b0/b1(blob descriptor inline), b2/b3(blob).
+    // Commit 1: file A writes (f0, b2, b3)
+    // Commit 2: file B writes (f0, b0, b1) with SetFirstRowId(0)
+    // -> merges with commit 1
+    // Commit 3: file A writes (f0, b0, b1, b3)
+    // Commit 4: file B writes (b0, b1, b3) with SetFirstRowId(3)
+    // -> merges with commit 3
+    arrow::FieldVector fields = {
+        arrow::field("f0", arrow::int32()), BlobUtils::ToArrowField("b0", true),
+        BlobUtils::ToArrowField("b1", true), BlobUtils::ToArrowField("b2", true),
+        BlobUtils::ToArrowField("b3", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},   {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_DESCRIPTOR_FIELD, "b0,b1"}, {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // --- Commit 1: file A (f0, b2, b3), Commit 2: file B (f0, b0, b1) SetFirstRowId(0) ---
+    std::string file_a1_json = R"([
+        [1, "raw_2_0", "raw_3_0"],
+        [2, "raw_2_1", null     ],
+        [3, null,      "raw_3_2"]
+    ])";
+    arrow::FieldVector file_a1_fields = {fields[0], fields[3], fields[4]};
+    auto file_a1_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(file_a1_fields), file_a1_json)
+            .ValueOrDie());
+
+    std::string file_b1_json = R"([
+        [1, "img_0", "vid_0"],
+        [2, "img_1", null   ],
+        [3, "img_2", "vid_2"]
+    ])";
+    arrow::FieldVector file_b1_fields = {fields[0], fields[1], fields[2]};
+    auto file_b1_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(file_b1_fields), file_b1_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto file_b1_desc,
+                         ConvertRawBlobToDescriptor(file_b1_array, {"b0", "b1"}));
+
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_a1,
+                         WriteArray(table_path, {}, {"f0", "b2", "b3"}, {file_a1_array}));
+    ASSERT_OK(Commit(table_path, commit_msgs_a1));
+
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_b1,
+                         WriteArray(table_path, {}, {"f0", "b0", "b1"}, {file_b1_desc}));
+    SetFirstRowId(0, commit_msgs_b1);
+    ASSERT_OK(Commit(table_path, commit_msgs_b1));
+
+    // --- Commit 3: file A (f0, b0, b1, b3), Commit 4: file B (b0, b1, b3) SetFirstRowId(3) ---
+    // Duplicate cols b0, b1, b3: file B (commit 4, newer) takes precedence.
+    std::string file_a2_json = R"([
+        [4, "img_3_old", "vid_3_old", "raw_3_3_old"],
+        [5, null,        "vid_4_old", "raw_3_4_old"],
+        [6, "img_5_old", null,        null         ]
+    ])";
+    arrow::FieldVector file_a2_fields = {fields[0], fields[1], fields[2], fields[4]};
+    auto file_a2_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(file_a2_fields), file_a2_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto file_a2_desc,
+                         ConvertRawBlobToDescriptor(file_a2_array, {"b0", "b1"}));
+
+    std::string file_b2_json = R"([
+        ["img_3", "vid_3", "raw_3_3"],
+        [null,    "vid_4", "raw_3_4"],
+        ["img_5", null,    null     ]
+    ])";
+    arrow::FieldVector file_b2_fields = {fields[1], fields[2], fields[4]};
+    auto file_b2_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(file_b2_fields), file_b2_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto file_b2_desc,
+                         ConvertRawBlobToDescriptor(file_b2_array, {"b0", "b1"}));
+
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_a2,
+                         WriteArray(table_path, {}, {"f0", "b0", "b1", "b3"}, {file_a2_desc}));
+    ASSERT_OK(Commit(table_path, commit_msgs_a2));
+
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_b2,
+                         WriteArray(table_path, {}, {"b0", "b1", "b3"}, {file_b2_desc}));
+    SetFirstRowId(3, commit_msgs_b2);
+    ASSERT_OK(Commit(table_path, commit_msgs_b2));
+
+    // --- Read all data with full schema ---
+    std::vector<std::string> read_schema = {"f0", "b0", "b1", "b2", "b3"};
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+
+    std::map<std::string, std::string> read_options = {{Options::BLOB_AS_DESCRIPTOR, "false"}};
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, read_schema, plan,
+                                                /*predicate=*/nullptr, read_options));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_EQ(read_struct->length(), 6);
+
+    // Expected: round1 all columns present; round2 b2=null, b0/b1/b3 from file B (newer)
+    std::string expected_json = R"([
+        [1, "img_0", "vid_0", "raw_2_0", "raw_3_0"],
+        [2, "img_1", null,    "raw_2_1", null      ],
+        [3, "img_2", "vid_2", null,      "raw_3_2" ],
+        [4, "img_3", "vid_3", null,      "raw_3_3" ],
+        [5, null,    "vid_4", null,      "raw_3_4" ],
+        [6, "img_5", null,    null,      null      ]
+    ])";
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+
+    // Resolve descriptors back to raw bytes
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(read_struct, {"b0", "b1"}));
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_array));
+    ASSERT_TRUE(resolved->type()->Equals(expected_with_rk->type()));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk));
+}
+
+TEST_P(BlobTableInteTest, TestBlobDescriptorFieldWriteRawBytesDirectly) {
+    // Similar to TestBlobDescriptorField but writes raw bytes directly without converting to
+    // descriptor first. Descriptor fields reject values without the descriptor magic header.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("b0", true),
+                                 BlobUtils::ToArrowField("b1", true)};
+
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, GetParam()},
+        {Options::TARGET_FILE_SIZE, "700"},        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},   {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_DESCRIPTOR_FIELD, "b0,b1"}, {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Write raw bytes directly (no ConvertRawBlobToDescriptor)
+    std::string raw_json = R"([
+        [1, "image_data_0", "video_data_0"],
+        [2, "image_data_1", "video_data_1"],
+        [3, "image_data_2", "video_data_2"]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+
+    auto schema = arrow::schema(fields);
+    ASSERT_NOK_WITH_MSG(WriteArray(table_path, {}, schema->field_names(), {raw_array}),
+                        "BLOB inline field b0 require values to be set as corresponding type.");
+}
+
+TEST_P(BlobTableInteTest, TestBlobViewFieldWithUpstreamTable) {
+    auto file_format = GetParam();
+    if (file_format == "avro") {
+        return;
+    }
+
+    const std::string upstream_db_name = "append_table_with_multi_blob";
+    const std::string upstream_table_name = "append_table_with_multi_blob";
+    std::string src_db_path = paimon::test::GetDataDir() + file_format + "/" + upstream_db_name +
+                              ".db/" + upstream_table_name;
+    std::string dst_db_path =
+        PathUtil::JoinPath(dir_->Str(), upstream_db_name + ".db/" + upstream_table_name);
+    ASSERT_TRUE(TestUtil::CopyDirectory(src_db_path, dst_db_path));
+
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("view", true)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_VIEW_FIELD, "view"},
+        {Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, dir_->Str()},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // src array
+    Identifier upstream_identifier(upstream_db_name, upstream_table_name);
+    arrow::LargeBinaryBuilder view_builder;
+    for (int32_t i = 0; i < 8; ++i) {
+        if (i < 6) {
+            BlobViewStruct view_struct(upstream_identifier, /*field_id=*/6,
+                                       /*row_id=*/static_cast<int64_t>(i));
+            auto serialized = view_struct.Serialize(pool_);
+            ASSERT_TRUE(view_builder
+                            .Append(reinterpret_cast<const uint8_t*>(serialized->data()),
+                                    serialized->size())
+                            .ok());
+        } else {
+            ASSERT_TRUE(view_builder.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> write_view_array;
+    ASSERT_TRUE(view_builder.Finish(&write_view_array).ok());
+    auto write_f0_array = arrow::ipc::internal::json::ArrayFromJSON(
+                              arrow::int32(), R"([100,101,102,103,104,105,106,107])")
+                              .ValueOrDie();
+    auto write_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(arrow::ArrayVector({write_f0_array, write_view_array}),
+                                 std::vector<std::string>({"f0", "view"}))
+            .ValueOrDie());
+
+    // write & commit
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {write_struct}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    std::string padding_b(2048, 'b');
+    std::string padding_d(2048, 'd');
+    std::string padding_e(2048, 'e');
+    std::string padding_f(2048, 'f');
+
+    // scan & read
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadTable(table_path, schema->field_names(), plan, /*predicate=*/nullptr));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_EQ(read_struct->length(), 8);
+    ASSERT_OK_AND_ASSIGN(auto result_array, ConvertDescriptorToRawBlob(read_struct, {"view"}));
+
+    // clang-format off
+    std::string expected_json = R"([
+[100, null],
+[101, ")" + padding_b + R"("],
+[102, null],
+[103, ")" + padding_d + R"("],
+[104, ")" + padding_e + R"("],
+[105, ")" + padding_f + R"("],
+[106, null],
+[107, null]
+])";
+    // clang-format on
+    auto expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_struct));
+
+    ASSERT_TRUE(result_array->Equals(expected_with_rk))
+        << "result_array:" << result_array->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+
+    // Sub-case 1: scan with row_ranges.
+    {
+        ASSERT_OK_AND_ASSIGN(auto range_plan, ScanTable(table_path, /*predicate=*/nullptr,
+                                                        /*row_ranges=*/{Range(1, 3), Range(5, 5)}));
+        ASSERT_OK_AND_ASSIGN(auto range_result, ReadTable(table_path, schema->field_names(),
+                                                          range_plan, /*predicate=*/nullptr));
+        ASSERT_TRUE(range_result.chunked_array);
+        auto range_concat = arrow::Concatenate(range_result.chunked_array->chunks()).ValueOrDie();
+        auto range_struct = std::dynamic_pointer_cast<arrow::StructArray>(range_concat);
+        ASSERT_EQ(range_struct->length(), 4);
+        ASSERT_OK_AND_ASSIGN(auto range_resolved,
+                             ConvertDescriptorToRawBlob(range_struct, {"view"}));
+
+        // clang-format off
+        std::string range_json = R"([
+[101, ")" + padding_b + R"("],
+[102, null],
+[103, ")" + padding_d + R"("],
+[105, ")" + padding_f + R"("]
+])";
+        // clang-format on
+        auto range_expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), range_json)
+                .ValueOrDie());
+        ASSERT_OK_AND_ASSIGN(auto range_expected_with_rk,
+                             PrependRowKindColumn(range_expected_struct));
+        ASSERT_TRUE(range_resolved->Equals(range_expected_with_rk))
+            << "range_resolved:" << range_resolved->ToString() << std::endl
+            << "expected:" << range_expected_with_rk->ToString();
+    }
+
+    // Sub-case 2: scan with predicate (f0 > 102), data evolution split read will ignore format push
+    // down
+    {
+        auto predicate = PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"f0",
+                                                       FieldType::INT, Literal(102));
+        ASSERT_OK_AND_ASSIGN(auto pred_plan, ScanTable(table_path, predicate, /*row_ranges=*/{}));
+        ASSERT_OK_AND_ASSIGN(auto pred_result,
+                             ReadTable(table_path, schema->field_names(), pred_plan, predicate));
+        ASSERT_TRUE(pred_result.chunked_array);
+        auto pred_concat = arrow::Concatenate(pred_result.chunked_array->chunks()).ValueOrDie();
+        auto pred_struct = std::dynamic_pointer_cast<arrow::StructArray>(pred_concat);
+        ASSERT_EQ(pred_struct->length(), 8);
+        ASSERT_OK_AND_ASSIGN(auto pred_resolved, ConvertDescriptorToRawBlob(pred_struct, {"view"}));
+
+        // clang-format off
+        std::string pred_json = R"([
+[100, null],
+[101, ")" + padding_b + R"("],
+[102, null],
+[103, ")" + padding_d + R"("],
+[104, ")" + padding_e + R"("],
+[105, ")" + padding_f + R"("],
+[106, null],
+[107, null]
+])";
+        // clang-format on
+        auto pred_expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), pred_json)
+                .ValueOrDie());
+        ASSERT_OK_AND_ASSIGN(auto pred_expected_with_rk,
+                             PrependRowKindColumn(pred_expected_struct));
+        ASSERT_TRUE(pred_resolved->Equals(pred_expected_with_rk))
+            << "pred_resolved:" << pred_resolved->ToString() << std::endl
+            << "expected:" << pred_expected_with_rk->ToString();
+    }
+}
+
+TEST_P(BlobTableInteTest, TestForwardBlobViewReference) {
+    auto file_format = GetParam();
+    if (file_format == "avro") {
+        return;
+    }
+
+    // Forward blob view references between two blob-view tables: read the source table with
+    // resolve dynamically disabled, write the preserved BlobViewStruct bytes into the target
+    // table, then verify the target still stores the original upstream references and a
+    // default read resolves them to the actual upstream blob values.
+    const std::string upstream_db_name = "append_table_with_multi_blob";
+    const std::string upstream_table_name = "append_table_with_multi_blob";
+    std::string src_db_path = paimon::test::GetDataDir() + file_format + "/" + upstream_db_name +
+                              ".db/" + upstream_table_name;
+    std::string dst_db_path =
+        PathUtil::JoinPath(dir_->Str(), upstream_db_name + ".db/" + upstream_table_name);
+    ASSERT_TRUE(TestUtil::CopyDirectory(src_db_path, dst_db_path));
+
+    // The source table has no upstream warehouse configured: only a read with resolve
+    // dynamically disabled can succeed on it.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("view", true)};
+    std::map<std::string, std::string> source_options = {{Options::MANIFEST_FORMAT, "orc"},
+                                                         {Options::FILE_FORMAT, file_format},
+                                                         {Options::BUCKET, "-1"},
+                                                         {Options::ROW_TRACKING_ENABLED, "true"},
+                                                         {Options::DATA_EVOLUTION_ENABLED, "true"},
+                                                         {Options::BLOB_VIEW_FIELD, "view"},
+                                                         {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, source_options);
+    std::string source_table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // The target table configures the upstream warehouse for resolving forwarded references.
+    std::map<std::string, std::string> target_options = source_options;
+    target_options[Options::BLOB_VIEW_UPSTREAM_WAREHOUSE] = dir_->Str();
+    auto schema = arrow::schema(fields);
+    ::ArrowSchema c_target_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &c_target_schema).ok());
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(dir_->Str(), {}));
+    ASSERT_OK(catalog->CreateTable(Identifier("foo", "bar_forward"), &c_target_schema,
+                                   /*partition_keys=*/{}, /*primary_keys=*/{}, target_options,
+                                   /*ignore_if_exists=*/false));
+    std::string target_table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar_forward");
+
+    // src array
+    Identifier upstream_identifier(upstream_db_name, upstream_table_name);
+    arrow::LargeBinaryBuilder view_builder;
+    for (int32_t i = 0; i < 8; ++i) {
+        if (i < 6) {
+            BlobViewStruct view_struct(upstream_identifier, /*field_id=*/6,
+                                       /*row_id=*/static_cast<int64_t>(i));
+            auto serialized = view_struct.Serialize(pool_);
+            ASSERT_TRUE(view_builder
+                            .Append(reinterpret_cast<const uint8_t*>(serialized->data()),
+                                    serialized->size())
+                            .ok());
+        } else {
+            ASSERT_TRUE(view_builder.AppendNull().ok());
+        }
+    }
+    std::shared_ptr<arrow::Array> write_view_array;
+    ASSERT_TRUE(view_builder.Finish(&write_view_array).ok());
+    auto write_f0_array = arrow::ipc::internal::json::ArrayFromJSON(
+                              arrow::int32(), R"([100,101,102,103,104,105,106,107])")
+                              .ValueOrDie();
+    auto write_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(arrow::ArrayVector({write_f0_array, write_view_array}),
+                                 std::vector<std::string>({"f0", "view"}))
+            .ValueOrDie());
+
+    // write & commit into the source table
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(source_table_path, {}, schema->field_names(), {write_struct}));
+    ASSERT_OK(Commit(source_table_path, commit_msgs));
+
+    // A default read fails on the missing upstream warehouse: the pass-through below is
+    // enabled by the dynamic option alone.
+    ASSERT_OK_AND_ASSIGN(auto source_plan, ScanTable(source_table_path));
+    ASSERT_NOK_WITH_MSG(
+        ReadTable(source_table_path, schema->field_names(), source_plan, /*predicate=*/nullptr),
+        "BLOB_VIEW_UPSTREAM_WAREHOUSE");
+
+    ASSERT_OK_AND_ASSIGN(
+        auto source_result,
+        ReadTable(source_table_path, schema->field_names(), source_plan, /*predicate=*/nullptr,
+                  {{Options::BLOB_VIEW_RESOLVE_ENABLED, "false"}}));
+    ASSERT_TRUE(source_result.chunked_array);
+    auto source_concat = arrow::Concatenate(source_result.chunked_array->chunks()).ValueOrDie();
+    auto source_struct = std::dynamic_pointer_cast<arrow::StructArray>(source_concat);
+    ASSERT_EQ(source_struct->length(), 8);
+    auto forward_f0_array = source_struct->GetFieldByName("f0");
+    ASSERT_TRUE(forward_f0_array);
+    auto forward_view_array = source_struct->GetFieldByName("view");
+    ASSERT_TRUE(forward_view_array);
+    ASSERT_TRUE(forward_view_array->Equals(write_view_array))
+        << "source view:" << forward_view_array->ToString() << std::endl
+        << "written view:" << write_view_array->ToString();
+
+    // Forward the preserved references into the target blob-view table.
+    auto forward_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(arrow::ArrayVector({forward_f0_array, forward_view_array}),
+                                 std::vector<std::string>({"f0", "view"}))
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(
+        auto forward_commit_msgs,
+        WriteArray(target_table_path, {}, schema->field_names(), {forward_struct}));
+    ASSERT_OK(Commit(target_table_path, forward_commit_msgs));
+
+    // The target table stores the original upstream references byte-identically.
+    ASSERT_OK_AND_ASSIGN(auto target_plan, ScanTable(target_table_path));
+    ASSERT_OK_AND_ASSIGN(
+        auto raw_target_result,
+        ReadTable(target_table_path, schema->field_names(), target_plan, /*predicate=*/nullptr,
+                  {{Options::BLOB_VIEW_RESOLVE_ENABLED, "false"}}));
+    ASSERT_TRUE(raw_target_result.chunked_array);
+    auto raw_target_concat =
+        arrow::Concatenate(raw_target_result.chunked_array->chunks()).ValueOrDie();
+    auto raw_target_struct = std::dynamic_pointer_cast<arrow::StructArray>(raw_target_concat);
+    ASSERT_EQ(raw_target_struct->length(), 8);
+    auto raw_target_view_array = raw_target_struct->GetFieldByName("view");
+    ASSERT_TRUE(raw_target_view_array);
+    ASSERT_TRUE(raw_target_view_array->Equals(write_view_array))
+        << "target view:" << raw_target_view_array->ToString() << std::endl
+        << "written view:" << write_view_array->ToString();
+
+    // A default read of the target table resolves to the actual upstream blob values.
+    ASSERT_OK_AND_ASSIGN(auto resolved_result,
+                         ReadTable(target_table_path, schema->field_names(), target_plan,
+                                   /*predicate=*/nullptr));
+    ASSERT_TRUE(resolved_result.chunked_array);
+    auto resolved_concat = arrow::Concatenate(resolved_result.chunked_array->chunks()).ValueOrDie();
+    auto resolved_struct = std::dynamic_pointer_cast<arrow::StructArray>(resolved_concat);
+    ASSERT_EQ(resolved_struct->length(), 8);
+    ASSERT_OK_AND_ASSIGN(auto resolved, ConvertDescriptorToRawBlob(resolved_struct, {"view"}));
+
+    std::string padding_b(2048, 'b');
+    std::string padding_d(2048, 'd');
+    std::string padding_e(2048, 'e');
+    std::string padding_f(2048, 'f');
+    // clang-format off
+    std::string expected_json = R"([
+[100, null],
+[101, ")" + padding_b + R"("],
+[102, null],
+[103, ")" + padding_d + R"("],
+[104, ")" + padding_e + R"("],
+[105, ")" + padding_f + R"("],
+[106, null],
+[107, null]
+])";
+    // clang-format on
+    auto expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_struct));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk))
+        << "resolved:" << resolved->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestBlobViewFieldWithUpstreamDescriptorBlob) {
+    auto file_format = GetParam();
+    // Upstream table has two blob descriptor fields. The downstream view references cells from
+    // both b0 (field_id=1) and b1 (field_id=2).
+    const std::string upstream_db_name = "upstream_two_blob";
+    const std::string upstream_table_name = "upstream_two_blob";
+    arrow::FieldVector upstream_fields = {arrow::field("f0", arrow::int32()),
+                                          BlobUtils::ToArrowField("b0", true),
+                                          BlobUtils::ToArrowField("b1", true)};
+    auto upstream_schema = arrow::schema(upstream_fields);
+    std::map<std::string, std::string> upstream_options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_DESCRIPTOR_FIELD, "b0,b1"},
+        {Options::FILE_SYSTEM, "local"}};
+
+    ::ArrowSchema upstream_c_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*upstream_schema, &upstream_c_schema).ok());
+    ASSERT_OK_AND_ASSIGN(auto upstream_catalog,
+                         Catalog::Create(dir_->Str(), {{Options::FILE_SYSTEM, "local"}}));
+    ASSERT_OK(upstream_catalog->CreateDatabase(upstream_db_name, {}, /*ignore_if_exists=*/true));
+    ASSERT_OK(upstream_catalog->CreateTable(
+        Identifier(upstream_db_name, upstream_table_name), &upstream_c_schema,
+        /*partition_keys=*/{}, /*primary_keys=*/{}, upstream_options,
+        /*ignore_if_exists=*/false));
+    std::string upstream_table_path =
+        PathUtil::JoinPath(dir_->Str(), upstream_db_name + ".db/" + upstream_table_name);
+
+    // Write 4 rows of b0/b1 data into the upstream table.
+    std::string upstream_raw_json = R"([
+[0, "b0_data_0", "b1_data_0"],
+[1, "b0_data_1", "b1_data_1"],
+[2, "b0_data_2", "b1_data_2"],
+[3, "b0_data_3", "b1_data_3"]
+])";
+    auto upstream_raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(upstream_fields),
+                                                  upstream_raw_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto upstream_desc_array,
+                         ConvertRawBlobToDescriptor(upstream_raw_array, {"b0", "b1"}));
+    ASSERT_OK_AND_ASSIGN(
+        auto upstream_commit_msgs,
+        WriteArray(upstream_table_path, {}, upstream_schema->field_names(), {upstream_desc_array}));
+    ASSERT_OK(Commit(upstream_table_path, upstream_commit_msgs));
+
+    // Create the downstream blob-view table that references both b0 and b1 of the upstream table.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("view", true)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_VIEW_FIELD, "view"},
+        {Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, dir_->Str()},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Build the view column mixing references to b0 (field_id=1) and b1 (field_id=2).
+    // - row 0: b0 row 0 -> "b0_data_0"
+    // - row 1: b1 row 1 -> "b1_data_1"
+    // - row 2: b0 row 2 -> "b0_data_2"
+    // - row 3: b1 row 3 -> "b1_data_3"
+    Identifier upstream_identifier(upstream_db_name, upstream_table_name);
+    auto append_view = [&](int32_t field_id, int64_t row_id, arrow::LargeBinaryBuilder* builder) {
+        BlobViewStruct view_struct(upstream_identifier, field_id, row_id);
+        auto serialized = view_struct.Serialize(pool_);
+        ASSERT_TRUE(
+            builder
+                ->Append(reinterpret_cast<const uint8_t*>(serialized->data()), serialized->size())
+                .ok());
+    };
+    arrow::LargeBinaryBuilder view_builder;
+    append_view(/*field_id=*/1, /*row_id=*/0, &view_builder);
+    append_view(/*field_id=*/2, /*row_id=*/1, &view_builder);
+    append_view(/*field_id=*/1, /*row_id=*/2, &view_builder);
+    append_view(/*field_id=*/2, /*row_id=*/3, &view_builder);
+    std::shared_ptr<arrow::Array> write_view_array;
+    ASSERT_TRUE(view_builder.Finish(&write_view_array).ok());
+
+    auto write_f0_array =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::int32(), R"([100,101,102,103])")
+            .ValueOrDie();
+    auto write_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(arrow::ArrayVector({write_f0_array, write_view_array}),
+                                 std::vector<std::string>({"f0", "view"}))
+            .ValueOrDie());
+
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {write_struct}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Scan/read the downstream table and verify the resolved view blobs.
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadTable(table_path, schema->field_names(), plan, /*predicate=*/nullptr));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_EQ(read_struct->length(), 4);
+    ASSERT_OK_AND_ASSIGN(auto result_array, ConvertDescriptorToRawBlob(read_struct, {"view"}));
+
+    std::string expected_json = R"([
+[100, "b0_data_0"],
+[101, "b1_data_1"],
+[102, "b0_data_2"],
+[103, "b1_data_3"]
+])";
+    auto expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_struct));
+    ASSERT_TRUE(result_array->Equals(expected_with_rk))
+        << "result_array:" << result_array->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestBlobViewFieldWithMultipleUpstreamTables) {
+    auto file_format = GetParam();
+    if (file_format == "avro") {
+        return;
+    }
+
+    // Upstream table 1: append_table_with_multi_blob, with two blob fields f5 (field_id=5) and
+    // f6 (field_id=6).
+    const std::string multi_blob_db_name = "append_table_with_multi_blob";
+    const std::string multi_blob_table_name = "append_table_with_multi_blob";
+    {
+        std::string src_db_path = paimon::test::GetDataDir() + file_format + "/" +
+                                  multi_blob_db_name + ".db/" + multi_blob_table_name;
+        std::string dst_db_path =
+            PathUtil::JoinPath(dir_->Str(), multi_blob_db_name + ".db/" + multi_blob_table_name);
+        ASSERT_TRUE(TestUtil::CopyDirectory(src_db_path, dst_db_path));
+    }
+
+    // Upstream table 2: blob_append_table_alter_table_with_cast_with_data_evolution, with one blob
+    // field blob (field_id=8).
+    const std::string alter_db_name = "blob_append_table_alter_table_with_cast_with_data_evolution";
+    const std::string alter_table_name =
+        "blob_append_table_alter_table_with_cast_with_data_evolution";
+    {
+        std::string src_db_path = paimon::test::GetDataDir() + file_format + "/" + alter_db_name +
+                                  ".db/" + alter_table_name;
+        std::string dst_db_path =
+            PathUtil::JoinPath(dir_->Str(), alter_db_name + ".db/" + alter_table_name);
+        ASSERT_TRUE(TestUtil::CopyDirectory(src_db_path, dst_db_path));
+    }
+
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("view1", true),
+                                 BlobUtils::ToArrowField("view2", true)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_VIEW_FIELD, "view1,view2"},
+        {Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, dir_->Str()},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    Identifier multi_blob_identifier(multi_blob_db_name, multi_blob_table_name);
+    Identifier alter_identifier(alter_db_name, alter_table_name);
+
+    auto append_view = [&](const Identifier& identifier, int32_t field_id, int64_t row_id,
+                           arrow::LargeBinaryBuilder* builder) {
+        BlobViewStruct view_struct(identifier, field_id, row_id);
+        auto serialized = view_struct.Serialize(pool_);
+        ASSERT_TRUE(
+            builder
+                ->Append(reinterpret_cast<const uint8_t*>(serialized->data()), serialized->size())
+                .ok());
+    };
+
+    // Build view1 column. References multi_blob.f5 (field_id=5) and f6 (field_id=6).
+    // Some upstream cells are referenced more than once on purpose.
+    // - row 0: f5 row 3  -> 'D' * 1024
+    // - row 1: f6 row 1  -> 'b' * 2048
+    // - row 2: f5 row 3  -> 'D' * 1024  (repeat of row 0)
+    // - row 3: f6 row 4  -> 'e' * 2048
+    // - row 4: f5 row 3  -> 'D' * 1024  (repeat of row 0)
+    // - row 5: f6 row 1  -> 'b' * 2048  (repeat of row 1)
+    // - row 6: f5 row 5  -> 'F' * 1024
+    // - row 7: f6 row 6  -> 'g' * 2048
+    arrow::LargeBinaryBuilder view1_builder;
+    append_view(multi_blob_identifier, /*field_id=*/5, /*row_id=*/3, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/6, /*row_id=*/1, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/5, /*row_id=*/3, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/6, /*row_id=*/4, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/5, /*row_id=*/3, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/6, /*row_id=*/1, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/5, /*row_id=*/5, &view1_builder);
+    append_view(multi_blob_identifier, /*field_id=*/6, /*row_id=*/6, &view1_builder);
+    std::shared_ptr<arrow::Array> write_view1_array;
+    ASSERT_TRUE(view1_builder.Finish(&write_view1_array).ok());
+
+    // Build view2 column. References alter.blob (field_id=8).
+    // Some upstream cells are referenced more than once on purpose.
+    // - row 0: blob row 0  -> "Lily"
+    // - row 1: blob row 5  -> "Apple"
+    // - row 2: blob row 0  -> "Lily"        (repeat of row 0)
+    // - row 3: blob row 2  -> "Bob"
+    // - row 4: blob row 5  -> "Apple"       (repeat of row 1)
+    // - row 5: blob row 9  -> "Elderberry"
+    // - row 6: blob row 0  -> "Lily"        (repeat of row 0)
+    // - row 7: blob row 3  -> "Cindy"
+    arrow::LargeBinaryBuilder view2_builder;
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/0, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/5, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/0, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/2, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/5, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/9, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/0, &view2_builder);
+    append_view(alter_identifier, /*field_id=*/8, /*row_id=*/3, &view2_builder);
+    std::shared_ptr<arrow::Array> write_view2_array;
+    ASSERT_TRUE(view2_builder.Finish(&write_view2_array).ok());
+
+    auto write_f0_array = arrow::ipc::internal::json::ArrayFromJSON(
+                              arrow::int32(), R"([100,101,102,103,104,105,106,107])")
+                              .ValueOrDie();
+    auto write_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(
+            arrow::ArrayVector({write_f0_array, write_view1_array, write_view2_array}),
+            std::vector<std::string>({"f0", "view1", "view2"}))
+            .ValueOrDie());
+
+    // write & commit
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {write_struct}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Expected blob contents per referenced upstream cell.
+    std::string blob_f5_row3(1024, 'D');  // multi_blob.f5 row 3
+    std::string blob_f5_row5(1024, 'F');  // multi_blob.f5 row 5
+    std::string blob_f6_row1(2048, 'b');  // multi_blob.f6 row 1
+    std::string blob_f6_row4(2048, 'e');  // multi_blob.f6 row 4
+    std::string blob_f6_row6(2048, 'g');  // multi_blob.f6 row 6
+
+    std::vector<std::string> read_fields = {"view2", "view1", "f0"};
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadTable(table_path, read_fields, plan, /*predicate=*/nullptr));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_EQ(read_struct->length(), 8);
+    ASSERT_OK_AND_ASSIGN(auto result_array,
+                         ConvertDescriptorToRawBlob(read_struct, {"view1", "view2"}));
+
+    // Expected struct follows the requested (shuffled) column order: view2, view1, f0.
+    arrow::FieldVector expected_fields = {BlobUtils::ToArrowField("view2", true),
+                                          BlobUtils::ToArrowField("view1", true),
+                                          arrow::field("f0", arrow::int32())};
+    // clang-format off
+    std::string expected_json = R"([
+["Lily", ")" + blob_f5_row3 + R"(", 100],
+["Apple", ")" + blob_f6_row1 + R"(", 101],
+["Lily", ")" + blob_f5_row3 + R"(", 102],
+["Bob", ")" + blob_f6_row4 + R"(", 103],
+["Apple", ")" + blob_f5_row3 + R"(", 104],
+["Elderberry", ")" + blob_f6_row1 + R"(", 105],
+["Lily", ")" + blob_f5_row5 + R"(", 106],
+["Cindy", ")" + blob_f6_row6 + R"(", 107]
+])";
+    // clang-format on
+    auto expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(expected_fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_struct));
+
+    ASSERT_TRUE(result_array->Equals(expected_with_rk))
+        << "result_array:" << result_array->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestBlobViewFailsWhenBothPathsAbsent) {
+    auto file_format = GetParam();
+    auto upstream_dir = UniqueTestDirectory::Create("local");
+    const std::string upstream_db_name = "nonexistent_db";
+    const std::string upstream_table_name = "nonexistent_table";
+
+    // Build downstream table that references the non-existent upstream table.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("view", true)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_VIEW_FIELD, "view"},
+        {Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, upstream_dir->Str()},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Write a single row with a BlobViewStruct pointing to the non-existent upstream table.
+    Identifier upstream_identifier(upstream_db_name, upstream_table_name);
+    BlobViewStruct view_struct(upstream_identifier, /*field_id=*/2, /*row_id=*/0);
+    auto serialized = view_struct.Serialize(pool_);
+    arrow::LargeBinaryBuilder view_builder;
+    ASSERT_TRUE(
+        view_builder
+            .Append(reinterpret_cast<const uint8_t*>(serialized->data()), serialized->size())
+            .ok());
+    std::shared_ptr<arrow::Array> write_view_array;
+    ASSERT_TRUE(view_builder.Finish(&write_view_array).ok());
+    auto write_f0_array =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::int32(), R"([100])").ValueOrDie();
+    auto write_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(arrow::ArrayVector({write_f0_array, write_view_array}),
+                                 std::vector<std::string>({"f0", "view"}))
+            .ValueOrDie());
+
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {write_struct}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Reading should fail because both paths are absent.
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    ASSERT_NOK_WITH_MSG(ReadTable(table_path, schema->field_names(), plan, /*predicate=*/nullptr),
+                        "Ambiguous table path");
+}
+
+TEST_P(BlobTableInteTest, TestBlobViewWithFallbackPath) {
+    auto file_format = GetParam();
+    const std::string upstream_db_name = "fallback_db";
+    const std::string upstream_table_name = "fallback_table";
+    arrow::FieldVector upstream_fields = {arrow::field("f0", arrow::int32()),
+                                          BlobUtils::ToArrowField("blob", true)};
+    auto upstream_schema = arrow::schema(upstream_fields);
+    std::map<std::string, std::string> upstream_options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_AS_DESCRIPTOR, "true"},
+        {Options::FILE_SYSTEM, "local"}};
+
+    // Create the upstream table at the fallback path: <warehouse>/db/table (no .db).
+    auto upstream_dir = UniqueTestDirectory::Create("local");
+    std::string fallback_table_path =
+        PathUtil::JoinPath(upstream_dir->Str(), upstream_db_name + "/" + upstream_table_name);
+
+    // Manually create schema at fallback path so it can be read as a valid paimon table.
+    {
+        // Use a temporary warehouse with Catalog to build the table data, then copy to fallback.
+        auto temp_dir = UniqueTestDirectory::Create("local");
+        ::ArrowSchema c_schema;
+        ASSERT_TRUE(arrow::ExportSchema(*upstream_schema, &c_schema).ok());
+        ASSERT_OK_AND_ASSIGN(auto catalog,
+                             Catalog::Create(temp_dir->Str(), {{Options::FILE_SYSTEM, "local"}}));
+        ASSERT_OK(catalog->CreateDatabase(upstream_db_name, {}, /*ignore_if_exists=*/true));
+        ASSERT_OK(catalog->CreateTable(Identifier(upstream_db_name, upstream_table_name), &c_schema,
+                                       /*partition_keys=*/{}, /*primary_keys=*/{}, upstream_options,
+                                       /*ignore_if_exists=*/false));
+        std::string temp_table_path =
+            PathUtil::JoinPath(temp_dir->Str(), upstream_db_name + ".db/" + upstream_table_name);
+
+        // Write data to the temp table.
+        std::string raw_json = R"([[0, "hello"], [1, "world"]])";
+        auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(upstream_fields), raw_json)
+                .ValueOrDie());
+        ASSERT_OK_AND_ASSIGN(auto desc_array, ConvertRawBlobToDescriptor(raw_array, {"blob"}));
+        ASSERT_OK_AND_ASSIGN(
+            auto upstream_commit_msgs,
+            WriteArray(temp_table_path, {}, upstream_schema->field_names(), {desc_array}));
+        ASSERT_OK(Commit(temp_table_path, upstream_commit_msgs));
+
+        // Copy the temp table to the fallback path (without .db).
+        ASSERT_TRUE(TestUtil::CopyDirectory(temp_table_path, fallback_table_path));
+    }
+
+    // Build the downstream table.
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32()),
+                                 BlobUtils::ToArrowField("view", true)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::BLOB_VIEW_FIELD, "view"},
+        {Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, upstream_dir->Str()},
+        {Options::FILE_SYSTEM, "local"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Write downstream rows referencing the upstream fallback table.
+    Identifier upstream_identifier(upstream_db_name, upstream_table_name);
+    arrow::LargeBinaryBuilder view_builder;
+    for (int64_t row = 0; row < 2; ++row) {
+        BlobViewStruct view_struct(upstream_identifier, /*field_id=*/1, /*row_id=*/row);
+        auto serialized = view_struct.Serialize(pool_);
+        ASSERT_TRUE(
+            view_builder
+                .Append(reinterpret_cast<const uint8_t*>(serialized->data()), serialized->size())
+                .ok());
+    }
+    std::shared_ptr<arrow::Array> write_view_array;
+    ASSERT_TRUE(view_builder.Finish(&write_view_array).ok());
+    auto write_f0_array =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::int32(), R"([100, 101])").ValueOrDie();
+    auto write_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::StructArray::Make(arrow::ArrayVector({write_f0_array, write_view_array}),
+                                 std::vector<std::string>({"f0", "view"}))
+            .ValueOrDie());
+
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs,
+                         WriteArray(table_path, {}, schema->field_names(), {write_struct}));
+    ASSERT_OK(Commit(table_path, commit_msgs));
+
+    // Read and verify
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadTable(table_path, schema->field_names(), plan, /*predicate=*/nullptr));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+    ASSERT_EQ(read_struct->length(), 2);
+    ASSERT_OK_AND_ASSIGN(auto result_array, ConvertDescriptorToRawBlob(read_struct, {"view"}));
+
+    std::string expected_json = R"([[100, "hello"], [101, "world"]])";
+    auto expected_struct = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_json)
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(expected_struct));
+    ASSERT_TRUE(result_array->Equals(expected_with_rk))
+        << "result_array:" << result_array->ToString() << std::endl
+        << "expected:" << expected_with_rk->ToString();
+}
+
+TEST_P(BlobTableInteTest, TestReadBlobDescriptorFieldFromJava) {
+    auto file_format = GetParam();
+    if (file_format == "avro") {
+        return;
+    }
+    std::string table_path =
+        GetDataDir() + "/" + file_format + "/blob_desc_field.db/blob_desc_field";
+    arrow::FieldVector fields = {
+        arrow::field("f0", arrow::int32()), BlobUtils::ToArrowField("b0", true),
+        BlobUtils::ToArrowField("b1", true), BlobUtils::ToArrowField("b2", true),
+        BlobUtils::ToArrowField("b3", true)};
+    auto schema = arrow::schema(fields);
+    // b0: all non-null, b1: has nulls, b2: all non-null, b3: has nulls
+    std::string raw_json = R"([
+        [1, "img_0", null,    "raw_2_0", "raw_3_0"],
+        [2, "img_1", "vid_1", "raw_2_1", null      ],
+        [3, "img_2", null,    "raw_2_2", "raw_3_2" ]
+    ])";
+    auto raw_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), raw_json).ValueOrDie());
+
+    ASSERT_OK_AND_ASSIGN(auto plan, ScanTable(table_path));
+    std::map<std::string, std::string> read_options = {{Options::BLOB_AS_DESCRIPTOR, "false"}};
+    ASSERT_OK_AND_ASSIGN(auto result, ReadTable(table_path, schema->field_names(), plan,
+                                                /*predicate=*/nullptr, read_options));
+    ASSERT_TRUE(result.chunked_array);
+    auto read_concat = arrow::Concatenate(result.chunked_array->chunks()).ValueOrDie();
+    auto read_struct = std::dynamic_pointer_cast<arrow::StructArray>(read_concat);
+
+    // After read, b0 and b1 are both descriptor-stored; resolve all back to raw bytes.
+    // Java-generated descriptors may contain absolute paths from the generation machine.
+    // Rewrite them to the portable blob directories inside the copied table path.
+    BlobDescriptorPathRewrite rewrite{table_path, {"raw_blob", "external_blob"}};
+    ASSERT_OK_AND_ASSIGN(auto resolved,
+                         ConvertDescriptorToRawBlob(read_struct, {"b0", "b1"}, rewrite));
+    ASSERT_OK_AND_ASSIGN(auto expected_with_rk, PrependRowKindColumn(raw_array));
+    ASSERT_TRUE(resolved->Equals(expected_with_rk));
 }
 
 }  // namespace paimon::test

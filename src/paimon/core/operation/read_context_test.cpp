@@ -20,7 +20,10 @@
 
 #include <utility>
 
+#include "arrow/c/bridge.h"
+#include "arrow/type.h"
 #include "gtest/gtest.h"
+#include "paimon/common/io/cache/lru_cache.h"
 #include "paimon/defs.h"
 #include "paimon/executor.h"
 #include "paimon/memory/memory_pool.h"
@@ -36,7 +39,7 @@ TEST(ReadContextTest, TestDefaultValue) {
     ASSERT_EQ(ctx->GetPath(), "table_root_path");
     ASSERT_TRUE(ctx->GetMemoryPool());
     ASSERT_TRUE(ctx->GetExecutor());
-    ASSERT_TRUE(ctx->GetReadSchema().empty());
+    ASSERT_TRUE(ctx->GetReadFieldNames().empty());
     ASSERT_TRUE(ctx->GetReadFieldIds().empty());
     ASSERT_TRUE(ctx->GetOptions().empty());
     ASSERT_FALSE(ctx->GetPredicate());
@@ -60,7 +63,7 @@ TEST(ReadContextTest, TestSetContent) {
                              /*hole_size_limit=*/128, /*pre_buffer_limit=*/2048);
 
     builder.AddOption("key", "value");
-    builder.SetReadSchema({"f1", "f2"});
+    builder.SetReadFieldNames({"f1", "f2"});
     builder.SetReadFieldIds({0, 1});
     auto predicate =
         PredicateBuilder::IsNull(/*field_index=*/0, /*field_name=*/"f1", FieldType::INT);
@@ -77,16 +80,17 @@ TEST(ReadContextTest, TestSetContent) {
     builder.SetTableSchema("table-schema-json");
     builder.WithBranch("rt");
     builder.WithCacheConfig(cache_config);
-    builder.WithFileSystemSchemeToIdentifierMap({{"file", "local"}});
     auto fs = std::make_shared<MockFileSystem>();
     builder.WithFileSystem(fs);
+    auto manifest_cache = std::make_shared<LruCache>(1024);
+    builder.WithCache(manifest_cache);
     ASSERT_OK_AND_ASSIGN(auto ctx, builder.Finish());
 
     // test result
     ASSERT_EQ(ctx->GetPath(), "table_root_path");
     ASSERT_TRUE(ctx->GetMemoryPool());
     ASSERT_TRUE(ctx->GetExecutor());
-    ASSERT_EQ(ctx->GetReadSchema(), std::vector<std::string>({"f1", "f2"}));
+    ASSERT_EQ(ctx->GetReadFieldNames(), std::vector<std::string>({"f1", "f2"}));
     ASSERT_EQ(ctx->GetReadFieldIds(), std::vector<int32_t>({0, 1}));
     ASSERT_EQ(*predicate, *(ctx->GetPredicate()));
     ASSERT_TRUE(ctx->EnablePredicateFilter());
@@ -105,11 +109,11 @@ TEST(ReadContextTest, TestSetContent) {
     ASSERT_EQ(512U, ctx->GetCacheConfig().GetRangeSizeLimit());
     ASSERT_EQ(128U, ctx->GetCacheConfig().GetHoleSizeLimit());
     ASSERT_EQ(2048U, ctx->GetCacheConfig().GetPreBufferLimit());
-    std::map<std::string, std::string> expected_fs_map = {{"file", "local"}};
-    ASSERT_EQ(expected_fs_map, ctx->GetFileSystemSchemeToIdentifierMap());
+    ASSERT_TRUE(ctx->GetFileSystemSchemeToIdentifierMap().empty());
     std::map<std::string, std::string> expected_options = {{"key", "value"}};
     ASSERT_EQ(expected_options, ctx->GetOptions());
     ASSERT_EQ(ctx->GetSpecificFileSystem(), fs);
+    ASSERT_TRUE(ctx->GetCache());
 }
 
 TEST(ReadContextTest, TestSetOptionsOverridesAddedOptions) {
@@ -121,6 +125,60 @@ TEST(ReadContextTest, TestSetOptionsOverridesAddedOptions) {
 
     std::map<std::string, std::string> expected_options = {{"key1", "value1"}, {"key2", "value2"}};
     ASSERT_EQ(expected_options, ctx->GetOptions());
+}
+
+TEST(ReadContextTest, TestFileSystemAndSchemeMapConflict) {
+    ReadContextBuilder builder("table_root_path");
+    auto fs = std::make_shared<MockFileSystem>();
+    builder.WithFileSystem(fs);
+    builder.WithFileSystemSchemeToIdentifierMap({{"file", "local"}});
+    ASSERT_NOK_WITH_MSG(
+        builder.Finish(),
+        "WithFileSystem() and WithFileSystemSchemeToIdentifierMap() cannot be used together");
+}
+
+TEST(ReadContextTest, TestSchemeMapWithoutFileSystem) {
+    ReadContextBuilder builder("table_root_path");
+    builder.WithFileSystemSchemeToIdentifierMap({{"file", "local"}});
+    ASSERT_OK_AND_ASSIGN(auto ctx, builder.Finish());
+    std::map<std::string, std::string> expected_fs_map = {{"file", "local"}};
+    ASSERT_EQ(expected_fs_map, ctx->GetFileSystemSchemeToIdentifierMap());
+    ASSERT_FALSE(ctx->GetSpecificFileSystem());
+}
+
+TEST(ReadContextTest, TestPrefetchMaxParallelNumZero) {
+    ReadContextBuilder builder("table_root_path");
+    builder.EnablePrefetch(true);
+    builder.SetPrefetchMaxParallelNum(0);
+    ASSERT_NOK_WITH_MSG(builder.Finish(), "prefetch max parallel num should be greater than 0");
+}
+
+TEST(ReadContextTest, TestSetReadSchemaAndHasReadSchema) {
+    auto projected_schema = arrow::schema({arrow::field("f0", arrow::utf8())});
+    auto c_schema = std::make_unique<ArrowSchema>();
+    auto* c_schema_raw = c_schema.get();
+    ASSERT_TRUE(arrow::ExportSchema(*projected_schema, c_schema.get()).ok());
+
+    {
+        ReadContextBuilder builder("table_root_path");
+        builder.SetReadSchema(std::move(c_schema));
+        ASSERT_OK_AND_ASSIGN(auto ctx, builder.Finish());
+        ASSERT_TRUE(ctx->HasReadSchema());
+        ASSERT_EQ(ctx->GetReadSchema(), c_schema_raw);
+    }
+
+    ASSERT_EQ(c_schema, nullptr);
+}
+
+TEST(ReadContextTest, TestSetInvalidReadSchemaIgnored) {
+    auto invalid_schema = std::make_unique<ArrowSchema>();
+
+    ReadContextBuilder builder("table_root_path");
+    builder.SetReadSchema(std::move(invalid_schema));
+    ASSERT_OK_AND_ASSIGN(auto ctx, builder.Finish());
+
+    ASSERT_FALSE(ctx->HasReadSchema());
+    ASSERT_EQ(ctx->GetReadSchema(), nullptr);
 }
 
 }  // namespace paimon::test

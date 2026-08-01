@@ -73,8 +73,9 @@ class MergeFunctionWrapper;
 /// ->ConcatBatchReader across no overlapped
 /// files->KeyValueProjectionReader/AsyncKeyValueProjectionReader
 /// ->DropDeleteReader->SortMergeReader->ConcatKeyValueRecordReader->KeyValueDataFileRecordReader
-/// ->FieldMappingReader->(ApplyDeletionVectorBatchReader)->(DelegatingPrefetchReader)
-/// ->(PrefetchFileBatchReader)->FormatReader
+/// ->FieldMappingReader->(ApplyDeletionVectorBatchReader)->(ShreddingFileReader)
+/// ->(MapSharedShreddingFileReader)
+/// ->(DelegatingPrefetchReader)->(PrefetchFileBatchReader)->FormatReader
 class MergeFileSplitRead : public AbstractSplitRead {
  public:
     static Result<std::unique_ptr<MergeFileSplitRead>> Create(
@@ -105,6 +106,11 @@ class MergeFileSplitRead : public AbstractSplitRead {
 
     std::shared_ptr<FileStorePathFactory> GetPathFactory() const {
         return path_factory_;
+    }
+
+    /// Get the key comparator (needed by count readers for IntervalPartition).
+    std::shared_ptr<FieldsComparator> GetKeyComparator() const {
+        return key_comparator_;
     }
 
     std::shared_ptr<arrow::Schema> GetValueSchema() const {

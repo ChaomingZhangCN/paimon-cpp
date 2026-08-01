@@ -22,19 +22,25 @@
 #include <cassert>
 #include <cstddef>
 #include <exception>
+#include <map>
 #include <optional>
+#include <string>
+#include <string_view>
 #include <utility>
 
 #include "arrow/api.h"
 #include "arrow/array/array_base.h"
 #include "arrow/c/bridge.h"
+#include "arrow/util/base64.h"
 #include "fmt/format.h"
 #include "orc/Common.hh"
 #include "orc/OrcFile.hh"
 #include "orc/Type.hh"
 #include "orc/Vector.hh"
 #include "orc/Writer.hh"
+#include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/metrics/metrics_impl.h"
+#include "paimon/common/options/memory_size.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/options_utils.h"
 #include "paimon/common/utils/string_utils.h"
@@ -75,6 +81,9 @@ Result<std::unique_ptr<OrcFormatWriter>> OrcFormatWriter::Create(
     const std::map<std::string, std::string>& options, const std::string& compression,
     int32_t batch_size, const std::shared_ptr<MemoryPool>& pool) {
     assert(output_stream);
+    if (VariantTypeUtils::ContainsVariantField(arrow::schema(schema.fields()))) {
+        return Status::NotImplemented("ORC format does not support the VARIANT type");
+    }
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<::orc::Type> orc_type, OrcAdapter::GetOrcType(schema));
     auto data_type = arrow::struct_(schema.fields());
     try {
@@ -207,6 +216,38 @@ std::shared_ptr<Metrics> OrcFormatWriter::GetWriterMetrics() const {
     return metrics_;
 }
 
+Status OrcFormatWriter::AddMetadata(const std::map<std::string, std::string>& metadata) {
+    if (metadata.empty()) {
+        return Status::OK();
+    }
+    try {
+        for (const auto& [key, value] : metadata) {
+            writer_->addUserMetadata(key, arrow::util::base64_encode(std::string_view(value)));
+        }
+    } catch (const std::exception& e) {
+        return Status::Invalid(
+            fmt::format("orc format writer AddMetadata failed for file {}, with {} error",
+                        output_stream_->getName(), e.what()));
+    } catch (...) {
+        return Status::UnknownError(
+            fmt::format("orc format writer AddMetadata failed for file {}, with unknown error",
+                        output_stream_->getName()));
+    }
+    return Status::OK();
+}
+
+namespace {
+
+Result<uint64_t> GetMemorySizeOption(const std::map<std::string, std::string>& options,
+                                     const std::string& key, uint64_t default_value) {
+    PAIMON_ASSIGN_OR_RAISE(std::string value, OptionsUtils::GetValueFromMap<std::string>(
+                                                  options, key, std::to_string(default_value)));
+    PAIMON_ASSIGN_OR_RAISE(int64_t bytes, MemorySize::ParseBytes(value));
+    return static_cast<uint64_t>(bytes);
+}
+
+}  // namespace
+
 Result<::orc::WriterOptions> OrcFormatWriter::PrepareWriterOptions(
     const std::map<std::string, std::string>& options, const std::string& file_compression,
     const std::shared_ptr<arrow::DataType>& data_type) {
@@ -220,15 +261,15 @@ Result<::orc::WriterOptions> OrcFormatWriter::PrepareWriterOptions(
         }
     }
     ::orc::WriterOptions writer_options;
-    PAIMON_ASSIGN_OR_RAISE(size_t stripe_size, OptionsUtils::GetValueFromMap<size_t>(
-                                                   options, ORC_STRIPE_SIZE, DEFAULT_STRIPE_SIZE));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t stripe_size,
+                           GetMemorySizeOption(options, ORC_STRIPE_SIZE, DEFAULT_STRIPE_SIZE));
     writer_options.setStripeSize(stripe_size);
     PAIMON_ASSIGN_OR_RAISE(::orc::CompressionKind compression,
                            ToOrcCompressionKind(StringUtils::ToLowerCase(file_compression)));
     writer_options.setCompression(compression);
-    PAIMON_ASSIGN_OR_RAISE(size_t compression_block_size, OptionsUtils::GetValueFromMap<size_t>(
-                                                              options, ORC_COMPRESSION_BLOCK_SIZE,
-                                                              DEFAULT_COMPRESSION_BLOCK_SIZE));
+    PAIMON_ASSIGN_OR_RAISE(
+        uint64_t compression_block_size,
+        GetMemorySizeOption(options, ORC_COMPRESSION_BLOCK_SIZE, DEFAULT_COMPRESSION_BLOCK_SIZE));
     writer_options.setCompressionBlockSize(compression_block_size);
     PAIMON_ASSIGN_OR_RAISE(
         double dictionary_key_threshold,
@@ -237,9 +278,9 @@ Result<::orc::WriterOptions> OrcFormatWriter::PrepareWriterOptions(
     writer_options.setDictionaryKeySizeThreshold(dictionary_key_threshold);
     // always use tight numeric vector
     writer_options.setUseTightNumericVector(true);
-    PAIMON_ASSIGN_OR_RAISE(size_t row_index_stride,
-                           OptionsUtils::GetValueFromMap<size_t>(options, ORC_ROW_INDEX_STRIDE,
-                                                                 DEFAULT_ROW_INDEX_STRIDE));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t row_index_stride,
+                           OptionsUtils::GetValueFromMap<uint64_t>(options, ORC_ROW_INDEX_STRIDE,
+                                                                   DEFAULT_ROW_INDEX_STRIDE));
     writer_options.setRowIndexStride(row_index_stride);
     // In order to avoid issue like https://github.com/alibaba/paimon-cpp/issues/42, we explicitly
     // set GMT timezone.

@@ -24,6 +24,8 @@
 #include <utility>
 #include <vector>
 
+#include "arrow/api.h"
+#include "arrow/array/concatenate.h"
 #include "arrow/c/bridge.h"
 #include "arrow/ipc/api.h"
 #include "paimon/api.h"
@@ -59,25 +61,22 @@ class TestHelper {
         const std::vector<std::string>& partition_keys,
         const std::vector<std::string>& primary_keys,
         const std::map<std::string, std::string>& options, bool is_streaming_mode,
-        bool ignore_if_exists = false) {
-        // only for test && only check the key
-        auto new_options = options;
-        new_options["enable-object-store-catalog-in-inte-test"] = "";
-        PAIMON_ASSIGN_OR_RAISE(auto catalog, Catalog::Create(root_path, new_options));
-        PAIMON_RETURN_NOT_OK(catalog->CreateDatabase("foo", new_options, ignore_if_exists));
+        bool ignore_if_exists = false, const std::string& temp_directory = "") {
+        PAIMON_ASSIGN_OR_RAISE(auto catalog, Catalog::Create(root_path, options));
+        PAIMON_RETURN_NOT_OK(catalog->CreateDatabase("foo", options, ignore_if_exists));
         ::ArrowSchema c_schema;
         ScopeGuard guard([schema = &c_schema]() { ArrowSchemaRelease(schema); });
         PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema, &c_schema));
         PAIMON_RETURN_NOT_OK(catalog->CreateTable(Identifier("foo", "bar"), &c_schema,
-                                                  partition_keys, primary_keys, new_options,
+                                                  partition_keys, primary_keys, options,
                                                   ignore_if_exists));
         std::string table_path = PathUtil::JoinPath(root_path, "foo.db/bar");
-        return Create(table_path, new_options, is_streaming_mode);
+        return Create(table_path, options, is_streaming_mode, temp_directory);
     }
 
     static Result<std::unique_ptr<TestHelper>> Create(
         const std::string& table_path, const std::map<std::string, std::string>& options,
-        bool is_streaming_mode) {
+        bool is_streaming_mode, const std::string& temp_directory = "") {
         std::string file_system_identifier = "local";
         auto fs_iter = options.find(Options::FILE_SYSTEM);
         if (fs_iter != options.end()) {
@@ -87,6 +86,9 @@ class TestHelper {
                                FileSystemFactory::Get(file_system_identifier, table_path, options));
         std::string commit_user = "commit_user";
         WriteContextBuilder context_builder(table_path, commit_user);
+        if (!temp_directory.empty()) {
+            context_builder.WithTempDirectory(temp_directory);
+        }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<WriteContext> write_context,
                                context_builder.SetOptions(options)
                                    .WithStreamingMode(is_streaming_mode)
@@ -94,14 +96,10 @@ class TestHelper {
                                    .Finish());
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreWrite> write,
                                FileStoreWrite::Create(std::move(write_context)));
-        std::map<std::string, std::string> new_options = options;
-        // only for test && only check the key
-        new_options["enable-pk-commit-in-inte-test"] = "";
-        new_options["enable-object-store-commit-in-inte-test"] = "";
         CommitContextBuilder commit_context_builder(table_path, commit_user);
         PAIMON_ASSIGN_OR_RAISE(
             std::unique_ptr<CommitContext> commit_context,
-            commit_context_builder.SetOptions(new_options).IgnoreEmptyCommit(false).Finish());
+            commit_context_builder.SetOptions(options).IgnoreEmptyCommit(false).Finish());
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreCommit> commit,
                                FileStoreCommit::Create(std::move(commit_context)));
         return std::unique_ptr<TestHelper>(new TestHelper(std::move(file_system), std::move(write),
@@ -174,6 +172,27 @@ class TestHelper {
         return result_plan->Splits();
     }
 
+    /// Builds a one-row struct array holding the serialized descriptor of the blob.
+    static Result<std::shared_ptr<arrow::Array>> MakeBlobDescriptorArray(
+        const std::shared_ptr<arrow::DataType>& struct_type, const std::shared_ptr<Blob>& blob,
+        const std::shared_ptr<MemoryPool>& pool) {
+        if (struct_type->num_fields() != 1 ||
+            struct_type->field(0)->type()->id() != arrow::Type::LARGE_BINARY) {
+            return Status::Invalid("struct_type must have a single large binary field");
+        }
+        arrow::StructBuilder struct_builder(struct_type, arrow::default_memory_pool(),
+                                            {std::make_shared<arrow::LargeBinaryBuilder>()});
+        auto blob_builder =
+            static_cast<arrow::LargeBinaryBuilder*>(struct_builder.field_builder(0));
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(struct_builder.Append());
+        PAIMON_UNIQUE_PTR<Bytes> descriptor = blob->ToDescriptor(pool);
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(
+            blob_builder->Append(descriptor->data(), descriptor->size()));
+        std::shared_ptr<arrow::Array> array;
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(struct_builder.Finish(&array));
+        return array;
+    }
+
     static Result<bool> CheckBlobsEqual(const std::vector<std::shared_ptr<Blob>>& result_blobs,
                                         const std::vector<std::shared_ptr<Blob>>& expected_blobs,
                                         const std::shared_ptr<FileSystem>& fs) {
@@ -186,8 +205,8 @@ class TestHelper {
             PAIMON_ASSIGN_OR_RAISE(auto result_stream, result_blobs[i]->NewInputStream(fs));
             PAIMON_ASSIGN_OR_RAISE(auto expected_stream, expected_blobs[i]->NewInputStream(fs));
 
-            PAIMON_ASSIGN_OR_RAISE(uint64_t result_length, result_stream->Length());
-            PAIMON_ASSIGN_OR_RAISE(uint64_t expected_length, expected_stream->Length());
+            PAIMON_ASSIGN_OR_RAISE(int64_t result_length, result_stream->Length());
+            PAIMON_ASSIGN_OR_RAISE(int64_t expected_length, expected_stream->Length());
             if (result_length != expected_length) {
                 auto result_descriptor_bytes = result_blobs[i]->ToDescriptor(GetDefaultPool());
                 auto expected_descriptor_bytes = expected_blobs[i]->ToDescriptor(GetDefaultPool());
@@ -241,72 +260,38 @@ class TestHelper {
         return result_blobs;
     }
 
-    // need to reconstruct the blob array, because the array in read result do not have blob meta
-    Result<std::shared_ptr<arrow::Array>> ReconstructBlobArray(
-        const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::Schema>& schema) {
-        ::ArrowArray c_array;
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*array, &c_array));
-        ::ArrowSchema new_c_schema;
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportSchema(*schema, &new_c_schema));
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(auto new_array,
-                                          arrow::ImportArray(&c_array, &new_c_schema));
-        return new_array;
+    /// Reads all rows of the given splits and returns the raw result (including the leading
+    /// `_VALUE_KIND` column). Useful when the expected data cannot be expressed as JSON, e.g.
+    /// binary-encoded VARIANT columns.
+    Result<std::shared_ptr<arrow::ChunkedArray>> ReadResult(
+        const std::vector<std::shared_ptr<Split>>& splits) {
+        return ReadResult(splits, /*read_schema=*/nullptr);
     }
 
-    Result<bool> ReadAndCheckResultForBlobTable(
-        const std::shared_ptr<arrow::Schema>& all_columns_schema,
-        const std::vector<std::shared_ptr<Split>>& splits, const std::string& main_expected_json,
-        const std::vector<PAIMON_UNIQUE_PTR<Bytes>>& expected_blob_descriptors) {
+    /// Reads all rows of the given splits with an optional projected read schema.
+    Result<std::shared_ptr<arrow::ChunkedArray>> ReadResult(
+        const std::vector<std::shared_ptr<Split>>& splits,
+        std::unique_ptr<::ArrowSchema> read_schema) {
         ReadContextBuilder read_context_builder(table_path_);
         read_context_builder.SetOptions(options_);
+        if (read_schema != nullptr) {
+            read_context_builder.SetReadSchema(std::move(read_schema));
+        }
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context,
                                read_context_builder.Finish());
         PAIMON_ASSIGN_OR_RAISE(auto table_read, TableRead::Create(std::move(read_context)));
         PAIMON_ASSIGN_OR_RAISE(auto batch_reader, table_read->CreateReader(splits));
-        PAIMON_ASSIGN_OR_RAISE(auto read_result,
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::ChunkedArray> collected,
                                ReadResultCollector::CollectResult(batch_reader.get()));
-
-        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(auto concat_array,
-                                          arrow::Concatenate(read_result->chunks()));
-        PAIMON_ASSIGN_OR_RAISE(auto reconstruct_array,
-                               ReconstructBlobArray(concat_array, all_columns_schema));
-        PAIMON_ASSIGN_OR_RAISE(
-            auto separated_array,
-            BlobUtils::SeparateBlobArray(
-                std::dynamic_pointer_cast<arrow::StructArray>(reconstruct_array)));
-
-        arrow::EqualOptions equal_options = arrow::EqualOptions::Defaults();
-
-        // check main columns
-        auto separated_schema = BlobUtils::SeparateBlobSchema(all_columns_schema);
+        if (collected->num_chunks() == 0) {
+            return collected;
+        }
+        // The collected batches borrow reader-owned buffers; copy them into the process pool
+        // while the reader is still alive so the returned result may outlive it.
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-            auto main_expected_array,
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_(separated_schema.main_schema->fields()), main_expected_json));
-        auto main_expected_chunk_array = std::make_shared<arrow::ChunkedArray>(main_expected_array);
-        bool main_equal = main_expected_chunk_array->Equals(
-            arrow::ChunkedArray(separated_array.main_array), equal_options.diff_sink(&std::cout));
-        if (!main_equal) {
-            std::cout << "[expected_data_type]" << main_expected_chunk_array->type()->ToString()
-                      << std::endl;
-            std::cout << "[actual_data_type]" << separated_array.main_array->type()->ToString()
-                      << std::endl;
-            std::cout << "[expected]:" << main_expected_chunk_array->ToString() << std::endl;
-            std::cout << "[actual]: " << separated_array.main_array->ToString() << std::endl;
-        }
-
-        // check blob column
-        std::vector<std::shared_ptr<Blob>> expected_blobs;
-        for (const auto& descriptor : expected_blob_descriptors) {
-            PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Blob> blob,
-                                   Blob::FromDescriptor(descriptor->data(), descriptor->size()));
-            expected_blobs.emplace_back(blob);
-        }
-        PAIMON_ASSIGN_OR_RAISE(auto result_blobs, ToBlobs(separated_array.blob_array));
-        PAIMON_ASSIGN_OR_RAISE(bool blob_equal, CheckBlobsEqual(result_blobs, expected_blobs, fs_));
-
-        table_read.reset();
-        return main_equal && blob_equal;
+            std::shared_ptr<arrow::Array> copied,
+            arrow::Concatenate(collected->chunks(), arrow::default_memory_pool()));
+        return std::make_shared<arrow::ChunkedArray>(copied);
     }
 
     Result<bool> ReadAndCheckResult(const std::shared_ptr<arrow::DataType>& data_type,

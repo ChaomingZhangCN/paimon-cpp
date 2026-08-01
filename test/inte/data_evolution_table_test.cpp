@@ -7,18 +7,23 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
+#include <tuple>
+
 #include "arrow/type.h"
 #include "gtest/gtest.h"
 #include "paimon/common/factories/io_hook.h"
+#include "paimon/common/io/cache/lru_cache.h"
 #include "paimon/common/table/special_fields.h"
+#include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
@@ -36,9 +41,11 @@
 #include "paimon/testing/utils/test_helper.h"
 #include "paimon/testing/utils/testharness.h"
 namespace paimon::test {
+using DataEvolutionTableParam = std::tuple<std::string, bool>;
+
 // This is a sdk end-to-end test for data evolution
 class DataEvolutionTableTest : public ::testing::Test,
-                               public ::testing::WithParamInterface<std::string> {
+                               public ::testing::WithParamInterface<DataEvolutionTableParam> {
     void SetUp() override {
         dir_ = UniqueTestDirectory::Create("local");
         int64_t seed = DateTimeUtils::GetCurrentUTCTimeUs();
@@ -48,9 +55,10 @@ class DataEvolutionTableTest : public ::testing::Test,
         dir_.reset();
     }
 
-    void CreateTable(const std::vector<std::string>& partition_keys,
+    void CreateTable(const arrow::FieldVector& fields,
+                     const std::vector<std::string>& partition_keys,
                      const std::map<std::string, std::string>& options) const {
-        auto schema = arrow::schema(fields_);
+        auto schema = arrow::schema(fields);
         ::ArrowSchema c_schema;
         ASSERT_TRUE(arrow::ExportSchema(*schema, &c_schema).ok());
 
@@ -61,9 +69,14 @@ class DataEvolutionTableTest : public ::testing::Test,
                                        /*ignore_if_exists=*/false));
     }
 
+    void CreateTable(const std::vector<std::string>& partition_keys,
+                     const std::map<std::string, std::string>& options) const {
+        CreateTable(fields_, partition_keys, options);
+    }
+
     void CreateTable(const std::vector<std::string>& partition_keys) const {
         std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
-                                                      {Options::FILE_FORMAT, GetParam()},
+                                                      {Options::FILE_FORMAT, FileFormat()},
                                                       {Options::FILE_SYSTEM, "local"},
                                                       {Options::ROW_TRACKING_ENABLED, "true"},
                                                       {Options::DATA_EVOLUTION_ENABLED, "true"}};
@@ -125,6 +138,19 @@ class DataEvolutionTableTest : public ::testing::Test,
         return file_store_commit->Commit(commit_msgs);
     }
 
+    Status CommitWithRowIdCheckFromSnapshot(
+        const std::string& table_path,
+        const std::vector<std::shared_ptr<CommitMessage>>& commit_msgs,
+        std::optional<int64_t> row_id_check_from_snapshot) const {
+        CommitContextBuilder commit_builder(table_path, "commit_user_1");
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<CommitContext> commit_context,
+                               commit_builder.Finish());
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileStoreCommit> file_store_commit,
+                               FileStoreCommit::Create(std::move(commit_context)));
+        file_store_commit->RowIdCheckConflict(row_id_check_from_snapshot);
+        return file_store_commit->Commit(commit_msgs);
+    }
+
     Status ScanAndRead(const std::string& table_path, const std::vector<std::string>& read_schema,
                        const std::shared_ptr<arrow::StructArray>& expected_array,
                        const std::shared_ptr<Predicate>& predicate = nullptr,
@@ -137,7 +163,7 @@ class DataEvolutionTableTest : public ::testing::Test,
             auto global_index_result = BitmapGlobalIndexResult::FromRanges(row_ranges);
             scan_context_builder.SetGlobalIndexResult(global_index_result);
         }
-        PAIMON_ASSIGN_OR_RAISE(auto scan_context, scan_context_builder.Finish());
+        PAIMON_ASSIGN_OR_RAISE(auto scan_context, FinishScanContext(scan_context_builder));
         PAIMON_ASSIGN_OR_RAISE(auto table_scan, TableScan::Create(std::move(scan_context)));
         PAIMON_ASSIGN_OR_RAISE(auto result_plan, table_scan->CreatePlan());
         if (!expected_array && check_scan_plan_when_empty_result) {
@@ -149,7 +175,7 @@ class DataEvolutionTableTest : public ::testing::Test,
         // read
         auto splits = result_plan->Splits();
         ReadContextBuilder read_context_builder(table_path);
-        read_context_builder.SetReadSchema(read_schema).SetPredicate(predicate);
+        read_context_builder.SetReadFieldNames(read_schema).SetPredicate(predicate);
         PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context,
                                read_context_builder.Finish());
         PAIMON_ASSIGN_OR_RAISE(auto table_read, TableRead::Create(std::move(read_context)));
@@ -203,7 +229,7 @@ class DataEvolutionTableTest : public ::testing::Test,
             auto global_index_result = BitmapGlobalIndexResult::FromRanges(row_ranges);
             scan_context_builder.SetGlobalIndexResult(global_index_result);
         }
-        ASSERT_OK_AND_ASSIGN(auto scan_context, scan_context_builder.Finish());
+        ASSERT_OK_AND_ASSIGN(auto scan_context, FinishScanContext(scan_context_builder));
         ASSERT_OK_AND_ASSIGN(auto table_scan, TableScan::Create(std::move(scan_context)));
         ASSERT_OK_AND_ASSIGN(auto result_plan, table_scan->CreatePlan());
         const auto& result_splits = result_plan->Splits();
@@ -229,6 +255,26 @@ class DataEvolutionTableTest : public ::testing::Test,
         ASSERT_EQ(result_row_counts, expected_row_counts);
     }
 
+    Result<std::unique_ptr<ScanContext>> FinishScanContext(ScanContextBuilder& builder) const {
+        if (EnableSnapshotLiveManifestCache()) {
+            if (!snapshot_live_manifest_cache_) {
+                snapshot_live_manifest_cache_ =
+                    std::make_shared<LruCache>(/*max_weight=*/64 * 1024 * 1024);
+            }
+            builder.AddOption(Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS, "3")
+                .WithCache(snapshot_live_manifest_cache_);
+        }
+        return builder.Finish();
+    }
+
+    std::string FileFormat() const {
+        return std::get<0>(GetParam());
+    }
+
+    bool EnableSnapshotLiveManifestCache() const {
+        return std::get<1>(GetParam());
+    }
+
     std::shared_ptr<arrow::StructArray> PrepareBulkData(
         int32_t write_batch_size, std::function<std::string(int32_t)> data_generator,
         const arrow::FieldVector& fields) const {
@@ -248,6 +294,7 @@ class DataEvolutionTableTest : public ::testing::Test,
 
  private:
     std::unique_ptr<UniqueTestDirectory> dir_;
+    mutable std::shared_ptr<Cache> snapshot_live_manifest_cache_;
     arrow::FieldVector fields_ = {
         arrow::field("f0", arrow::int32()),
         arrow::field("f1", arrow::utf8()),
@@ -288,27 +335,65 @@ TEST_P(DataEvolutionTableTest, TestBasic) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[1], fields_[0], SpecialFields::SequenceNumber().field_,
-                                SpecialFields::RowId().field_, fields_[2]}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[1], fields_[0], SpecialFields::SequenceNumber().field_,
+                            SpecialFields::RowId().field_, fields_[2]}),
+            R"([
         ["a", 1, 2, 0, "c"]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "_SEQUENCE_NUMBER", "_ROW_ID", "f2"},
-                              expected_row_tracking_array));
+    ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "_SEQUENCE_NUMBER", "_ROW_ID", "f2"},
+                          expected_row_tracking_array));
 
-        // read score but not indexed split
-        ASSERT_NOK_WITH_MSG(
-            ScanAndRead(table_path, {"f0", "f1", "_INDEX_SCORE"}, expected_row_tracking_array,
-                        /*predicate=*/nullptr,
-                        /*row_ranges=*/{}),
-            "Invalid read schema, read _INDEX_SCORE while split cannot cast to IndexedSplit");
-    }
+    // read score but not indexed split
+    ASSERT_NOK_WITH_MSG(
+        ScanAndRead(table_path, {"f0", "f1", "_INDEX_SCORE"}, expected_row_tracking_array,
+                    /*predicate=*/nullptr,
+                    /*row_ranges=*/{}),
+        "Invalid read schema, read _INDEX_SCORE while split cannot cast to IndexedSplit");
+}
+
+TEST_P(DataEvolutionTableTest, TestCommitConflictOnOverlappedRowIdAndWriteColumns) {
+    CreateTable();
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    // Snapshot 1: initialize row id range [0, 0].
+    std::vector<std::string> init_write_cols = {"f0", "f1", "f2"};
+    auto init_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_), R"([
+        [1, "a", "b"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto init_msgs, WriteArray(table_path, init_write_cols, init_array));
+    ASSERT_OK(Commit(table_path, init_msgs));
+
+    // Snapshot 2: update f2 at row id 0.
+    std::vector<std::string> write_cols = {"f2"};
+    auto src_array_1 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[2]}), R"([
+        ["c"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_1, WriteArray(table_path, write_cols, src_array_1));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs_1);
+    ASSERT_OK(Commit(table_path, commit_msgs_1));
+
+    // Snapshot 3 attempt: update f2 at row id 0 again, and check history from snapshot 1.
+    // This should conflict with snapshot 2 because row-id range and write columns overlap.
+    auto src_array_2 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[2]}), R"([
+        ["d"]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs_2, WriteArray(table_path, write_cols, src_array_2));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs_2);
+    ASSERT_NOK_WITH_MSG(
+        CommitWithRowIdCheckFromSnapshot(table_path, commit_msgs_2,
+                                         /*row_id_check_from_snapshot=*/1),
+        "multiple 'MERGE INTO' operations have encountered conflicts, updating the same file");
 }
 
 TEST_P(DataEvolutionTableTest, TestMultipleAppends) {
@@ -417,17 +502,16 @@ TEST_P(DataEvolutionTableTest, TestMultipleAppends) {
                               /*predicate=*/nullptr,
                               /*row_ranges=*/row_ranges));
     }
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
-                                                          fields_[0],
-                                                          fields_[1],
-                                                          fields_[2],
-                                                          SpecialFields::RowId().field_,
-                                                          SpecialFields::SequenceNumber().field_,
-                                                      }),
-                                                      R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
+                                                      fields_[0],
+                                                      fields_[1],
+                                                      fields_[2],
+                                                      SpecialFields::RowId().field_,
+                                                      SpecialFields::SequenceNumber().field_,
+                                                  }),
+                                                  R"([
         [1, "a", "b", 0, 1],
         [1, "a", "b", 1, 1],
         [1, "a", "b", 2, 1],
@@ -441,11 +525,10 @@ TEST_P(DataEvolutionTableTest, TestMultipleAppends) {
         [1, "a", "b", 10, 2],
         [2, "c", "d", 11, 4]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestOnlySomeColumns) {
@@ -492,24 +575,165 @@ TEST_P(DataEvolutionTableTest, TestOnlySomeColumns) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
-                                                          fields_[0],
-                                                          fields_[1],
-                                                          fields_[2],
-                                                          SpecialFields::RowId().field_,
-                                                          SpecialFields::SequenceNumber().field_,
-                                                      }),
-                                                      R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
+                                                      fields_[0],
+                                                      fields_[1],
+                                                      fields_[2],
+                                                      SpecialFields::RowId().field_,
+                                                      SpecialFields::SequenceNumber().field_,
+                                                  }),
+                                                  R"([
         [1, "a", "b", 0, 3]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
+}
+
+TEST_P(DataEvolutionTableTest, TestMultipleSharedShreddingMapsPartialOverwrite) {
+    if (FileFormat() == "avro") {
+        return;
     }
+
+    auto map_type = arrow::map(arrow::utf8(), arrow::int64());
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("map1", map_type),
+        arrow::field("map2", map_type),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},
+        {Options::FILE_FORMAT, FileFormat()},
+        {Options::FILE_SYSTEM, "local"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {"fields.map1.map.storage-layout", "shared-shredding"},
+        {"fields.map1.map.shared-shredding.max-columns", "1"},
+        {"fields.map2.map.storage-layout", "shared-shredding"},
+        {"fields.map2.map.shared-shredding.max-columns", "1"},
+    };
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto schema = arrow::schema(fields);
+
+    std::vector<std::string> write_cols0 = {"id", "map1"};
+    auto src_array0 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[0], fields[1]}), R"([
+        [1, [["a", 10], ["b", 20]]],
+        [11, [["a", 11], ["b", 21]]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs0, WriteArray(table_path, write_cols0, src_array0));
+    ASSERT_OK(Commit(table_path, commit_msgs0));
+
+    std::vector<std::string> write_cols1 = {"id", "map2"};
+    auto src_array1 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[0], fields[2]}), R"([
+        [2, [["c", 30], ["d", 40]]],
+        [12, [["c", 31], ["d", 41]]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs1, WriteArray(table_path, write_cols1, src_array1));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs1);
+    ASSERT_OK(Commit(table_path, commit_msgs1));
+
+    std::vector<std::string> write_cols2 = {"map1"};
+    auto src_array2 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[1]}), R"([
+        [[["b", 200], ["a", 100]]],
+        [[["b", 201], ["a", 101]]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(auto commit_msgs2, WriteArray(table_path, write_cols2, src_array2));
+    SetFirstRowId(/*reset_first_row_id=*/0, commit_msgs2);
+    ASSERT_OK(Commit(table_path, commit_msgs2));
+
+    // Read all columns and merge values from all partial files.
+    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [2, [["a", 100], ["b", 200]], [["c", 30], ["d", 40]]],
+        [12, [["a", 101], ["b", 201]], [["c", 31], ["d", 41]]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
+
+    // Read a subset of columns and recall only the requested shared-shredding MAP column.
+    auto expected_column_pruned_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[0], fields[2]}), R"([
+        [2, [["c", 30], ["d", 40]]],
+        [12, [["c", 31], ["d", 41]]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"id", "map2"}, expected_column_pruned_array));
+
+    // Read selected keys from both shared-shredding MAP columns after partial overwrite merge.
+    {
+        auto map1_selected_keys =
+            arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {"b"});
+        auto map2_selected_keys =
+            arrow::KeyValueMetadata::Make({DataField::MAP_SELECTED_KEYS}, {"d"});
+        auto read_schema = arrow::schema({
+            fields[0],
+            fields[1]->WithMetadata(map1_selected_keys),
+            fields[2]->WithMetadata(map2_selected_keys),
+        });
+        auto c_schema = std::make_unique<ArrowSchema>();
+        ASSERT_TRUE(arrow::ExportSchema(*read_schema, c_schema.get()).ok());
+
+        ScanContextBuilder scan_context_builder(table_path);
+        ASSERT_OK_AND_ASSIGN(auto scan_context, FinishScanContext(scan_context_builder));
+        ASSERT_OK_AND_ASSIGN(auto table_scan, TableScan::Create(std::move(scan_context)));
+        ASSERT_OK_AND_ASSIGN(auto result_plan, table_scan->CreatePlan());
+
+        ReadContextBuilder read_context_builder(table_path);
+        read_context_builder.SetReadSchema(std::move(c_schema));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context,
+                             read_context_builder.Finish());
+        ASSERT_OK_AND_ASSIGN(auto table_read, TableRead::Create(std::move(read_context)));
+        ASSERT_OK_AND_ASSIGN(auto batch_reader, table_read->CreateReader(result_plan->Splits()));
+        ASSERT_OK_AND_ASSIGN(auto actual, ReadResultCollector::CollectResult(batch_reader.get()));
+
+        auto expected_type = arrow::struct_({
+            SpecialFields::ValueKind().field_,
+            fields[0],
+            fields[1],
+            fields[2],
+        });
+        auto expected = arrow::ipc::internal::json::ArrayFromJSON(expected_type, R"([
+            [0, 2, [["b", 200]], [["d", 40]]],
+            [0, 12, [["b", 201]], [["d", 41]]]
+        ])")
+                            .ValueOrDie();
+        auto expected_chunked = std::make_shared<arrow::ChunkedArray>(expected);
+        ASSERT_TRUE(expected_chunked->Equals(actual))
+            << "actual=" << actual->ToString() << "\nexpected=" << expected_chunked->ToString();
+    }
+
+    // Read a subset of rows after merging values from all partial files.
+    auto expected_partial_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+        [12, [["a", 101], ["b", 201]], [["c", 31], ["d", 41]]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_partial_array,
+                          /*predicate=*/nullptr,
+                          /*row_ranges=*/{Range(1l, 1l)}));
+
+    // Read row tracking fields and verify the latest partial overwrite sequence number.
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields[0], fields[1], fields[2], SpecialFields::RowId().field_,
+                            SpecialFields::SequenceNumber().field_}),
+            R"([
+        [2, [["a", 100], ["b", 200]], [["c", 30], ["d", 40]], 0, 3],
+        [12, [["a", 101], ["b", 201]], [["c", 31], ["d", 41]], 1, 3]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"id", "map1", "map2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestNullValues) {
@@ -561,24 +785,22 @@ TEST_P(DataEvolutionTableTest, TestNullValues) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
-                                                          fields_[0],
-                                                          fields_[1],
-                                                          fields_[2],
-                                                          SpecialFields::RowId().field_,
-                                                          SpecialFields::SequenceNumber().field_,
-                                                      }),
-                                                      R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
+                                                      fields_[0],
+                                                      fields_[1],
+                                                      fields_[2],
+                                                      SpecialFields::RowId().field_,
+                                                      SpecialFields::SequenceNumber().field_,
+                                                  }),
+                                                  R"([
         [1, null, "c", 0, 2]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestMultipleAppendsDifferentFirstRowIds) {
@@ -644,25 +866,23 @@ TEST_P(DataEvolutionTableTest, TestMultipleAppendsDifferentFirstRowIds) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
-                                                          fields_[0],
-                                                          fields_[1],
-                                                          fields_[2],
-                                                          SpecialFields::RowId().field_,
-                                                          SpecialFields::SequenceNumber().field_,
-                                                      }),
-                                                      R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({
+                                                      fields_[0],
+                                                      fields_[1],
+                                                      fields_[2],
+                                                      SpecialFields::RowId().field_,
+                                                      SpecialFields::SequenceNumber().field_,
+                                                  }),
+                                                  R"([
         [1, "a", "b", 0, 1],
         [2, "c", "d", 1, 3]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestMoreData) {
@@ -714,7 +934,7 @@ TEST_P(DataEvolutionTableTest, TestMoreData) {
 TEST_P(DataEvolutionTableTest, TestOnlyRowTrackingEnabled) {
     std::map<std::string, std::string> options = {
         {Options::MANIFEST_FORMAT, "orc"},
-        {Options::FILE_FORMAT, GetParam()},
+        {Options::FILE_FORMAT, FileFormat()},
         {Options::FILE_SYSTEM, "local"},
         {Options::ROW_TRACKING_ENABLED, "true"},
         {Options::DATA_EVOLUTION_ENABLED, "false"},
@@ -735,21 +955,19 @@ TEST_P(DataEvolutionTableTest, TestOnlyRowTrackingEnabled) {
     ASSERT_OK_AND_ASSIGN(auto commit_msgs, WriteArray(table_path, write_cols0, src_array0));
     ASSERT_OK(Commit(table_path, commit_msgs));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[1], fields_[0], SpecialFields::SequenceNumber().field_,
-                                SpecialFields::RowId().field_, fields_[2]}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[1], fields_[0], SpecialFields::SequenceNumber().field_,
+                            SpecialFields::RowId().field_, fields_[2]}),
+            R"([
         ["a", 1, 1, 0, "b"],
         ["c", 2, 1, 1, "d"]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "_SEQUENCE_NUMBER", "_ROW_ID", "f2"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "_SEQUENCE_NUMBER", "_ROW_ID", "f2"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestExternalPath) {
@@ -760,7 +978,7 @@ TEST_P(DataEvolutionTableTest, TestExternalPath) {
 
     std::map<std::string, std::string> options = {
         {Options::MANIFEST_FORMAT, "orc"},
-        {Options::FILE_FORMAT, GetParam()},
+        {Options::FILE_FORMAT, FileFormat()},
         {Options::FILE_SYSTEM, "local"},
         {Options::ROW_TRACKING_ENABLED, "true"},
         {Options::DATA_EVOLUTION_ENABLED, "true"},
@@ -803,21 +1021,19 @@ TEST_P(DataEvolutionTableTest, TestExternalPath) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[1], fields_[0], fields_[2], SpecialFields::RowId().field_,
-                                SpecialFields::SequenceNumber().field_}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[1], fields_[0], fields_[2], SpecialFields::RowId().field_,
+                            SpecialFields::SequenceNumber().field_}),
+            R"([
         ["a", 10, "b", 0, 2],
         ["c", 20, "d", 1, 2]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f1", "f0", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestWithPartitionSimple) {
@@ -881,10 +1097,9 @@ TEST_P(DataEvolutionTableTest, TestWithPartitionSimple) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_array));
 
-    {
-        // test only read partition fields
-        auto expected_array_only_partition = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[1]}), R"([
+    // test only read partition fields
+    auto expected_array_only_partition = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_[1]}), R"([
         ["2024"],
         ["2024"],
         ["2024"],
@@ -892,15 +1107,15 @@ TEST_P(DataEvolutionTableTest, TestWithPartitionSimple) {
         ["2025"],
         ["2025"]
     ])")
-                .ValueOrDie());
-        ASSERT_OK(ScanAndRead(table_path, {"f1"}, expected_array_only_partition));
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"f1"}, expected_array_only_partition));
 
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[0], fields_[1], fields_[2], SpecialFields::RowId().field_,
-                                SpecialFields::SequenceNumber().field_}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[0], fields_[1], fields_[2], SpecialFields::RowId().field_,
+                            SpecialFields::SequenceNumber().field_}),
+            R"([
         [1, "2024", "c1", 0, 2],
         [2, "2024", "c2", 1, 2],
         [3, "2024", "c3", 2, 2],
@@ -908,17 +1123,17 @@ TEST_P(DataEvolutionTableTest, TestWithPartitionSimple) {
         [null, "2025", "d2", 4, 3],
         [null, "2025", "d3", 5, 3]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 
-        // read only read partition fields and row tracking
-        auto expected_partition_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[1], SpecialFields::RowId().field_,
-                                SpecialFields::SequenceNumber().field_}),
-                R"([
+    // read only read partition fields and row tracking
+    auto expected_partition_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[1], SpecialFields::RowId().field_,
+                            SpecialFields::SequenceNumber().field_}),
+            R"([
         ["2024", 0, 2],
         ["2024", 1, 2],
         ["2024", 2, 2],
@@ -926,11 +1141,10 @@ TEST_P(DataEvolutionTableTest, TestWithPartitionSimple) {
         ["2025", 4, 3],
         ["2025", 5, 3]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f1", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_partition_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f1", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_partition_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestWithPartitionWithoutPartitionFieldsInFile) {
@@ -992,32 +1206,30 @@ TEST_P(DataEvolutionTableTest, TestWithPartitionWithoutPartitionFieldsInFile) {
                               /*row_ranges=*/row_ranges));
     }
 
-    {
-        // read with row tracking
-        auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
-            arrow::ipc::internal::json::ArrayFromJSON(
-                arrow::struct_({fields_[0], fields_[1], fields_[2], SpecialFields::RowId().field_,
-                                SpecialFields::SequenceNumber().field_}),
-                R"([
+    // read with row tracking
+    auto expected_row_tracking_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_({fields_[0], fields_[1], fields_[2], SpecialFields::RowId().field_,
+                            SpecialFields::SequenceNumber().field_}),
+            R"([
         [1, "2024", "c1", 0, 2],
         [2, "2024", "c2", 1, 2],
         [3, "2024", "c3", 2, 2]
     ])")
-                .ValueOrDie());
+            .ValueOrDie());
 
-        ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
-                              expected_row_tracking_array));
-    }
+    ASSERT_OK(ScanAndRead(table_path, {"f0", "f1", "f2", "_ROW_ID", "_SEQUENCE_NUMBER"},
+                          expected_row_tracking_array));
 }
 
 TEST_P(DataEvolutionTableTest, TestPartitionWithPredicate) {
-    auto file_format = GetParam();
+    auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
     }
     std::vector<std::string> partition_keys = {"f1"};
     std::map<std::string, std::string> options = {
-        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, GetParam()},
+        {Options::MANIFEST_FORMAT, "orc"},         {Options::FILE_FORMAT, FileFormat()},
         {Options::FILE_SYSTEM, "local"},           {Options::ROW_TRACKING_ENABLED, "true"},
         {Options::DATA_EVOLUTION_ENABLED, "true"}, {"parquet.write.max-row-group-length", "1"}};
 
@@ -1184,7 +1396,7 @@ TEST_P(DataEvolutionTableTest, TestPartitionWithPredicate) {
 }
 
 TEST_P(DataEvolutionTableTest, TestAlterTable) {
-    auto file_format = GetParam();
+    auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
     }
@@ -1281,7 +1493,7 @@ TEST_P(DataEvolutionTableTest, TestAlterTable) {
 }
 
 TEST_P(DataEvolutionTableTest, TestReadCompactFiles) {
-    auto file_format = GetParam();
+    auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
     }
@@ -1311,7 +1523,7 @@ TEST_P(DataEvolutionTableTest, TestReadCompactFiles) {
 }
 
 TEST_P(DataEvolutionTableTest, TestReadTableWithDenseStats) {
-    auto file_format = GetParam();
+    auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
     }
@@ -1392,7 +1604,7 @@ TEST_P(DataEvolutionTableTest, TestReadTableWithDenseStats) {
 }
 
 TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
-    auto file_format = GetParam();
+    auto file_format = FileFormat();
     if (file_format == "avro") {
         return;
     }
@@ -1533,7 +1745,7 @@ TEST_P(DataEvolutionTableTest, TestScanAndReadWithIndex) {
 }
 
 TEST_P(DataEvolutionTableTest, TestPredicate) {
-    if (GetParam() == "avro") {
+    if (FileFormat() == "avro") {
         // Avro does not have stats.
         return;
     }
@@ -1674,7 +1886,7 @@ TEST_P(DataEvolutionTableTest, TestIOException) {
 
 TEST_P(DataEvolutionTableTest, TestWithRowIds) {
     std::map<std::string, std::string> options = {{Options::MANIFEST_FORMAT, "orc"},
-                                                  {Options::FILE_FORMAT, GetParam()},
+                                                  {Options::FILE_FORMAT, FileFormat()},
                                                   {Options::FILE_SYSTEM, "local"},
                                                   {Options::ROW_TRACKING_ENABLED, "true"},
                                                   {Options::DATA_EVOLUTION_ENABLED, "true"}};
@@ -1836,7 +2048,7 @@ TEST_P(DataEvolutionTableTest, TestWithRowIds) {
                               /*predicate=*/nullptr,
                               /*row_ranges=*/row_ranges));
     }
-    if (GetParam() == "avro") {
+    if (FileFormat() == "avro") {
         // Avro does not support stats.
         return;
     }
@@ -1896,15 +2108,17 @@ TEST_P(DataEvolutionTableTest, TestWithRowIds) {
     }
 }
 
-std::vector<std::string> GetTestValuesForDataEvolutionTableTest() {
-    std::vector<std::string> values;
-    values.emplace_back("parquet");
+std::vector<DataEvolutionTableParam> GetTestValuesForDataEvolutionTableTest() {
+    std::vector<DataEvolutionTableParam> values;
+    for (bool enable_snapshot_live_manifest_cache : {false, true}) {
+        values.emplace_back("parquet", enable_snapshot_live_manifest_cache);
 #ifdef PAIMON_ENABLE_ORC
-    values.emplace_back("orc");
+        values.emplace_back("orc", enable_snapshot_live_manifest_cache);
 #endif
 #ifdef PAIMON_ENABLE_AVRO
-    values.emplace_back("avro");
+        values.emplace_back("avro", enable_snapshot_live_manifest_cache);
 #endif
+    }
     return values;
 }
 

@@ -20,6 +20,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <memory>
@@ -28,10 +29,10 @@
 
 #include "fmt/format.h"
 #include "paimon/common/io/memory_segment_output_stream.h"
-#include "paimon/common/memory/memory_segment.h"
 #include "paimon/io/byte_order.h"
 #include "paimon/memory/bytes.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/memory/memory_segment.h"
 #include "paimon/status.h"
 #include "paimon/type_fwd.h"
 #include "paimon/visibility.h"
@@ -42,9 +43,6 @@ class PAIMON_EXPORT MemorySegmentUtils {
  public:
     MemorySegmentUtils() = delete;
     ~MemorySegmentUtils() = delete;
-
-    /// Allocate bytes in pool
-    static std::shared_ptr<Bytes> AllocateBytes(int32_t length, MemoryPool* pool);
 
     /// Copy target segments from source byte[].
     ///

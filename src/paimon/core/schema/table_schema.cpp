@@ -28,6 +28,7 @@
 #include "arrow/c/bridge.h"
 #include "arrow/util/checked_cast.h"
 #include "fmt/format.h"
+#include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/field_type_utils.h"
@@ -48,9 +49,6 @@ Result<std::unique_ptr<TableSchema>> TableSchema::Create(
     int64_t schema_id, const std::shared_ptr<arrow::Schema>& schema,
     const std::vector<std::string>& partition_keys, const std::vector<std::string>& primary_keys,
     const std::map<std::string, std::string>& options) {
-    if (schema_id != 0) {
-        return Status::NotImplemented("do not support schema evolution, schema_id must be 0");
-    }
     std::vector<DataField> data_fields;
     int32_t field_id = 0;
     std::set<std::string> primary_key_set;
@@ -99,6 +97,11 @@ Result<std::shared_ptr<arrow::Field>> TableSchema::AssignFieldIdsRecursively(
     }
     auto type = field->type();
     if (type->id() == arrow::Type::STRUCT) {
+        if (VariantTypeUtils::IsVariantField(field)) {
+            // A variant struct is a leaf type: its value/metadata children keep their fixed
+            // paimon field ids 0/1 (mapped to parquet field ids on write).
+            return metadata ? field->WithMergedMetadata(metadata) : field;
+        }
         auto struct_type = arrow::internal::checked_pointer_cast<arrow::StructType>(field->type());
         arrow::FieldVector new_childs;
         for (const auto& child : struct_type->fields()) {
@@ -122,8 +125,11 @@ Result<std::shared_ptr<arrow::Field>> TableSchema::AssignFieldIdsRecursively(
             key_field, AssignFieldIdsRecursively(key_field, /*set_field_id=*/false, field_id));
         PAIMON_ASSIGN_OR_RAISE(
             value_field, AssignFieldIdsRecursively(value_field, /*set_field_id=*/false, field_id));
-        return arrow::field(field->name(), arrow::map(key_field->type(), value_field),
-                            field->nullable(), metadata);
+        // Paimon MAP does not expose Arrow's keys_sorted property. Normalize it so an
+        // in-memory schema and the same schema reloaded from JSON remain equivalent.
+        auto new_map_type =
+            std::make_shared<arrow::MapType>(key_field, value_field, /*keys_sorted=*/false);
+        return arrow::field(field->name(), new_map_type, field->nullable(), metadata);
     }
     return metadata ? field->WithMergedMetadata(metadata) : field;
 }
@@ -193,7 +199,7 @@ std::vector<std::string> TableSchema::FieldNames() const {
 
 Result<FieldType> TableSchema::GetFieldType(const std::string& field_name) const {
     PAIMON_ASSIGN_OR_RAISE(DataField field, GetField(field_name));
-    return FieldTypeUtils::ConvertToFieldType(field.Type()->id());
+    return FieldTypeUtils::ConvertToFieldType(field.ArrowField());
 }
 
 Result<DataField> TableSchema::GetField(const std::string& field_name) const {

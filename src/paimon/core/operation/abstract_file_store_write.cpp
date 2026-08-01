@@ -76,7 +76,7 @@ AbstractFileStoreWrite::AbstractFileStoreWrite(
       dv_maintainer_factory_(dv_maintainer_factory),
       io_manager_(io_manager),
       options_(options),
-      compact_executor_(CreateDefaultExecutor(4)),
+      compact_executor_(CreateDefaultExecutor()),
       compaction_metrics_(std::make_shared<CompactionMetrics>()),
       ignore_previous_files_(ignore_previous_files),
       is_streaming_mode_(is_streaming_mode),
@@ -128,7 +128,7 @@ Status AbstractFileStoreWrite::Write(std::unique_ptr<RecordBatch>&& batch) {
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*data, batch->GetData()));
 
     PAIMON_ASSIGN_OR_RAISE(BinaryRow partition,
-                           file_store_path_factory_->ToBinaryRow(batch->GetPartition()))
+                           file_store_path_factory_->ToBinaryRow(batch->GetPartition()));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<BatchWriter> writer,
                            GetWriter(partition, batch->GetBucket()));
     assert(writer);
@@ -283,7 +283,8 @@ int32_t AbstractFileStoreWrite::GetDefaultBucketNum() const {
 
 Result<std::shared_ptr<RestoreFiles>> AbstractFileStoreWrite::ScanExistingFileMetas(
     const BinaryRow& partition, int32_t bucket) const {
-    PAIMON_ASSIGN_OR_RAISE(auto part_values,
+    std::vector<std::pair<std::string, std::string>> part_values;
+    PAIMON_ASSIGN_OR_RAISE(part_values,
                            file_store_path_factory_->GeneratePartitionVector(partition));
     std::map<std::string, std::string> part_values_map;
     for (const auto& [key, value] : part_values) {

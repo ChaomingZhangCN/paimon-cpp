@@ -52,11 +52,11 @@ KeyValueDataFileRecordReader::KeyValueDataFileRecordReader(
 
 Result<bool> KeyValueDataFileRecordReader::Iterator::HasNext() const {
     int64_t array_length = reader_->row_kind_array_->length();
-    const auto& selection_bitmap = reader_->selection_bitmap_;
-    if (selection_bitmap.Cardinality() == array_length) {
+    if (selection_cardinality_ == array_length) {
         // all rows are selected in bitmap
         return cursor_ < array_length;
     }
+    const auto& selection_bitmap = reader_->selection_bitmap_;
     auto iter = selection_bitmap.EqualOrLarger(cursor_);
     if (iter == selection_bitmap.End()) {
         // no row are selected
@@ -70,7 +70,7 @@ Result<bool> KeyValueDataFileRecordReader::Iterator::HasNext() const {
 
 Result<KeyValue> KeyValueDataFileRecordReader::Iterator::Next() {
     // key is only used in merge sort; key context does not hold parent struct array
-    auto key = std::make_unique<ColumnarRowRef>(reader_->key_ctx_, cursor_);
+    std::shared_ptr<InternalRow> key = std::make_shared<ColumnarRowRef>(reader_->key_ctx_, cursor_);
     // value is used in merge sort and projection (maybe async and multi-thread), so value context
     // holds parent struct array to ensure data remains valid
     auto value = std::make_unique<ColumnarRowRef>(reader_->value_ctx_, cursor_);
@@ -83,15 +83,15 @@ Result<KeyValue> KeyValueDataFileRecordReader::Iterator::Next() {
 
 Result<std::pair<int64_t, KeyValue>> KeyValueDataFileRecordReader::Iterator::NextWithFilePos() {
     PAIMON_ASSIGN_OR_RAISE(KeyValue kv, Next());
-    return std::make_pair(previous_batch_first_row_number_ + cursor_ - 1, std::move(kv));
+    PAIMON_ASSIGN_OR_RAISE(uint64_t global_row_id,
+                           reader_->reader_->GetPreviousBatchFileRowId(cursor_ - 1));
+    return std::make_pair(static_cast<int64_t>(global_row_id), std::move(kv));
 }
 
 Result<std::unique_ptr<KeyValueRecordReader::Iterator>> KeyValueDataFileRecordReader::NextBatch() {
     Reset();
     PAIMON_ASSIGN_OR_RAISE(BatchReader::ReadBatchWithBitmap batch_with_bitmap,
                            reader_->NextBatchWithBitmap());
-    PAIMON_ASSIGN_OR_RAISE(int64_t previous_batch_first_row_number,
-                           reader_->GetPreviousBatchFirstRowNumber());
     if (BatchReader::IsEofBatch(batch_with_bitmap)) {
         // reader eof, just return
         return std::unique_ptr<KeyValueRecordReader::Iterator>();
@@ -142,8 +142,7 @@ Result<std::unique_ptr<KeyValueRecordReader::Iterator>> KeyValueDataFileRecordRe
     key_ctx_ = std::make_shared<ColumnarBatchContext>(key_fields, pool_);
     value_ctx_ = std::make_shared<ColumnarBatchContext>(value_fields, pool_);
     ArrowUtils::TraverseArray(data_batch);
-    return std::make_unique<KeyValueDataFileRecordReader::Iterator>(
-        this, previous_batch_first_row_number);
+    return std::make_unique<KeyValueDataFileRecordReader::Iterator>(this);
 }
 
 void KeyValueDataFileRecordReader::Reset() {

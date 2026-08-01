@@ -19,10 +19,8 @@
 
 #include "paimon/core/utils/field_mapping.h"
 
-#include <algorithm>
-#include <cassert>
 #include <cstddef>
-#include <set>
+#include <vector>
 
 #include "arrow/type.h"
 #include "fmt/format.h"
@@ -32,6 +30,7 @@
 #include "paimon/common/utils/object_utils.h"
 #include "paimon/core/casting/cast_executor_factory.h"
 #include "paimon/core/casting/casting_utils.h"
+#include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/defs.h"
 #include "paimon/predicate/literal.h"
 #include "paimon/predicate/predicate_builder.h"
@@ -77,8 +76,8 @@ Result<std::unique_ptr<FieldMapping>> FieldMappingBuilder::CreateFieldMapping(
     // generate non-exist field info
     std::optional<NonExistFieldInfo> non_exist_field_info = CreateNonExistFieldInfo(data_fields);
 
-    // generate exist field info
-    ExistFieldInfo exist_field_info = CreateExistFieldInfo(data_fields);
+    // generate exist field info (includes nested type pruning)
+    PAIMON_ASSIGN_OR_RAISE(ExistFieldInfo exist_field_info, CreateExistFieldInfo(data_fields));
 
     // key: partition key, value: partition idx
     std::map<std::string, int32_t> partition_key_to_idx =
@@ -92,7 +91,7 @@ Result<std::unique_ptr<FieldMapping>> FieldMappingBuilder::CreateFieldMapping(
     return std::make_unique<FieldMapping>(partition_info, non_partition_info, non_exist_field_info);
 }
 
-ExistFieldInfo FieldMappingBuilder::CreateExistFieldInfo(
+Result<ExistFieldInfo> FieldMappingBuilder::CreateExistFieldInfo(
     const std::vector<DataField>& data_fields) const {
     // key:field id, value: {target_idx, read field}
     std::map<int32_t, std::pair<int32_t, DataField>> field_id_to_read_fields;
@@ -106,8 +105,22 @@ ExistFieldInfo FieldMappingBuilder::CreateExistFieldInfo(
         auto iter = field_id_to_read_fields.find(data_field.Id());
         if (iter != field_id_to_read_fields.end()) {
             const auto& [target_idx, read_field] = iter->second;
+
+            // Recursively prune nested types in data_field to match read_field's
+            // projection. For atomic types this is a no-op.
+            PAIMON_ASSIGN_OR_RAISE(
+                std::optional<std::shared_ptr<arrow::DataType>> pruned_type,
+                NestedProjectionUtils::PruneDataType(read_field.Type(), data_field.Type()));
+            if (!pruned_type.has_value()) {
+                // All sub-fields pruned away — treat as non-existent.
+                continue;
+            }
+
+            DataField pruned_data_field(data_field.Id(),
+                                        data_field.ArrowField()->WithType(pruned_type.value()),
+                                        data_field.Description());
             exist_field_info.exist_read_schema.push_back(read_field);
-            exist_field_info.exist_data_schema.push_back(data_field);
+            exist_field_info.exist_data_schema.push_back(pruned_data_field);
             exist_field_info.idx_in_target_read_schema.push_back(target_idx);
         }
     }
@@ -129,6 +142,19 @@ std::optional<NonExistFieldInfo> FieldMappingBuilder::CreateNonExistFieldInfo(
         if (iter == field_id_to_data_fields.end()) {
             non_exist_field_info.non_exist_read_schema.push_back(read_field);
             non_exist_field_info.idx_in_target_read_schema.push_back(i);
+            continue;
+        }
+
+        // Empty STRUCT projection (f1: struct<>) is a valid request, but
+        // cannot be read from data files directly. Materialize it as nulls.
+        if (read_field.Type()->id() == arrow::Type::STRUCT &&
+            iter->second.Type()->id() == arrow::Type::STRUCT) {
+            auto read_struct = std::static_pointer_cast<arrow::StructType>(read_field.Type());
+            auto data_struct = std::static_pointer_cast<arrow::StructType>(iter->second.Type());
+            if (read_struct->num_fields() == 0 && data_struct->num_fields() > 0) {
+                non_exist_field_info.non_exist_read_schema.push_back(read_field);
+                non_exist_field_info.idx_in_target_read_schema.push_back(i);
+            }
         }
     }
     if (non_exist_field_info.idx_in_target_read_schema.empty()) {
@@ -149,9 +175,13 @@ Result<std::vector<std::shared_ptr<CastExecutor>>> FieldMappingBuilder::CreateDa
                                FieldTypeUtils::ConvertToFieldType(data_fields[i].Type()->id()));
 
         if (!read_fields[i].Type()->Equals(data_fields[i].Type())) {
-            if (read_type == FieldType::MAP || read_type == FieldType::ARRAY ||
-                read_type == FieldType::STRUCT) {
-                return Status::Invalid("Only support column type evolution in atomic data type.");
+            auto read_type_id = read_fields[i].Type()->id();
+            if (read_type_id == arrow::Type::STRUCT || read_type_id == arrow::Type::LIST ||
+                read_type_id == arrow::Type::MAP) {
+                // Nested type differs by pruning/evolution; the reader's reshape
+                // handles it, no scalar cast.
+                cast_executors.push_back(nullptr);
+                continue;
             }
             auto executor_factory = CastExecutorFactory::GetCastExecutorFactory();
             auto cast_executor =
@@ -175,13 +205,16 @@ Result<NonPartitionInfo> FieldMappingBuilder::CreateNonPartitionInfo(
     const std::vector<DataField>& data_fields, const ExistFieldInfo& exist_field_info,
     const std::map<std::string, int32_t>& partition_keys) const {
     NonPartitionInfo non_partition_info;
+    const std::vector<std::string> propagated_metadata_keys = {DataField::MAP_SELECTED_KEYS};
     for (size_t i = 0; i < exist_field_info.exist_data_schema.size(); i++) {
         const auto& data_field = exist_field_info.exist_data_schema[i];
         const auto& read_field = exist_field_info.exist_read_schema[i];
         auto iter = partition_keys.find(read_field.Name());
         if (iter == partition_keys.end()) {
             non_partition_info.non_partition_read_schema.push_back(read_field);
-            non_partition_info.non_partition_data_schema.push_back(data_field);
+            non_partition_info.non_partition_data_schema.push_back(
+                DataField::MergeFieldMetadataByWhitelist(data_field, read_field,
+                                                         propagated_metadata_keys));
             non_partition_info.idx_in_target_read_schema.push_back(
                 exist_field_info.idx_in_target_read_schema[i]);
         }

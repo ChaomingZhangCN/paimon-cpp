@@ -277,6 +277,55 @@ class WriteInteTest : public testing::Test, public ::testing::WithParamInterface
         return array;
     }
 
+    SimpleStats GenerateBlobValueStats() const {
+        return BinaryRowGenerator::GenerateStats({NullType()}, {NullType()},
+                                                 std::vector<int64_t>({-1}), pool_.get());
+    }
+
+    Status CheckReadBlobs(const std::string& table_path,
+                          const std::map<std::string, std::string>& options,
+                          const std::vector<std::shared_ptr<Split>>& data_splits,
+                          const std::string& blob_field,
+                          const std::vector<std::shared_ptr<Blob>>& expected_blobs) const {
+        ReadContextBuilder read_context_builder(table_path);
+        read_context_builder.SetOptions(options).SetReadFieldNames({blob_field});
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context,
+                               read_context_builder.Finish());
+        PAIMON_ASSIGN_OR_RAISE(auto table_read, TableRead::Create(std::move(read_context)));
+        PAIMON_ASSIGN_OR_RAISE(auto batch_reader, table_read->CreateReader(data_splits));
+        PAIMON_ASSIGN_OR_RAISE(auto read_result,
+                               ReadResultCollector::CollectResult(batch_reader.get()));
+        if (read_result == nullptr) {
+            return Status::Invalid(fmt::format("No rows read for blob field {}", blob_field));
+        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(auto combined_array,
+                                          arrow::Concatenate(read_result->chunks()));
+        auto struct_array = std::dynamic_pointer_cast<arrow::StructArray>(combined_array);
+        if (struct_array == nullptr) {
+            return Status::Invalid(
+                fmt::format("Read result for {} is not a struct array", blob_field));
+        }
+        auto struct_type = std::dynamic_pointer_cast<arrow::StructType>(struct_array->type());
+        int blob_index = struct_type->GetFieldIndex(blob_field);
+        if (blob_index < 0) {
+            return Status::Invalid(
+                fmt::format("Blob field {} was not found in read result", blob_field));
+        }
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            auto blob_struct_array,
+            arrow::StructArray::Make({struct_array->field(blob_index)},
+                                     {BlobUtils::ToArrowField(blob_field, false)}));
+        PAIMON_ASSIGN_OR_RAISE(
+            auto actual_blobs,
+            TestHelper::ToBlobs(std::static_pointer_cast<arrow::StructArray>(blob_struct_array)));
+        PAIMON_ASSIGN_OR_RAISE(bool blobs_equal, TestHelper::CheckBlobsEqual(
+                                                     actual_blobs, expected_blobs, file_system_));
+        if (!blobs_equal) {
+            return Status::Invalid(fmt::format("Read blobs for {} do not match", blob_field));
+        }
+        return Status::OK();
+    }
+
     void CheckCreationTime(const std::vector<std::shared_ptr<CommitMessage>>& commit_messages) {
         TimezoneGuard guard("Asia/Shanghai");
         for (const auto& msg : commit_messages) {
@@ -296,11 +345,9 @@ class WriteInteTest : public testing::Test, public ::testing::WithParamInterface
 
     Status CommitMessages(const std::string& table_path,
                           const std::vector<std::shared_ptr<CommitMessage>>& commit_messages,
-                          const std::map<std::string, std::string>& commit_options,
                           bool ignore_empty_commit = true,
                           int64_t commit_identifier = BATCH_WRITE_COMMIT_IDENTIFIER) const {
         CommitContextBuilder commit_builder(table_path, "commit_user_1");
-        commit_builder.SetOptions(commit_options);
         commit_builder.IgnoreEmptyCommit(ignore_empty_commit);
         PAIMON_ASSIGN_OR_RAISE(auto commit_context, commit_builder.Finish());
         PAIMON_ASSIGN_OR_RAISE(auto file_store_commit,
@@ -412,8 +459,8 @@ TEST_P(WriteInteTest, TestAppendTableBatchWrite) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(4, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(4, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -515,8 +562,8 @@ TEST_P(WriteInteTest, TestAppendTableStreamWriteWithOneBucket) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(4, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(4, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -585,8 +632,8 @@ TEST_P(WriteInteTest, TestAppendTableStreamWriteWithOneBucket) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(7, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(3, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(7, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(3, snapshot2.value().DeltaRecordCount());
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
     ASSERT_EQ(data_splits_2.size(), 1);
 
@@ -655,8 +702,8 @@ TEST_P(WriteInteTest, TestAppendTableStreamWriteWithPartitionAndMultiBuckets) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(8, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(8, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(8, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(8, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -720,8 +767,8 @@ TEST_P(WriteInteTest, TestAppendTableStreamWriteWithPartitionAndMultiBuckets) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(16, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(8, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(16, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(8, snapshot2.value().DeltaRecordCount());
 
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
     ASSERT_EQ(data_splits_2.size(), 3);
@@ -830,8 +877,8 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithComplexType) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(6, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(6, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(6, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(6, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -893,8 +940,8 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithComplexType) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(10, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(10, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount());
 
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
     ASSERT_EQ(data_splits_2.size(), 1);
@@ -1031,8 +1078,8 @@ TEST_P(WriteInteTest, TestPkTableStreamWrite) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(5, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(5, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount());
 
     // round 1 read
     arrow::FieldVector fields_with_row_kind = fields;
@@ -1161,8 +1208,8 @@ TEST_P(WriteInteTest, TestPkTableStreamWrite) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(9, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(9, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount());
 
     // round 2 read
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
@@ -1306,8 +1353,8 @@ TEST_P(WriteInteTest, TestPkTableBatchWrite) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(5, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(5, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount());
 
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_1,
                          helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
@@ -1450,8 +1497,8 @@ TEST_P(WriteInteTest, TestPkTableWriteWithNoPartitionKey) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(5, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(5, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount());
 
     // round1 read
     arrow::FieldVector fields_with_row_kind = fields;
@@ -1554,8 +1601,8 @@ TEST_P(WriteInteTest, TestPkTableWriteWithNoPartitionKey) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(9, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(9, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount());
 
     // round2 read
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
@@ -1663,8 +1710,8 @@ TEST_P(WriteInteTest, TestPkTableWriteWithComplexType) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(5, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(5, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -1737,8 +1784,8 @@ TEST_P(WriteInteTest, TestPkTableWriteWithComplexType) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(9, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(9, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot2.value().DeltaRecordCount());
 
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
     ASSERT_EQ(data_splits_2.size(), 1);
@@ -1795,8 +1842,8 @@ TEST_P(WriteInteTest, TestPkTableForceLookup) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(4, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(4, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount());
 
     // read
     arrow::FieldVector fields_with_row_kind = fields;
@@ -1860,8 +1907,8 @@ TEST_P(WriteInteTest, TestPkTableEnableDeletionVector) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(4, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(4, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount());
 
     // read
     arrow::FieldVector fields_with_row_kind = fields;
@@ -1876,6 +1923,7 @@ TEST_P(WriteInteTest, TestPkTableEnableDeletionVector) {
 }
 
 TEST_P(WriteInteTest, TestPkTableWriteWithIOException) {
+    auto file_format = GetParam();
     ::testing::GTEST_FLAG(throw_on_failure) = true;
     // create table
     arrow::FieldVector fields = {
@@ -1884,7 +1932,6 @@ TEST_P(WriteInteTest, TestPkTableWriteWithIOException) {
     auto schema = arrow::schema(fields);
     std::vector<std::string> primary_keys = {"f0", "f1"};
     std::vector<std::string> partition_keys = {"f1"};
-    auto file_format = GetParam();
     std::map<std::string, std::string> options = {
         {Options::MANIFEST_FORMAT, "orc"},   {Options::FILE_FORMAT, file_format},
         {Options::TARGET_FILE_SIZE, "1024"}, {Options::BUCKET, "2"},
@@ -1893,7 +1940,11 @@ TEST_P(WriteInteTest, TestPkTableWriteWithIOException) {
     bool run_complete = false;
     auto io_hook = IOHook::GetInstance();
 
-    for (size_t i = 0; i < 500; i++) {
+    // Loop bound must exceed the workflow's total IO operations so the loop can
+    // naturally terminate at the iteration where injection position falls past
+    // the last IO. Measured IO counts: orc=310, parquet=506, avro=195.
+    // 1000 leaves headroom for future format/workflow changes.
+    for (size_t i = 0; i < 1000; i++) {
         auto dir = UniqueTestDirectory::Create();
         ASSERT_TRUE(dir);
         ScopeGuard guard([&io_hook]() { io_hook->Clear(); });
@@ -2482,10 +2533,7 @@ TEST_P(WriteInteTest, TestWriteWithFieldId) {
     ASSERT_OK(file_store_write->Close());
 
     // commit
-    std::map<std::string, std::string> commit_options = {
-        {Options::MANIFEST_TARGET_FILE_SIZE, "8mb"}, {Options::FILE_SYSTEM, "local"}};
-    ASSERT_OK(CommitMessages(table_path, commit_messages, commit_options,
-                             /*ignore_empty_commit=*/false));
+    ASSERT_OK(CommitMessages(table_path, commit_messages, /*ignore_empty_commit=*/false));
 
     // check data file has field id meta
     std::vector<std::unique_ptr<BasicFileStatus>> status_list;
@@ -2567,10 +2615,8 @@ TEST_P(WriteInteTest, TestAppendTableWriteAndReadWithExternalPath) {
     ASSERT_EQ(results.size(), 1);
     auto commit_msg_impl = std::dynamic_pointer_cast<CommitMessageImpl>(results[0]);
     auto meta = commit_msg_impl->data_increment_.new_files_[0];
-    std::map<std::string, std::string> commit_options = {
-        {Options::MANIFEST_TARGET_FILE_SIZE, "8mb"}, {Options::FILE_SYSTEM, "local"}};
-    ASSERT_OK(CommitMessages(root_path, results, commit_options,
-                             /*ignore_empty_commit=*/false, /*commit_identifier=*/1));
+    ASSERT_OK(CommitMessages(root_path, results, /*ignore_empty_commit=*/false,
+                             /*commit_identifier=*/1));
 
     // check external path
     ASSERT_OK_AND_ASSIGN(bool file_exist, file_system_->Exists(meta->external_path.value()));
@@ -2742,8 +2788,8 @@ TEST_P(WriteInteTest, TestAppendTableStreamWriteWithExternalPath) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(4, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(4, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(4, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -2811,8 +2857,8 @@ TEST_P(WriteInteTest, TestAppendTableStreamWriteWithExternalPath) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot2, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot2);
     ASSERT_EQ(2, snapshot2.value().Id());
-    ASSERT_EQ(7, snapshot2.value().TotalRecordCount().value());
-    ASSERT_EQ(3, snapshot2.value().DeltaRecordCount().value());
+    ASSERT_EQ(7, snapshot2.value().TotalRecordCount());
+    ASSERT_EQ(3, snapshot2.value().DeltaRecordCount());
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits_2, helper->Scan());
     ASSERT_EQ(data_splits_2.size(), 1);
     std::string expected_data_2 =
@@ -2888,10 +2934,8 @@ TEST_P(WriteInteTest, TestWriteAndReadWithSpecialPartitionValue) {
     ASSERT_EQ(results.size(), 3);
     auto commit_msg_impl = std::dynamic_pointer_cast<CommitMessageImpl>(results[0]);
     auto meta = commit_msg_impl->data_increment_.new_files_[0];
-    std::map<std::string, std::string> commit_options = {
-        {Options::MANIFEST_TARGET_FILE_SIZE, "8mb"}, {Options::FILE_SYSTEM, "local"}};
-    ASSERT_OK(CommitMessages(root_path, results, commit_options,
-                             /*ignore_empty_commit=*/false, /*commit_identifier=*/1));
+    ASSERT_OK(CommitMessages(root_path, results, /*ignore_empty_commit=*/false,
+                             /*commit_identifier=*/1));
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -3073,10 +3117,8 @@ TEST_P(WriteInteTest, TestWriteWithNestedSchema) {
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<CommitMessage>> results,
                          file_store_write->PrepareCommit());
     ASSERT_EQ(results.size(), 1);
-    std::map<std::string, std::string> commit_options = {
-        {Options::MANIFEST_TARGET_FILE_SIZE, "8mb"}, {Options::FILE_SYSTEM, "local"}};
-    ASSERT_OK(CommitMessages(root_path, results, commit_options,
-                             /*ignore_empty_commit=*/false, /*commit_identifier=*/1));
+    ASSERT_OK(CommitMessages(root_path, results, /*ignore_empty_commit=*/false,
+                             /*commit_identifier=*/1));
 
     // check read result
     ScanContextBuilder scan_context_builder(table_path);
@@ -3415,8 +3457,8 @@ TEST_P(WriteInteTest, TestPkTablePostponeBucket) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(5, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(5, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(5, snapshot1.value().DeltaRecordCount());
 
     ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
                          helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
@@ -3751,20 +3793,26 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithBlobType) {
     ASSERT_OK_AND_ASSIGN(
         auto helper, TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{},
                                         /*primary_keys=*/{}, options, /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
     int64_t commit_identifier = 0;
 
     std::vector<PAIMON_UNIQUE_PTR<Bytes>> blob_descriptors;
+    std::vector<std::shared_ptr<Blob>> expected_blobs;
     std::string file1 = paimon::test::GetDataDir() + "/avro/data/avro_with_null";
     ASSERT_OK_AND_ASSIGN(auto blob1, Blob::FromPath(file1));
     blob_descriptors.emplace_back(blob1->ToDescriptor(pool_));
+    expected_blobs.emplace_back(std::shared_ptr<Blob>(std::move(blob1)));
 
     std::string file2 = paimon::test::GetDataDir() + "/xxhash.data";
     ASSERT_OK_AND_ASSIGN(auto blob2, Blob::FromPath(file2, /*offset=*/0, /*length=*/91));
     blob_descriptors.emplace_back(blob2->ToDescriptor(pool_));
+    expected_blobs.emplace_back(std::shared_ptr<Blob>(std::move(blob2)));
     ASSERT_OK_AND_ASSIGN(auto blob3, Blob::FromPath(file2, /*offset=*/92, /*length=*/85));
     blob_descriptors.emplace_back(blob3->ToDescriptor(pool_));
+    expected_blobs.emplace_back(std::shared_ptr<Blob>(std::move(blob3)));
     ASSERT_OK_AND_ASSIGN(auto blob4, Blob::FromPath(file2, /*offset=*/300, /*length=*/3000));
     blob_descriptors.emplace_back(blob4->ToDescriptor(pool_));
+    expected_blobs.emplace_back(std::shared_ptr<Blob>(std::move(blob4)));
 
     std::vector<std::vector<PAIMON_UNIQUE_PTR<Bytes>>> blob_fields;
     blob_fields.emplace_back(std::move(blob_descriptors));
@@ -3790,9 +3838,7 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithBlobType) {
     auto file_meta2 = std::make_shared<DataFileMeta>(
         "data-xxx.blob", /*file_size=*/764, /*row_count=*/3,
         /*min_key=*/BinaryRow::EmptyRow(), /*max_key=*/BinaryRow::EmptyRow(),
-        /*key_stats=*/SimpleStats::EmptyStats(),
-        BinaryRowGenerator::GenerateStats({NullType()}, {NullType()}, std::vector<int64_t>({0}),
-                                          pool_.get()),
+        /*key_stats=*/SimpleStats::EmptyStats(), GenerateBlobValueStats(),
         /*min_sequence_number=*/1, /*max_sequence_number=*/1, /*schema_id=*/0,
         /*level=*/0, /*extra_files=*/std::vector<std::optional<std::string>>(),
         /*creation_time=*/Timestamp(1724090888706ll, 0),
@@ -3802,9 +3848,7 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithBlobType) {
     auto file_meta3 = std::make_shared<DataFileMeta>(
         "data-xxx.blob", /*file_size=*/3023, /*row_count=*/1,
         /*min_key=*/BinaryRow::EmptyRow(), /*max_key=*/BinaryRow::EmptyRow(),
-        /*key_stats=*/SimpleStats::EmptyStats(),
-        BinaryRowGenerator::GenerateStats({NullType()}, {NullType()}, std::vector<int64_t>({0}),
-                                          pool_.get()),
+        /*key_stats=*/SimpleStats::EmptyStats(), GenerateBlobValueStats(),
         /*min_sequence_number=*/1, /*max_sequence_number=*/1, /*schema_id=*/0,
         /*level=*/0, /*extra_files=*/std::vector<std::optional<std::string>>(),
         /*creation_time=*/Timestamp(1724090888706ll, 0),
@@ -3823,8 +3867,8 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithBlobType) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot);
     ASSERT_EQ(1, snapshot.value().Id());
-    ASSERT_EQ(8, snapshot.value().TotalRecordCount().value());
-    ASSERT_EQ(8, snapshot.value().DeltaRecordCount().value());
+    ASSERT_EQ(8, snapshot.value().TotalRecordCount());
+    ASSERT_EQ(8, snapshot.value().DeltaRecordCount());
     ASSERT_EQ(4, snapshot.value().NextRowId().value());
 
     // check data file meta after commit
@@ -3836,6 +3880,7 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithBlobType) {
     for (size_t i = 0; i < expected_meta.size(); i++) {
         ASSERT_TRUE(data_split->DataFiles()[i]->TEST_Equal(*expected_meta[i]));
     }
+    ASSERT_OK(CheckReadBlobs(table_path, options, data_splits, "blob", expected_blobs));
 }
 
 TEST_P(WriteInteTest, TestAppendTableWithDateFieldAsPartitionField) {
@@ -3894,8 +3939,8 @@ TEST_P(WriteInteTest, TestAppendTableWithDateFieldAsPartitionField) {
     ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot1, helper->LatestSnapshot());
     ASSERT_TRUE(snapshot1);
     ASSERT_EQ(1, snapshot1.value().Id());
-    ASSERT_EQ(2, snapshot1.value().TotalRecordCount().value());
-    ASSERT_EQ(2, snapshot1.value().DeltaRecordCount().value());
+    ASSERT_EQ(2, snapshot1.value().TotalRecordCount());
+    ASSERT_EQ(2, snapshot1.value().DeltaRecordCount());
 
     arrow::FieldVector fields_with_row_kind = fields;
     fields_with_row_kind.insert(fields_with_row_kind.begin(),
@@ -3958,6 +4003,77 @@ TEST_P(WriteInteTest, TestNullabilityCheck) {
                                                 /*expected_commit_messages=*/std::nullopt));
 }
 
+TEST_P(WriteInteTest, TestPkSpillableMapSharedShreddingReadWrite) {
+    auto file_format = GetParam();
+    if (file_format == "avro") {
+        return;
+    }
+
+    auto dir = UniqueTestDirectory::Create();
+    auto map_type = arrow::map(arrow::utf8(), arrow::int64());
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("metrics", map_type),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "avro"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::BUCKET, "1"},
+        {Options::BUCKET_KEY, "id"},
+        {Options::FILE_SYSTEM, "local"},
+        {Options::WRITE_BUFFER_SIZE, "1"},
+        {Options::WRITE_BUFFER_SPILLABLE, "true"},
+        {Options::WRITE_ONLY, "true"},
+        {"fields.metrics.map.storage-layout", "shared-shredding"},
+        {"fields.metrics.map.shared-shredding.max-columns", "2"},
+    };
+    auto schema = arrow::schema(fields);
+    ::ArrowSchema c_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &c_schema).ok());
+    ASSERT_OK_AND_ASSIGN(auto table_path, CreateTestTable(dir->Str(), "db", "tbl", &c_schema,
+                                                          /*partition_keys=*/{},
+                                                          /*primary_keys=*/{"id"}, options));
+
+    std::string tmp_dir = PathUtil::JoinPath(dir->Str(), "tmp");
+    WriteContextBuilder write_builder(table_path, "commit_user_1");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> write_context,
+                         write_builder.SetOptions(options)
+                             .WithStreamingMode(true)
+                             .WithTempDirectory(tmp_dir)
+                             .Finish());
+    ASSERT_OK_AND_ASSIGN(auto file_store_write, FileStoreWrite::Create(std::move(write_context)));
+
+    ASSERT_OK_AND_ASSIGN(
+        auto batch_0, TestHelper::MakeRecordBatch(
+                          arrow::struct_(fields),
+                          R"([[1, [["a", 10], ["b", 11], ["overflow", -10]]], [2, [["x", 20]]]])",
+                          /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(file_store_write->Write(std::move(batch_0)));
+    ASSERT_GT(TestHelper::CountChannelFiles(file_system_, tmp_dir), 0);
+
+    ASSERT_OK_AND_ASSIGN(auto batch_1,
+                         TestHelper::MakeRecordBatch(
+                             arrow::struct_(fields),
+                             R"([[1, [["a", 100], ["b", 101], ["overflow", -100]]], [3, null]])",
+                             /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(file_store_write->Write(std::move(batch_1)));
+    ASSERT_GT(TestHelper::CountChannelFiles(file_system_, tmp_dir), 0);
+
+    ASSERT_OK_AND_ASSIGN(auto commit_messages,
+                         file_store_write->PrepareCommit(/*wait_compaction=*/false,
+                                                         /*commit_identifier=*/0));
+    ASSERT_EQ(0, TestHelper::CountChannelFiles(file_system_, tmp_dir));
+    ASSERT_OK(CommitMessages(table_path, commit_messages));
+    ASSERT_OK(file_store_write->Close());
+
+    ASSERT_OK(ScanAndVerifyResult(table_path, fields,
+                                  R"([
+        [0, 1, [["a", 100], ["b", 101], ["overflow", -100]]],
+        [0, 2, [["x", 20]]],
+        [0, 3, null]
+    ])"));
+}
+
 TEST_P(WriteInteTest, TestPkSpillableDiskQuotaExhaustedFallsBackToFlush) {
     auto dir = UniqueTestDirectory::Create();
     arrow::FieldVector fields = {
@@ -4009,9 +4125,7 @@ TEST_P(WriteInteTest, TestPkSpillableDiskQuotaExhaustedFallsBackToFlush) {
                          file_store_write->PrepareCommit(/*wait_compaction=*/false,
                                                          /*commit_identifier=*/0));
 
-    std::map<std::string, std::string> pk_commit_options = {
-        {"enable-pk-commit-in-inte-test", ""}, {"enable-object-store-commit-in-inte-test", ""}};
-    ASSERT_OK(CommitMessages(table_path, commit_messages, pk_commit_options));
+    ASSERT_OK(CommitMessages(table_path, commit_messages));
     ASSERT_OK(file_store_write->Close());
 
     std::string expected = R"([
@@ -4081,9 +4195,7 @@ TEST_P(WriteInteTest, TestPkSpillableGlobalMemoryPreemptionDataCorrectness) {
 
     ASSERT_EQ(0, TestHelper::CountChannelFiles(file_system_, tmp_dir));
 
-    std::map<std::string, std::string> pk_commit_options = {
-        {"enable-pk-commit-in-inte-test", ""}, {"enable-object-store-commit-in-inte-test", ""}};
-    ASSERT_OK(CommitMessages(table_path, commit_messages, pk_commit_options));
+    ASSERT_OK(CommitMessages(table_path, commit_messages));
     ASSERT_OK(file_store_write->Close());
 
     // Scan and verify both partitions
@@ -4247,9 +4359,7 @@ TEST_P(WriteInteTest, TestPkSpillableIntermediateMergeWithTempFileTracking) {
                                                          /*commit_identifier=*/0));
     ASSERT_EQ(0, TestHelper::CountChannelFiles(file_system_, tmp_dir));
 
-    std::map<std::string, std::string> pk_commit_options = {
-        {"enable-pk-commit-in-inte-test", ""}, {"enable-object-store-commit-in-inte-test", ""}};
-    ASSERT_OK(CommitMessages(table_path, commit_messages, pk_commit_options));
+    ASSERT_OK(CommitMessages(table_path, commit_messages));
     ASSERT_OK(file_store_write->Close());
 
     // Scan: Alice deduped to f1=3, Bob f1=2
@@ -4346,9 +4456,7 @@ TEST_P(WriteInteTest, TestPkSpillableMultiBucketMultiRoundDataCorrectness) {
                                                          /*commit_identifier=*/0));
     // Spill files should be cleaned after PrepareCommit
     ASSERT_EQ(0, TestHelper::CountChannelFiles(file_system_, tmp_dir));
-    std::map<std::string, std::string> pk_commit_options = {
-        {"enable-pk-commit-in-inte-test", ""}, {"enable-object-store-commit-in-inte-test", ""}};
-    ASSERT_OK(CommitMessages(table_path, commit_messages_1, pk_commit_options));
+    ASSERT_OK(CommitMessages(table_path, commit_messages_1));
 
     // Round 2: Bucket 0 writes Charlie + Bob(overwrite), Bucket 1 writes Frank + Eve(overwrite)
     auto r2_b0_batch1 =
@@ -4379,7 +4487,7 @@ TEST_P(WriteInteTest, TestPkSpillableMultiBucketMultiRoundDataCorrectness) {
                                                          /*commit_identifier=*/1));
     // Spill files should be cleaned after PrepareCommit
     ASSERT_EQ(0, TestHelper::CountChannelFiles(file_system_, tmp_dir));
-    ASSERT_OK(CommitMessages(table_path, commit_messages_2, pk_commit_options));
+    ASSERT_OK(CommitMessages(table_path, commit_messages_2));
     ASSERT_OK(file_store_write->Close());
 
     // Scan and verify per (partition, bucket)
@@ -4523,10 +4631,8 @@ TEST_P(WriteInteTest, TestPkSpillableWithIOException) {
         io_hook->Clear();
 
         // Commit both rounds
-        std::map<std::string, std::string> pk_commit_options = {
-            {"enable-pk-commit-in-inte-test", ""}, {"enable-object-store-commit-in-inte-test", ""}};
-        ASSERT_OK(CommitMessages(root_path, results_1.value(), pk_commit_options));
-        ASSERT_OK(CommitMessages(root_path, results_2.value(), pk_commit_options));
+        ASSERT_OK(CommitMessages(root_path, results_1.value()));
+        ASSERT_OK(CommitMessages(root_path, results_2.value()));
         ASSERT_OK(file_store_write->Close());
 
         // Scan and verify final state after spill:
@@ -4566,29 +4672,38 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithMultipleBlobFields) {
     ASSERT_OK_AND_ASSIGN(
         auto helper, TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{},
                                         /*primary_keys=*/{}, options, /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
     int64_t commit_identifier = 0;
 
     // Prepare blob descriptors for both blob fields
     std::vector<PAIMON_UNIQUE_PTR<Bytes>> blob1_descriptors;
     std::vector<PAIMON_UNIQUE_PTR<Bytes>> blob2_descriptors;
+    std::vector<std::shared_ptr<Blob>> expected_blob1s;
+    std::vector<std::shared_ptr<Blob>> expected_blob2s;
 
     std::string file1 = paimon::test::GetDataDir() + "/avro/data/avro_with_null";
     ASSERT_OK_AND_ASSIGN(auto blob1_a, Blob::FromPath(file1));
     blob1_descriptors.emplace_back(blob1_a->ToDescriptor(pool_));
+    expected_blob1s.emplace_back(std::shared_ptr<Blob>(std::move(blob1_a)));
 
     std::string file2 = paimon::test::GetDataDir() + "/xxhash.data";
     ASSERT_OK_AND_ASSIGN(auto blob1_b, Blob::FromPath(file2, /*offset=*/0, /*length=*/91));
     blob1_descriptors.emplace_back(blob1_b->ToDescriptor(pool_));
+    expected_blob1s.emplace_back(std::shared_ptr<Blob>(std::move(blob1_b)));
     ASSERT_OK_AND_ASSIGN(auto blob1_c, Blob::FromPath(file2, /*offset=*/92, /*length=*/85));
     blob1_descriptors.emplace_back(blob1_c->ToDescriptor(pool_));
+    expected_blob1s.emplace_back(std::shared_ptr<Blob>(std::move(blob1_c)));
 
     // blob2 field uses different data slices
     ASSERT_OK_AND_ASSIGN(auto blob2_a, Blob::FromPath(file2, /*offset=*/300, /*length=*/3000));
     blob2_descriptors.emplace_back(blob2_a->ToDescriptor(pool_));
+    expected_blob2s.emplace_back(std::shared_ptr<Blob>(std::move(blob2_a)));
     ASSERT_OK_AND_ASSIGN(auto blob2_b, Blob::FromPath(file2, /*offset=*/0, /*length=*/91));
     blob2_descriptors.emplace_back(blob2_b->ToDescriptor(pool_));
+    expected_blob2s.emplace_back(std::shared_ptr<Blob>(std::move(blob2_b)));
     ASSERT_OK_AND_ASSIGN(auto blob2_c, Blob::FromPath(file1));
     blob2_descriptors.emplace_back(blob2_c->ToDescriptor(pool_));
+    expected_blob2s.emplace_back(std::shared_ptr<Blob>(std::move(blob2_c)));
 
     std::vector<std::vector<PAIMON_UNIQUE_PTR<Bytes>>> blob_fields;
     blob_fields.emplace_back(std::move(blob1_descriptors));
@@ -4619,9 +4734,7 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithMultipleBlobFields) {
     auto expected_blob1 = std::make_shared<DataFileMeta>(
         "data-xxx.blob", /*file_size=*/0, /*row_count=*/3,
         /*min_key=*/BinaryRow::EmptyRow(), /*max_key=*/BinaryRow::EmptyRow(),
-        /*key_stats=*/SimpleStats::EmptyStats(),
-        BinaryRowGenerator::GenerateStats({NullType()}, {NullType()}, std::vector<int64_t>({0}),
-                                          pool_.get()),
+        /*key_stats=*/SimpleStats::EmptyStats(), GenerateBlobValueStats(),
         /*min_sequence_number=*/1, /*max_sequence_number=*/1, /*schema_id=*/0,
         /*level=*/0, /*extra_files=*/std::vector<std::optional<std::string>>(),
         /*creation_time=*/Timestamp(0, 0),
@@ -4633,9 +4746,7 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithMultipleBlobFields) {
     auto expected_blob2 = std::make_shared<DataFileMeta>(
         "data-xxx.blob", /*file_size=*/0, /*row_count=*/3,
         /*min_key=*/BinaryRow::EmptyRow(), /*max_key=*/BinaryRow::EmptyRow(),
-        /*key_stats=*/SimpleStats::EmptyStats(),
-        BinaryRowGenerator::GenerateStats({NullType()}, {NullType()}, std::vector<int64_t>({0}),
-                                          pool_.get()),
+        /*key_stats=*/SimpleStats::EmptyStats(), GenerateBlobValueStats(),
         /*min_sequence_number=*/1, /*max_sequence_number=*/1, /*schema_id=*/0,
         /*level=*/0, /*extra_files=*/std::vector<std::optional<std::string>>(),
         /*creation_time=*/Timestamp(0, 0),
@@ -4652,8 +4763,8 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithMultipleBlobFields) {
     ASSERT_TRUE(snapshot);
     ASSERT_EQ(1, snapshot.value().Id());
     // 3 rows * 3 files (1 main + 1 blob1 + 1 blob2) = 9 total records
-    ASSERT_EQ(9, snapshot.value().TotalRecordCount().value());
-    ASSERT_EQ(9, snapshot.value().DeltaRecordCount().value());
+    ASSERT_EQ(9, snapshot.value().TotalRecordCount());
+    ASSERT_EQ(9, snapshot.value().DeltaRecordCount());
     ASSERT_EQ(3, snapshot.value().NextRowId().value());
 
     // Check data file meta after commit
@@ -4678,6 +4789,8 @@ TEST_P(WriteInteTest, TestAppendTableWriteWithMultipleBlobFields) {
             }
         }
     }
+    ASSERT_OK(CheckReadBlobs(table_path, options, data_splits, "blob1", expected_blob1s));
+    ASSERT_OK(CheckReadBlobs(table_path, options, data_splits, "blob2", expected_blob2s));
 }
 
 TEST_P(WriteInteTest, TestRowTrackingPartitionGroupOnCommit) {

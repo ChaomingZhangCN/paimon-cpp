@@ -20,6 +20,8 @@
 
 #include <utility>
 
+#include "arrow/c/abi.h"
+#include "arrow/c/bridge.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/core/utils/branch_manager.h"
 #include "paimon/executor.h"
@@ -30,19 +32,20 @@ namespace paimon {
 class Predicate;
 
 ReadContext::ReadContext(
-    const std::string& path, const std::string& branch, const std::vector<std::string>& read_schema,
-    const std::vector<int32_t>& read_field_ids, const std::shared_ptr<Predicate>& predicate,
-    bool enable_predicate_filter, bool enable_prefetch, uint32_t prefetch_batch_count,
-    uint32_t prefetch_max_parallel_num, bool enable_multi_thread_row_to_batch,
-    uint32_t row_to_batch_thread_number, const std::optional<std::string>& table_schema,
-    const std::shared_ptr<MemoryPool>& memory_pool, const std::shared_ptr<Executor>& executor,
+    const std::string& path, const std::string& branch,
+    const std::vector<std::string>& read_field_names, const std::vector<int32_t>& read_field_ids,
+    const std::shared_ptr<Predicate>& predicate, bool enable_predicate_filter, bool enable_prefetch,
+    uint32_t prefetch_batch_count, uint32_t prefetch_max_parallel_num,
+    bool enable_multi_thread_row_to_batch, uint32_t row_to_batch_thread_number,
+    const std::optional<std::string>& table_schema, const std::shared_ptr<MemoryPool>& memory_pool,
+    const std::shared_ptr<Executor>& executor,
     const std::shared_ptr<FileSystem>& specific_file_system,
     const std::map<std::string, std::string>& fs_scheme_to_identifier_map,
     const std::map<std::string, std::string>& options, PrefetchCacheMode prefetch_cache_mode,
-    const CacheConfig& cache_config)
+    const CacheConfig& cache_config, const std::shared_ptr<Cache>& cache)
     : path_(path),
       branch_(branch),
-      read_schema_(read_schema),
+      read_field_names_(read_field_names),
       read_field_ids_(read_field_ids),
       predicate_(predicate),
       enable_predicate_filter_(enable_predicate_filter),
@@ -58,9 +61,26 @@ ReadContext::ReadContext(
       fs_scheme_to_identifier_map_(fs_scheme_to_identifier_map),
       options_(options),
       prefetch_cache_mode_(prefetch_cache_mode),
-      cache_config_(cache_config) {}
+      cache_config_(cache_config),
+      cache_(cache) {}
 
-ReadContext::~ReadContext() = default;
+ReadContext::~ReadContext() {
+    if (read_schema_ && read_schema_->release) {
+        read_schema_->release(read_schema_.get());
+    }
+}
+
+void ReadContext::SetReadSchema(std::unique_ptr<ArrowSchema> schema) {
+    if (schema && schema->release) {
+        if (schema.get() == read_schema_.get()) {
+            return;
+        }
+        if (read_schema_ && read_schema_->release) {
+            read_schema_->release(read_schema_.get());
+        }
+        read_schema_ = std::move(schema);
+    }
+}
 
 class ReadContextBuilder::Impl {
  public:
@@ -69,6 +89,7 @@ class ReadContextBuilder::Impl {
         branch_ = BranchManager::DEFAULT_MAIN_BRANCH;
         read_field_names_.clear();
         read_field_ids_.clear();
+        read_schema_.reset();
         fs_scheme_to_identifier_map_.clear();
         options_.clear();
         predicate_.reset();
@@ -84,6 +105,7 @@ class ReadContextBuilder::Impl {
         executor_.reset();
         specific_file_system_.reset();
         cache_config_ = CacheConfig();
+        cache_.reset();
     }
 
  private:
@@ -91,6 +113,7 @@ class ReadContextBuilder::Impl {
     std::string branch_ = BranchManager::DEFAULT_MAIN_BRANCH;
     std::vector<std::string> read_field_names_;
     std::vector<int32_t> read_field_ids_;
+    std::unique_ptr<ArrowSchema> read_schema_;
     std::map<std::string, std::string> fs_scheme_to_identifier_map_;
     std::map<std::string, std::string> options_;
     std::shared_ptr<Predicate> predicate_;
@@ -106,6 +129,7 @@ class ReadContextBuilder::Impl {
     std::shared_ptr<FileSystem> specific_file_system_;
     PrefetchCacheMode prefetch_cache_mode_ = PrefetchCacheMode::ALWAYS;
     CacheConfig cache_config_;
+    std::shared_ptr<Cache> cache_;
 };
 
 ReadContextBuilder::ReadContextBuilder(const std::string& path)
@@ -129,7 +153,7 @@ ReadContextBuilder& ReadContextBuilder::SetOptions(const std::map<std::string, s
     return *this;
 }
 
-ReadContextBuilder& ReadContextBuilder::SetReadSchema(
+ReadContextBuilder& ReadContextBuilder::SetReadFieldNames(
     const std::vector<std::string>& read_field_names) {
     impl_->read_field_names_ = read_field_names;
     return *this;
@@ -138,6 +162,13 @@ ReadContextBuilder& ReadContextBuilder::SetReadSchema(
 ReadContextBuilder& ReadContextBuilder::SetReadFieldIds(
     const std::vector<int32_t>& read_field_ids) {
     impl_->read_field_ids_ = read_field_ids;
+    return *this;
+}
+
+ReadContextBuilder& ReadContextBuilder::SetReadSchema(std::unique_ptr<ArrowSchema> read_schema) {
+    if (read_schema && read_schema->release) {
+        impl_->read_schema_ = std::move(read_schema);
+    }
     return *this;
 }
 
@@ -219,10 +250,18 @@ ReadContextBuilder& ReadContextBuilder::WithCacheConfig(const CacheConfig& cache
     return *this;
 }
 
+ReadContextBuilder& ReadContextBuilder::WithCache(const std::shared_ptr<Cache>& cache) {
+    impl_->cache_ = cache;
+    return *this;
+}
+
 Result<std::unique_ptr<ReadContext>> ReadContextBuilder::Finish() {
     PAIMON_ASSIGN_OR_RAISE(impl_->path_, PathUtil::NormalizePath(impl_->path_));
     if (impl_->path_.empty()) {
         return Status::Invalid("cannot read with empty table path");
+    }
+    if (impl_->enable_prefetch_ && impl_->prefetch_max_parallel_num_ == 0) {
+        return Status::Invalid("prefetch max parallel num should be greater than 0");
     }
     if (impl_->enable_prefetch_ && impl_->prefetch_batch_count_ <= 0) {
         return Status::Invalid("prefetch batch count should be greater than 0");
@@ -232,10 +271,14 @@ Result<std::unique_ptr<ReadContext>> ReadContextBuilder::Finish() {
         return Status::Invalid(
             "prefetch batch count should be greater than or equal to prefetch max parallel num");
     }
+    if (impl_->specific_file_system_ && !impl_->fs_scheme_to_identifier_map_.empty()) {
+        return Status::Invalid(
+            "WithFileSystem() and WithFileSystemSchemeToIdentifierMap() cannot be used together");
+    }
     if (!impl_->executor_) {
         // If the user do not set executor, create default executor by prefetch batch count
         uint32_t thread_count = impl_->enable_prefetch_ ? impl_->prefetch_max_parallel_num_ : 1;
-        impl_->executor_ = CreateDefaultExecutor(thread_count);
+        PAIMON_ASSIGN_OR_RAISE(impl_->executor_, CreateDefaultExecutor(thread_count));
     }
 
     if (impl_->enable_multi_thread_row_to_batch_ && impl_->row_to_batch_thread_number_ <= 0) {
@@ -248,7 +291,10 @@ Result<std::unique_ptr<ReadContext>> ReadContextBuilder::Finish() {
         impl_->enable_multi_thread_row_to_batch_, impl_->row_to_batch_thread_number_,
         impl_->table_schema_, impl_->memory_pool_, impl_->executor_, impl_->specific_file_system_,
         impl_->fs_scheme_to_identifier_map_, impl_->options_, impl_->prefetch_cache_mode_,
-        impl_->cache_config_);
+        impl_->cache_config_, impl_->cache_);
+    if (impl_->read_schema_ && impl_->read_schema_->release) {
+        ctx->SetReadSchema(std::move(impl_->read_schema_));
+    }
     impl_->Reset();
     return ctx;
 }

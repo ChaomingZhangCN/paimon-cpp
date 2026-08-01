@@ -19,6 +19,7 @@
 #include "paimon/core/manifest/manifest_file.h"
 
 #include <cassert>
+#include <limits>
 #include <utility>
 
 #include "arrow/c/abi.h"
@@ -27,7 +28,7 @@
 #include "paimon/core/io/rolling_file_writer.h"
 #include "paimon/core/manifest/manifest_entry.h"
 #include "paimon/core/manifest/manifest_entry_serializer.h"
-#include "paimon/core/manifest/manifest_entry_writer.h"
+#include "paimon/core/manifest/manifest_entry_writer_factory.h"
 #include "paimon/core/manifest/manifest_file_meta.h"
 #include "paimon/core/utils/file_store_path_factory.h"
 #include "paimon/core/utils/object_serializer.h"
@@ -56,7 +57,7 @@ ManifestFile::ManifestFile(const std::shared_ptr<FileSystem>& file_system,
                            const std::shared_ptr<arrow::Schema>& partition_type)
     : ObjectsFile<ManifestEntry>(file_system, reader_builder, writer_builder,
                                  std::make_unique<ManifestEntrySerializer>(pool), compression,
-                                 path_factory, pool),
+                                 path_factory, options.GetCache(), pool),
       target_file_size_(target_file_size),
       options_(options),
       partition_type_(partition_type) {}
@@ -102,16 +103,13 @@ Result<std::vector<ManifestFileMeta>> ManifestFile::Write(
         return Status::OK();
     };
 
-    auto create_file_writer = [&]() -> Result<std::unique_ptr<ManifestEntryWriter>> {
-        auto writer = std::make_unique<ManifestEntryWriter>(options_.GetManifestCompression(),
-                                                            converter, pool_, partition_type_);
-        PAIMON_RETURN_NOT_OK(
-            writer->Init(options_.GetFileSystem(), path_factory_->NewPath(), writer_builder_));
-        return writer;
-    };
+    auto writer_factory = std::make_shared<ManifestEntryWriterFactory>(
+        options_.GetManifestCompression(), converter, pool_, partition_type_,
+        options_.GetFileSystem(), path_factory_, writer_builder_);
     std::unique_ptr<RollingFileWriter<const ManifestEntry&, ManifestFileMeta>> writer =
         std::make_unique<RollingFileWriter<const ManifestEntry&, ManifestFileMeta>>(
-            target_file_size_, create_file_writer);
+            target_file_size_, /*target_file_row_num=*/std::numeric_limits<int64_t>::max(),
+            writer_factory);
     for (const auto& entry : entries) {
         auto s = writer->Write(entry);
         if (!s.ok()) {

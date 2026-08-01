@@ -28,6 +28,7 @@
 #include "paimon/common/fs/resolving_file_system.h"
 #include "paimon/common/options/memory_size.h"
 #include "paimon/common/options/time_duration.h"
+#include "paimon/common/utils/options_utils.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/string_utils.h"
 #include "paimon/core/options/expire_config.h"
@@ -228,6 +229,23 @@ class ConfigParser {
         return Status::OK();
     }
 
+    // Parse VariantShreddingInferenceMode
+    Status ParseVariantShreddingInferenceMode(VariantShreddingInferenceMode* inference_mode) const {
+        auto iter = config_map_.find(Options::VARIANT_SHREDDING_INFERENCE_MODE);
+        if (iter != config_map_.end()) {
+            std::string str = StringUtils::ToLowerCase(iter->second);
+            if (str == "per-file") {
+                *inference_mode = VariantShreddingInferenceMode::PER_FILE;
+            } else if (str == "adaptive") {
+                *inference_mode = VariantShreddingInferenceMode::ADAPTIVE;
+            } else {
+                return Status::Invalid(
+                    fmt::format("invalid variant shredding inference mode: {}", str));
+            }
+        }
+        return Status::OK();
+    }
+
     // Parse ChangelogProducer
     Status ParseChangelogProducer(ChangelogProducer* changelog_producer) const {
         auto iter = config_map_.find(Options::CHANGELOG_PRODUCER);
@@ -361,6 +379,7 @@ class ConfigParser {
 struct CoreOptions::Impl {
     int64_t page_size = 64 * 1024;
     std::optional<int64_t> target_file_size;
+    int64_t target_file_row_num = std::numeric_limits<int64_t>::max();
     std::optional<int64_t> blob_target_file_size;
     int64_t source_split_target_size = 128 * 1024 * 1024;
     int64_t source_split_open_file_cost = 4 * 1024 * 1024;
@@ -369,10 +388,13 @@ struct CoreOptions::Impl {
     int64_t manifest_full_compaction_file_size = 16 * 1024 * 1024;
     int64_t write_buffer_size = 256 * 1024 * 1024;
     int64_t commit_timeout = std::numeric_limits<int64_t>::max();
+    int64_t commit_min_retry_wait = 10;
+    int64_t commit_max_retry_wait = 10 * 1000;
 
     std::shared_ptr<FileFormat> file_format;
     std::shared_ptr<FileSystem> file_system;
     std::shared_ptr<FileFormat> manifest_file_format;
+    std::shared_ptr<Cache> cache;
 
     std::optional<int64_t> scan_snapshot_id;
     std::optional<int64_t> scan_timestamp_millis;
@@ -382,7 +404,6 @@ struct CoreOptions::Impl {
     std::vector<std::string> blob_fields;
     std::vector<std::string> blob_descriptor_fields;
     std::vector<std::string> blob_view_fields;
-    std::vector<std::string> blob_external_storage_fields;
 
     std::string partition_default_name = "__DEFAULT_PARTITION__";
     StartupMode startup_mode = StartupMode::Default();
@@ -395,13 +416,14 @@ struct CoreOptions::Impl {
     std::optional<std::string> field_default_func;
     std::optional<std::string> scan_fallback_branch;
     std::optional<std::string> data_file_external_paths;
-    std::optional<std::string> blob_external_storage_path;
+    std::optional<std::string> blob_view_upstream_warehouse;
 
     std::map<std::string, std::string> raw_options;
 
     int32_t bucket = -1;
 
     int32_t manifest_merge_min_count = 30;
+    int32_t scan_manifest_entry_cache_max_snapshots = 0;
     int32_t read_batch_size = 1024;
     int32_t write_batch_size = 1024;
     int32_t local_sort_max_num_file_handles = 128;
@@ -428,6 +450,9 @@ struct CoreOptions::Impl {
     bool ignore_delete = false;
     bool write_buffer_spillable = true;
     bool write_only = false;
+    bool bucket_append_ordered = false;
+    CoreOptions::SequenceNumberInitMode write_sequence_number_init_mode =
+        CoreOptions::SequenceNumberInitMode::SCAN;
     bool deletion_vectors_enabled = false;
     bool deletion_vectors_bitmap64 = false;
     bool force_lookup = false;
@@ -442,10 +467,25 @@ struct CoreOptions::Impl {
     bool row_tracking_enabled = false;
     bool row_tracking_partition_group_on_commit = true;
     bool data_evolution_enabled = false;
+    bool variant_infer_shredding_schema = false;
+    VariantShreddingInferenceMode variant_shredding_inference_mode =
+        VariantShreddingInferenceMode::PER_FILE;
+    int32_t variant_shredding_max_schema_width = 300;
+    int32_t variant_shredding_max_schema_depth = 50;
+    double variant_shredding_min_field_cardinality_ratio = 0.1;
+    int32_t variant_shredding_max_infer_buffer_row = 4096;
+    int32_t variant_shredding_adaptive_max_infer_buffer_row = 256;
+    double variant_shredding_adaptive_retention_ratio = 0.05;
+    bool blob_view_resolve_enabled = true;
+    bool blob_as_descriptor = false;
+    std::optional<bool> blob_split_by_file_size;
     bool legacy_partition_name_enabled = true;
     bool global_index_enabled = true;
     std::optional<int32_t> global_index_thread_num;
     bool commit_force_compact = false;
+    bool commit_discard_duplicate_files = false;
+    bool dynamic_partition_overwrite = true;
+    bool overwrite_upgrade = true;
     bool compaction_force_rewrite_all_files = false;
     bool compaction_force_up_level_0 = false;
     std::optional<std::string> global_index_external_path;
@@ -484,6 +524,13 @@ struct CoreOptions::Impl {
         PAIMON_RETURN_NOT_OK(parser.ParseMemorySize(Options::PAGE_SIZE, &page_size));
         // Parse target-file-size - target size of a data file
         PAIMON_RETURN_NOT_OK(parser.ParseMemorySize(Options::TARGET_FILE_SIZE, &target_file_size));
+        // Parse target-file-row-num - target rows of a newly written data file
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<int64_t>(Options::TARGET_FILE_ROW_NUM, &target_file_row_num));
+        if (target_file_row_num <= 0) {
+            return Status::Invalid(
+                fmt::format("{} should be at least 1", Options::TARGET_FILE_ROW_NUM));
+        }
         // Parse blob.target-file-size - target size of a blob file
         PAIMON_RETURN_NOT_OK(
             parser.ParseMemorySize(Options::BLOB_TARGET_FILE_SIZE, &blob_target_file_size));
@@ -520,6 +567,9 @@ struct CoreOptions::Impl {
                                                     specified_file_system, &file_system));
         // Parse write-only - if true, compactions and snapshot expiration will be skipped
         PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::WRITE_ONLY, &write_only));
+        // Parse bucket-append-ordered - append writes in fixed-bucket mode are ordered
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<bool>(Options::BUCKET_APPEND_ORDERED, &bucket_append_ordered));
         // Parse partition.legacy-name - use legacy ToString for partition names, default true
         PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::PARTITION_GENERATE_LEGACY_NAME,
                                                 &legacy_partition_name_enabled));
@@ -560,13 +610,17 @@ struct CoreOptions::Impl {
         PAIMON_RETURN_NOT_OK(parser.ParseList<std::string>(Options::BLOB_VIEW_FIELD,
                                                            Options::FIELDS_SEPARATOR,
                                                            &blob_view_fields, /*need_trim=*/true));
-        // Parse blob-external-storage-field - descriptor BLOB fields written to external storage
-        PAIMON_RETURN_NOT_OK(parser.ParseList<std::string>(
-            Options::BLOB_EXTERNAL_STORAGE_FIELD, Options::FIELDS_SEPARATOR,
-            &blob_external_storage_fields, /*need_trim=*/true));
-        // Parse blob-external-storage-path - external storage path for configured BLOB fields
+        // Parse blob-view-upstream-warehouse - warehouse path for configured blob view fields
         PAIMON_RETURN_NOT_OK(
-            parser.Parse(Options::BLOB_EXTERNAL_STORAGE_PATH, &blob_external_storage_path));
+            parser.Parse(Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, &blob_view_upstream_warehouse));
+        // Parse blob-view.resolve.enabled - whether to resolve blob view fields at read time
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<bool>(Options::BLOB_VIEW_RESOLVE_ENABLED, &blob_view_resolve_enabled));
+        // Parse blob-as-descriptor - read blob field as descriptor rather than blob bytes
+        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::BLOB_AS_DESCRIPTOR, &blob_as_descriptor));
+        // Parse blob.split-by-file-size - whether blob file size counts in scan splitting
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse(Options::BLOB_SPLIT_BY_FILE_SIZE, &blob_split_by_file_size));
         return Status::OK();
     }
 
@@ -642,6 +696,22 @@ struct CoreOptions::Impl {
         PAIMON_RETURN_NOT_OK(parser.ParseTimeDuration(Options::COMMIT_TIMEOUT, &commit_timeout));
         // Parse commit.max-retries - maximum retries when commit failed, default 10
         PAIMON_RETURN_NOT_OK(parser.Parse(Options::COMMIT_MAX_RETRIES, &commit_max_retries));
+        // Parse commit.min-retry-wait - minimum retry wait when commit failed, default 10ms
+        PAIMON_RETURN_NOT_OK(
+            parser.ParseTimeDuration(Options::COMMIT_MIN_RETRY_WAIT, &commit_min_retry_wait));
+        // Parse commit.max-retry-wait - maximum retry wait when commit failed, default 10s
+        PAIMON_RETURN_NOT_OK(
+            parser.ParseTimeDuration(Options::COMMIT_MAX_RETRY_WAIT, &commit_max_retry_wait));
+        // Parse commit.discard-duplicate-files - whether to discard duplicate files on append
+        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::COMMIT_DISCARD_DUPLICATE_FILES,
+                                                &commit_discard_duplicate_files));
+        // Parse dynamic-partition-overwrite - whether overwrite only dynamic partitions
+        // for partitioned table overwrite.
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<bool>(Options::DYNAMIC_PARTITION_OVERWRITE, &dynamic_partition_overwrite));
+        // Parse overwrite-upgrade - whether to try upgrading data files after overwrite on
+        // primary key table
+        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::OVERWRITE_UPGRADE, &overwrite_upgrade));
         return Status::OK();
     }
 
@@ -652,12 +722,38 @@ struct CoreOptions::Impl {
             Options::SEQUENCE_FIELD, Options::FIELDS_SEPARATOR, &sequence_field));
         // Parse sequence.field.sort-order - order of sequence field, default "ascending"
         PAIMON_RETURN_NOT_OK(parser.ParseSortOrder(&sequence_field_sort_order));
+        // Parse write.sequence-number-init-mode - sequence init mode for write path
+        std::string write_sequence_init_mode_str = "scan";
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse(Options::WRITE_SEQUENCE_NUMBER_INIT_MODE, &write_sequence_init_mode_str));
+        write_sequence_init_mode_str = StringUtils::ToLowerCase(write_sequence_init_mode_str);
+        if (write_sequence_init_mode_str == "scan") {
+            write_sequence_number_init_mode = CoreOptions::SequenceNumberInitMode::SCAN;
+        } else if (write_sequence_init_mode_str == "snapshot") {
+            write_sequence_number_init_mode = CoreOptions::SequenceNumberInitMode::SNAPSHOT;
+        } else {
+            return Status::Invalid(fmt::format("invalid write sequence number init mode: {}",
+                                               write_sequence_init_mode_str));
+        }
         // Parse sort-engine - sort engine for primary key table, default "loser-tree"
         PAIMON_RETURN_NOT_OK(parser.ParseSortEngine(&sort_engine));
         // Parse merge-engine - merge engine for primary key table, default "deduplicate"
         PAIMON_RETURN_NOT_OK(parser.ParseMergeEngine(&merge_engine));
-        // Parse ignore-delete - whether to ignore delete records, default false
-        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::IGNORE_DELETE, &ignore_delete));
+        // Parse ignore-delete - whether to ignore delete records, default false.
+        // Java CoreOptions declares first-row.ignore-delete, deduplicate.ignore-delete
+        // and partial-update.ignore-delete as fallback keys, checked in that order only
+        // when ignore-delete itself is absent.
+        std::optional<bool> ignore_delete_value;
+        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::IGNORE_DELETE, &ignore_delete_value));
+        for (const char* fallback_key : {Options::FALLBACK_FIRST_ROW_IGNORE_DELETE,
+                                         Options::FALLBACK_DEDUPLICATE_IGNORE_DELETE,
+                                         Options::FALLBACK_PARTIAL_UPDATE_IGNORE_DELETE}) {
+            if (ignore_delete_value.has_value()) {
+                break;
+            }
+            PAIMON_RETURN_NOT_OK(parser.Parse<bool>(fallback_key, &ignore_delete_value));
+        }
+        ignore_delete = ignore_delete_value.value_or(false);
         // Parse fields.default-aggregate-function - default agg function for partial-update
         PAIMON_RETURN_NOT_OK(parser.Parse(Options::FIELDS_DEFAULT_AGG_FUNC, &field_default_func));
         // Parse changelog-producer - whether to double write to a changelog file, default "none"
@@ -671,7 +767,6 @@ struct CoreOptions::Impl {
         // Parse table-read.sequence-number.enabled - expose sequence number in system tables
         PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::TABLE_READ_SEQUENCE_NUMBER_ENABLED,
                                                 &table_read_sequence_number_enabled));
-        // Parse key-value.sequence_number.enabled - internal sequence number read switch
         PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::KEY_VALUE_SEQUENCE_NUMBER_ENABLED,
                                                 &key_value_sequence_number_enabled));
         // Parse partial-update.remove-record-on-sequence-group
@@ -714,6 +809,13 @@ struct CoreOptions::Impl {
         }
         // Parse scan.mode - scanning behavior of the source, default "default"
         PAIMON_RETURN_NOT_OK(parser.ParseStartupMode(&startup_mode));
+        // Parse scan.manifest-entry-cache.max-snapshots - cached snapshots per bucket.
+        PAIMON_RETURN_NOT_OK(parser.Parse(Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS,
+                                          &scan_manifest_entry_cache_max_snapshots));
+        if (scan_manifest_entry_cache_max_snapshots < 0) {
+            return Status::Invalid(fmt::format("{} must be non-negative",
+                                               Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS));
+        }
         // Parse scan.fallback-branch - fallback branch when partition not found
         PAIMON_RETURN_NOT_OK(parser.Parse(Options::SCAN_FALLBACK_BRANCH, &scan_fallback_branch));
         // Parse branch - branch name, default "main"
@@ -793,6 +895,76 @@ struct CoreOptions::Impl {
     }
 
     // Parse lookup configurations: compact mode, bloom filter, remote file, cache, compression.
+    Status ParseVariantOptions(const ConfigParser& parser) {
+        // Parse variant.inferShreddingSchema - infer the shredding schema from sampled rows
+        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::VARIANT_INFER_SHREDDING_SCHEMA,
+                                                &variant_infer_shredding_schema));
+        PAIMON_RETURN_NOT_OK(
+            parser.ParseVariantShreddingInferenceMode(&variant_shredding_inference_mode));
+        // Parse variant.shredding.maxSchemaWidth - max number of shredded fields, default 300
+        PAIMON_RETURN_NOT_OK(parser.Parse<int32_t>(Options::VARIANT_SHREDDING_MAX_SCHEMA_WIDTH,
+                                                   &variant_shredding_max_schema_width));
+        // Parse variant.shredding.maxSchemaDepth - max shredded nesting depth, default 50
+        PAIMON_RETURN_NOT_OK(parser.Parse<int32_t>(Options::VARIANT_SHREDDING_MAX_SCHEMA_DEPTH,
+                                                   &variant_shredding_max_schema_depth));
+        // Parse variant.shredding.minFieldCardinalityRatio - min occurrence ratio for a field to
+        // be shredded, default 0.1
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<double>(Options::VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO,
+                                 &variant_shredding_min_field_cardinality_ratio));
+        // Parse variant.shredding.maxInferBufferRow - rows buffered per file for inference,
+        // default 4096
+        PAIMON_RETURN_NOT_OK(parser.Parse<int32_t>(Options::VARIANT_SHREDDING_MAX_INFER_BUFFER_ROW,
+                                                   &variant_shredding_max_infer_buffer_row));
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<int32_t>(Options::VARIANT_SHREDDING_ADAPTIVE_MAX_INFER_BUFFER_ROW,
+                                  &variant_shredding_adaptive_max_infer_buffer_row));
+        PAIMON_RETURN_NOT_OK(
+            parser.Parse<double>(Options::VARIANT_SHREDDING_ADAPTIVE_RETENTION_RATIO,
+                                 &variant_shredding_adaptive_retention_ratio));
+        if (variant_shredding_max_schema_width <= 0) {
+            return Status::Invalid(fmt::format(
+                "The option '{}' should be positive, while input is {}",
+                Options::VARIANT_SHREDDING_MAX_SCHEMA_WIDTH, variant_shredding_max_schema_width));
+        }
+        if (variant_shredding_max_schema_depth <= 0) {
+            return Status::Invalid(fmt::format(
+                "The option '{}' should be positive, while input is {}",
+                Options::VARIANT_SHREDDING_MAX_SCHEMA_DEPTH, variant_shredding_max_schema_depth));
+        }
+        if (variant_shredding_min_field_cardinality_ratio < 0.0 ||
+            variant_shredding_min_field_cardinality_ratio > 1.0) {
+            return Status::Invalid(
+                fmt::format("The option '{}' should be in the range [0, 1], while input is {}",
+                            Options::VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO,
+                            variant_shredding_min_field_cardinality_ratio));
+        }
+        if (variant_shredding_max_infer_buffer_row <= 0) {
+            return Status::Invalid(
+                fmt::format("The option '{}' should be positive, while input is {}",
+                            Options::VARIANT_SHREDDING_MAX_INFER_BUFFER_ROW,
+                            variant_shredding_max_infer_buffer_row));
+        }
+        if (variant_shredding_inference_mode == VariantShreddingInferenceMode::ADAPTIVE) {
+            if (variant_shredding_adaptive_max_infer_buffer_row <= 0) {
+                return Status::Invalid(
+                    fmt::format("The option '{}' should be positive, while input is {}",
+                                Options::VARIANT_SHREDDING_ADAPTIVE_MAX_INFER_BUFFER_ROW,
+                                variant_shredding_adaptive_max_infer_buffer_row));
+            }
+            if (variant_shredding_adaptive_retention_ratio < 0.0 ||
+                variant_shredding_adaptive_retention_ratio >
+                    variant_shredding_min_field_cardinality_ratio) {
+                return Status::Invalid(
+                    fmt::format("The option '{}' should be in the range [0, {}], while input is {}",
+                                Options::VARIANT_SHREDDING_ADAPTIVE_RETENTION_RATIO,
+                                Options::VARIANT_SHREDDING_MIN_FIELD_CARDINALITY_RATIO,
+                                variant_shredding_adaptive_retention_ratio));
+            }
+        }
+        return Status::OK();
+    }
+
     Status ParseLookupOptions(const ConfigParser& parser) {
         // Parse force-lookup - whether to force lookup for compaction, default false
         PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::FORCE_LOOKUP, &force_lookup));
@@ -867,7 +1039,7 @@ Result<CoreOptions> CoreOptions::FromMap(
     PAIMON_RETURN_NOT_OK(impl->ParseIndexOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseCompactionOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseLookupOptions(parser));
-
+    PAIMON_RETURN_NOT_OK(impl->ParseVariantOptions(parser));
     return options;
 }
 
@@ -932,11 +1104,19 @@ int64_t CoreOptions::GetTargetFileSize(bool has_primary_key) const {
     return impl_->target_file_size.value();
 }
 
+int64_t CoreOptions::GetTargetFileRowNum() const {
+    return impl_->target_file_row_num;
+}
+
 int64_t CoreOptions::GetBlobTargetFileSize() const {
     if (impl_->blob_target_file_size == std::nullopt) {
         return GetTargetFileSize(/*has_primary_key=*/false);
     }
     return impl_->blob_target_file_size.value();
+}
+
+bool CoreOptions::BlobSplitByFileSize() const {
+    return impl_->blob_split_by_file_size.value_or(!impl_->blob_as_descriptor);
 }
 
 int64_t CoreOptions::GetCompactionFileSize(bool has_primary_key) const {
@@ -966,8 +1146,22 @@ std::optional<int64_t> CoreOptions::GetScanSnapshotId() const {
 std::optional<int64_t> CoreOptions::GetScanTimestampMillis() const {
     return impl_->scan_timestamp_millis;
 }
+
+int32_t CoreOptions::GetScanManifestEntryCacheMaxSnapshots() const {
+    return impl_->scan_manifest_entry_cache_max_snapshots;
+}
+
 int64_t CoreOptions::GetManifestTargetFileSize() const {
     return impl_->manifest_target_file_size;
+}
+
+std::shared_ptr<Cache> CoreOptions::GetCache() const {
+    return impl_->cache;
+}
+
+CoreOptions& CoreOptions::WithCache(const std::shared_ptr<Cache>& cache) {
+    impl_->cache = cache;
+    return *this;
 }
 
 int32_t CoreOptions::GetManifestMergeMinCount() const {
@@ -1033,6 +1227,26 @@ int64_t CoreOptions::GetCommitTimeout() const {
 
 int32_t CoreOptions::GetCommitMaxRetries() const {
     return impl_->commit_max_retries;
+}
+
+int64_t CoreOptions::GetCommitMinRetryWait() const {
+    return impl_->commit_min_retry_wait;
+}
+
+int64_t CoreOptions::GetCommitMaxRetryWait() const {
+    return impl_->commit_max_retry_wait;
+}
+
+bool CoreOptions::CommitDiscardDuplicateFiles() const {
+    return impl_->commit_discard_duplicate_files;
+}
+
+bool CoreOptions::DynamicPartitionOverwrite() const {
+    return impl_->dynamic_partition_overwrite;
+}
+
+bool CoreOptions::OverwriteUpgrade() const {
+    return impl_->overwrite_upgrade;
 }
 
 int32_t CoreOptions::GetCompactionMinFileNum() const {
@@ -1131,6 +1345,14 @@ bool CoreOptions::WriteOnly() const {
     return impl_->write_only;
 }
 
+bool CoreOptions::BucketAppendOrdered() const {
+    return impl_->bucket_append_ordered;
+}
+
+CoreOptions::SequenceNumberInitMode CoreOptions::WriteSequenceNumberInitMode() const {
+    return impl_->write_sequence_number_init_mode;
+}
+
 std::optional<std::string> CoreOptions::GetFieldsDefaultFunc() const {
     return impl_->field_default_func;
 }
@@ -1174,6 +1396,93 @@ Result<bool> CoreOptions::FieldCollectAggDistinct(const std::string& field_name)
                       std::string(Options::DISTINCT);
     PAIMON_RETURN_NOT_OK(parser.Parse<bool>(key, &distinct));
     return distinct;
+}
+
+std::optional<std::string> CoreOptions::GetVariantShreddingSchema() const {
+    auto it = impl_->raw_options.find(Options::VARIANT_SHREDDING_SCHEMA);
+    if (it == impl_->raw_options.end()) {
+        it = impl_->raw_options.find(Options::PARQUET_VARIANT_SHREDDING_SCHEMA);
+    }
+    if (it == impl_->raw_options.end() || it->second.empty()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+bool CoreOptions::VariantInferShreddingSchemaEnabled() const {
+    return impl_->variant_infer_shredding_schema;
+}
+
+VariantShreddingInferenceMode CoreOptions::GetVariantShreddingInferenceMode() const {
+    return impl_->variant_shredding_inference_mode;
+}
+
+int32_t CoreOptions::GetVariantShreddingMaxSchemaWidth() const {
+    return impl_->variant_shredding_max_schema_width;
+}
+
+int32_t CoreOptions::GetVariantShreddingMaxSchemaDepth() const {
+    return impl_->variant_shredding_max_schema_depth;
+}
+
+double CoreOptions::GetVariantShreddingMinFieldCardinalityRatio() const {
+    return impl_->variant_shredding_min_field_cardinality_ratio;
+}
+
+int32_t CoreOptions::GetVariantShreddingMaxInferBufferRow() const {
+    return impl_->variant_shredding_max_infer_buffer_row;
+}
+
+int32_t CoreOptions::GetVariantShreddingAdaptiveMaxInferBufferRow() const {
+    return impl_->variant_shredding_adaptive_max_infer_buffer_row;
+}
+
+double CoreOptions::GetVariantShreddingAdaptiveRetentionRatio() const {
+    return impl_->variant_shredding_adaptive_retention_ratio;
+}
+
+Result<MapStorageLayout> CoreOptions::GetMapStorageLayout(const std::string& field_name) const {
+    std::string key = std::string(Options::FIELDS_PREFIX) + "." + field_name + "." +
+                      std::string(Options::MAP_STORAGE_LAYOUT);
+    PAIMON_ASSIGN_OR_RAISE(std::string layout_str, OptionsUtils::GetValueFromMap<std::string>(
+                                                       impl_->raw_options, key, "default"));
+    std::string lower = StringUtils::ToLowerCase(layout_str);
+    if (lower == "shared-shredding") {
+        return MapStorageLayout::SHARED_SHREDDING;
+    } else if (lower == "default") {
+        return MapStorageLayout::DEFAULT;
+    }
+    return Status::Invalid(fmt::format("invalid map.storage-layout: {}", layout_str));
+}
+
+Result<int32_t> CoreOptions::GetMapSharedShreddingMaxColumns(const std::string& field_name) const {
+    std::string key = std::string(Options::FIELDS_PREFIX) + "." + field_name + "." +
+                      std::string(Options::MAP_SHARED_SHREDDING_MAX_COLUMNS);
+    PAIMON_ASSIGN_OR_RAISE(int32_t max_columns,
+                           OptionsUtils::GetValueFromMap<int32_t>(impl_->raw_options, key, 256));
+    if (max_columns <= 0) {
+        return Status::Invalid(fmt::format("options {} must > 0",
+                                           std::string(Options::MAP_SHARED_SHREDDING_MAX_COLUMNS)));
+    }
+    return max_columns;
+}
+
+Result<MapSharedShreddingColumnPlacementPolicy>
+CoreOptions::GetMapSharedShreddingColumnPlacementPolicy(const std::string& field_name) const {
+    std::string key = std::string(Options::FIELDS_PREFIX) + "." + field_name + "." +
+                      std::string(Options::MAP_SHARED_SHREDDING_COLUMN_PLACEMENT_POLICY);
+    PAIMON_ASSIGN_OR_RAISE(std::string policy_str, OptionsUtils::GetValueFromMap<std::string>(
+                                                       impl_->raw_options, key, "lru"));
+    std::string lower = StringUtils::ToLowerCase(policy_str);
+    if (lower == "plain") {
+        return MapSharedShreddingColumnPlacementPolicy::PLAIN;
+    } else if (lower == "sequential") {
+        return MapSharedShreddingColumnPlacementPolicy::SEQUENTIAL;
+    } else if (lower == "lru") {
+        return MapSharedShreddingColumnPlacementPolicy::LRU;
+    }
+    return Status::Invalid(
+        fmt::format("invalid map.shared-shredding.column-placement-policy: {}", policy_str));
 }
 
 bool CoreOptions::DeletionVectorsEnabled() const {
@@ -1426,19 +1735,19 @@ const std::vector<std::string>& CoreOptions::GetBlobViewFields() const {
     return impl_->blob_view_fields;
 }
 
+std::optional<std::string> CoreOptions::GetBlobViewUpstreamWarehouse() const {
+    return impl_->blob_view_upstream_warehouse;
+}
+
+bool CoreOptions::BlobViewResolveEnabled() const {
+    return impl_->blob_view_resolve_enabled;
+}
+
 std::vector<std::string> CoreOptions::GetBlobInlineFields() const {
     std::vector<std::string> blob_inline_fields = impl_->blob_descriptor_fields;
     blob_inline_fields.insert(blob_inline_fields.end(), impl_->blob_view_fields.begin(),
                               impl_->blob_view_fields.end());
     return blob_inline_fields;
-}
-
-const std::vector<std::string>& CoreOptions::GetBlobExternalStorageFields() const {
-    return impl_->blob_external_storage_fields;
-}
-
-std::optional<std::string> CoreOptions::GetBlobExternalStoragePath() const {
-    return impl_->blob_external_storage_path;
 }
 
 int64_t CoreOptions::GetLookupCacheFileRetentionMs() const {

@@ -16,8 +16,11 @@
  * limitations under the License.
  */
 
+#include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <map>
 #include <memory>
@@ -35,23 +38,31 @@
 #include "gtest/gtest.h"
 #include "paimon/catalog/catalog.h"
 #include "paimon/catalog/identifier.h"
+#include "paimon/commit_context.h"
 #include "paimon/common/data/binary_row.h"
 #include "paimon/common/factories/io_hook.h"
 #include "paimon/common/reader/complete_row_kind_batch_reader.h"
 #include "paimon/common/reader/concat_batch_reader.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
+#include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/manifest/file_source.h"
+#include "paimon/core/snapshot.h"
 #include "paimon/core/stats/simple_stats.h"
 #include "paimon/core/table/source/data_split_impl.h"
 #include "paimon/core/table/source/deletion_file.h"
 #include "paimon/core/table/source/fallback_data_split.h"
+#include "paimon/core/table/system/global_system_tables.h"
+#include "paimon/core/tag/tag.h"
+#include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/data/decimal.h"
 #include "paimon/data/timestamp.h"
 #include "paimon/defs.h"
+#include "paimon/file_store_commit.h"
+#include "paimon/file_store_write.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/memory/memory_pool.h"
@@ -72,6 +83,7 @@
 #include "paimon/testing/utils/read_result_collector.h"
 #include "paimon/testing/utils/test_helper.h"
 #include "paimon/testing/utils/testharness.h"
+#include "paimon/write_context.h"
 
 namespace paimon::test {
 
@@ -190,7 +202,7 @@ class ReadInteTest : public testing::Test, public ::testing::WithParamInterface<
         auto file_system = std::make_shared<LocalFileSystem>();
         EXPECT_OK_AND_ASSIGN(auto input_stream, file_system->Open(split_file_name));
         std::vector<char> split_bytes(input_stream->Length().value_or(0), 0);
-        EXPECT_OK_AND_ASSIGN([[maybe_unused]] int32_t read_len,
+        EXPECT_OK_AND_ASSIGN([[maybe_unused]] int64_t read_len,
                              input_stream->Read(split_bytes.data(), split_bytes.size()));
         EXPECT_OK(input_stream->Close());
 
@@ -268,17 +280,33 @@ std::vector<std::string> StructFieldNames(const std::shared_ptr<arrow::StructArr
 }
 
 Result<SystemTableReadResult> ReadSystemTable(const std::string& system_table_path,
-                                              const std::map<std::string, std::string>& options) {
+                                              const std::map<std::string, std::string>& options,
+                                              bool streaming_mode = false,
+                                              const std::shared_ptr<Predicate>& predicate = nullptr,
+                                              const std::vector<std::string>& read_field_names = {},
+                                              bool read_next_plan = false) {
     ScanContextBuilder scan_context_builder(system_table_path);
-    scan_context_builder.SetOptions(options);
+    scan_context_builder.SetOptions(options).WithStreamingMode(streaming_mode);
+    if (predicate) {
+        scan_context_builder.SetPredicate(predicate);
+    }
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ScanContext> scan_context,
                            scan_context_builder.Finish());
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableScan> table_scan,
                            TableScan::Create(std::move(scan_context)));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Plan> plan, table_scan->CreatePlan());
+    if (read_next_plan) {
+        PAIMON_ASSIGN_OR_RAISE(plan, table_scan->CreatePlan());
+    }
 
     ReadContextBuilder read_context_builder(system_table_path);
     read_context_builder.SetOptions(options);
+    if (predicate) {
+        read_context_builder.SetPredicate(predicate);
+    }
+    if (!read_field_names.empty()) {
+        read_context_builder.SetReadFieldNames(read_field_names);
+    }
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<ReadContext> read_context,
                            read_context_builder.Finish());
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableRead> table_read,
@@ -290,6 +318,17 @@ Result<SystemTableReadResult> ReadSystemTable(const std::string& system_table_pa
     return SystemTableReadResult(std::move(batch_reader), result);
 }
 
+Status WriteAndFullCompact(std::unique_ptr<RecordBatch>&& batch, int64_t commit_identifier,
+                           TestHelper* helper) {
+    PAIMON_RETURN_NOT_OK(helper->write_->Write(std::move(batch)));
+    PAIMON_RETURN_NOT_OK(
+        helper->write_->Compact(/*partition=*/{}, /*bucket=*/0, /*full_compaction=*/true));
+    PAIMON_ASSIGN_OR_RAISE(
+        std::vector<std::shared_ptr<CommitMessage>> commit_messages,
+        helper->write_->PrepareCommit(/*wait_compaction=*/true, commit_identifier));
+    return helper->commit_->Commit(commit_messages, commit_identifier);
+}
+
 void AssertStructArrayEqualsJson(const std::shared_ptr<arrow::StructArray>& actual,
                                  const std::string& expected_json) {
     ASSERT_TRUE(actual);
@@ -297,6 +336,18 @@ void AssertStructArrayEqualsJson(const std::shared_ptr<arrow::StructArray>& actu
         arrow::ipc::internal::json::ArrayFromJSON(actual->type(), expected_json).ValueOrDie();
     ASSERT_TRUE(actual->Equals(expected))
         << "expected: " << expected->ToString() << "\nactual: " << actual->ToString();
+}
+
+Result<int64_t> CountDataFiles(const std::vector<std::shared_ptr<Split>>& splits) {
+    int64_t file_count = 0;
+    for (const auto& split : splits) {
+        auto data_split = std::dynamic_pointer_cast<DataSplit>(split);
+        if (!data_split) {
+            return Status::Invalid("expected data split");
+        }
+        file_count += data_split->GetFileList().size();
+    }
+    return file_count;
 }
 
 }  // namespace
@@ -505,7 +556,7 @@ TEST_P(ReadInteTest, TestReadOnlyPartitionField) {
 
     ReadContextBuilder context_builder(path);
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format);
-    context_builder.SetReadSchema({"dt"});
+    context_builder.SetReadFieldNames({"dt"});
     context_builder.SetPrefetchCacheMode(param.cache_mode);
     context_builder.EnablePrefetch(param.enable_prefetch)
         .AddOption(Options::FILE_FORMAT, param.file_format)
@@ -561,7 +612,7 @@ TEST(SystemTableReadInteTest, TestReadOptionsSystemTable) {
                                    /*ignore_if_exists=*/false));
     ArrowSchemaRelease(&schema);
 
-    std::string system_table_path = catalog->GetTableLocation(Identifier("db1", "tbl1$options"));
+    std::string system_table_path = PathUtil::JoinPath(dir->Str(), "warehouse/db1.db/tbl1$options");
     ScanContextBuilder scan_context_builder(system_table_path);
     scan_context_builder.SetOptions(options);
     ASSERT_OK_AND_ASSIGN(auto scan_context, scan_context_builder.Finish());
@@ -614,6 +665,862 @@ TEST(SystemTableReadInteTest, TestReadBranchOptionsSystemTable) {
     std::map<std::string, std::string> expected = {
         {"bucket", "2"}, {"file.format", "parquet"}, {"manifest.format", "avro"}};
     ASSERT_EQ(CollectStringMap(result), expected) << result->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadMetadataSystemTables) {
+    arrow::FieldVector fields = {
+        arrow::field("pk", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "parquet"},
+                                                  {Options::MANIFEST_FORMAT, "avro"},
+                                                  {Options::BUCKET, "1"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(dir->Str(), schema,
+                                                         /*partition_keys=*/{},
+                                                         /*primary_keys=*/{"pk"}, options,
+                                                         /*is_streaming_mode=*/true));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch_1,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["a", 1]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch_1), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch_2,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["b", 2]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch_2), /*commit_identifier=*/1,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+    ASSERT_OK_AND_ASSIGN(auto snapshots_result,
+                         ReadSystemTable(table_path + "$snapshots", options));
+    auto snapshots_array = SingleStructChunk(snapshots_result);
+    ASSERT_EQ(StructFieldNames(snapshots_array),
+              (std::vector<std::string>{
+                  "snapshot_id", "schema_id", "commit_user", "commit_identifier", "commit_kind",
+                  "commit_time", "base_manifest_list", "delta_manifest_list",
+                  "changelog_manifest_list", "total_record_count", "delta_record_count",
+                  "changelog_record_count", "watermark", "next_row_id"}));
+    ASSERT_EQ(snapshots_array->length(), 2);
+    auto snapshot_id_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(snapshots_array->field(0));
+    auto commit_kind_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(snapshots_array->field(4));
+    auto commit_time_array =
+        std::dynamic_pointer_cast<arrow::TimestampArray>(snapshots_array->field(5));
+    ASSERT_TRUE(snapshot_id_array);
+    ASSERT_TRUE(commit_kind_array);
+    ASSERT_TRUE(commit_time_array);
+    ASSERT_EQ(snapshot_id_array->Value(0), 1);
+    ASSERT_EQ(snapshot_id_array->Value(1), 2);
+    ASSERT_EQ(commit_kind_array->GetString(0), "APPEND");
+    ASSERT_EQ(commit_kind_array->GetString(1), "APPEND");
+
+    ASSERT_OK_AND_ASSIGN(auto schemas_result, ReadSystemTable(table_path + "$schemas", options));
+    auto schemas_array = SingleStructChunk(schemas_result);
+    ASSERT_EQ(StructFieldNames(schemas_array),
+              (std::vector<std::string>{"schema_id", "fields", "partition_keys", "primary_keys",
+                                        "options", "comment", "update_time"}));
+    ASSERT_EQ(schemas_array->length(), 1);
+    auto schema_id_array = std::dynamic_pointer_cast<arrow::Int64Array>(schemas_array->field(0));
+    auto primary_keys_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(schemas_array->field(3));
+    auto update_time_array =
+        std::dynamic_pointer_cast<arrow::TimestampArray>(schemas_array->field(6));
+    ASSERT_TRUE(schema_id_array);
+    ASSERT_TRUE(primary_keys_array);
+    ASSERT_TRUE(update_time_array);
+    ASSERT_EQ(schema_id_array->Value(0), 0);
+    ASSERT_EQ(primary_keys_array->GetString(0), R"(["pk"])");
+
+    ASSERT_OK_AND_ASSIGN(auto branches_result, ReadSystemTable(table_path + "$branches", options));
+    auto branches_array = SingleStructChunk(branches_result);
+    ASSERT_EQ(StructFieldNames(branches_array),
+              (std::vector<std::string>{"branch_name", "create_time"}));
+    ASSERT_EQ(branches_array->length(), 1);
+    auto branch_name_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(branches_array->field(0));
+    ASSERT_TRUE(branch_name_array);
+    ASSERT_EQ(branch_name_array->GetString(0), "main");
+    auto branch_create_time_array =
+        std::dynamic_pointer_cast<arrow::TimestampArray>(branches_array->field(1));
+    ASSERT_TRUE(branch_create_time_array);
+
+    ASSERT_OK_AND_ASSIGN(auto manifests_result,
+                         ReadSystemTable(table_path + "$manifests", options));
+    auto manifests_array = SingleStructChunk(manifests_result);
+    ASSERT_EQ(StructFieldNames(manifests_array),
+              (std::vector<std::string>{"file_name", "file_size", "num_added_files",
+                                        "num_deleted_files", "schema_id", "min_partition_stats",
+                                        "max_partition_stats", "min_row_id", "max_row_id"}));
+    ASSERT_GT(manifests_array->length(), 0);
+    auto manifest_file_name_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(manifests_array->field(0));
+    auto manifest_file_size_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(manifests_array->field(1));
+    auto manifest_num_added_files_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(manifests_array->field(2));
+    auto manifest_schema_id_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(manifests_array->field(4));
+    ASSERT_TRUE(manifest_file_name_array);
+    ASSERT_TRUE(manifest_file_size_array);
+    ASSERT_TRUE(manifest_num_added_files_array);
+    ASSERT_TRUE(manifest_schema_id_array);
+    ASSERT_EQ(manifest_file_name_array->GetString(0).find("manifest-"), 0);
+    ASSERT_GT(manifest_file_size_array->Value(0), 0);
+    ASSERT_GE(manifest_num_added_files_array->Value(0), 1);
+    ASSERT_EQ(manifest_schema_id_array->Value(0), 0);
+
+    ASSERT_OK_AND_ASSIGN(auto files_result, ReadSystemTable(table_path + "$files", options));
+    auto files_array = SingleStructChunk(files_result);
+    ASSERT_EQ(StructFieldNames(files_array), (std::vector<std::string>{"partition",
+                                                                       "bucket",
+                                                                       "file_path",
+                                                                       "file_format",
+                                                                       "schema_id",
+                                                                       "level",
+                                                                       "record_count",
+                                                                       "file_size_in_bytes",
+                                                                       "min_key",
+                                                                       "max_key",
+                                                                       "null_value_counts",
+                                                                       "min_value_stats",
+                                                                       "max_value_stats",
+                                                                       "min_sequence_number",
+                                                                       "max_sequence_number",
+                                                                       "creation_time",
+                                                                       "deleteRowCount",
+                                                                       "file_source",
+                                                                       "first_row_id",
+                                                                       "write_cols"}));
+    ASSERT_GT(files_array->length(), 0);
+    auto partition_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(0));
+    auto bucket_array = std::dynamic_pointer_cast<arrow::Int32Array>(files_array->field(1));
+    auto file_path_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(2));
+    auto file_format_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(3));
+    auto file_schema_id_array = std::dynamic_pointer_cast<arrow::Int64Array>(files_array->field(4));
+    auto record_count_array = std::dynamic_pointer_cast<arrow::Int64Array>(files_array->field(6));
+    auto file_size_array = std::dynamic_pointer_cast<arrow::Int64Array>(files_array->field(7));
+    auto min_sequence_number_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(files_array->field(13));
+    auto max_sequence_number_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(files_array->field(14));
+    auto creation_time_array =
+        std::dynamic_pointer_cast<arrow::TimestampArray>(files_array->field(15));
+    ASSERT_TRUE(partition_array);
+    ASSERT_TRUE(bucket_array);
+    ASSERT_TRUE(file_path_array);
+    ASSERT_TRUE(file_format_array);
+    ASSERT_TRUE(file_schema_id_array);
+    ASSERT_TRUE(record_count_array);
+    ASSERT_TRUE(file_size_array);
+    ASSERT_TRUE(min_sequence_number_array);
+    ASSERT_TRUE(max_sequence_number_array);
+    ASSERT_TRUE(creation_time_array);
+    ASSERT_TRUE(partition_array->IsNull(0));
+    ASSERT_EQ(bucket_array->Value(0), 0);
+    ASSERT_NE(file_path_array->GetString(0).find("/bucket-0/"), std::string::npos);
+    ASSERT_EQ(file_format_array->GetString(0), "parquet");
+    ASSERT_EQ(file_schema_id_array->Value(0), 0);
+    ASSERT_EQ(record_count_array->Value(0), 1);
+    ASSERT_GT(file_size_array->Value(0), 0);
+    ASSERT_GE(min_sequence_number_array->Value(0), 0);
+    ASSERT_GE(max_sequence_number_array->Value(0), min_sequence_number_array->Value(0));
+    ASSERT_FALSE(creation_time_array->IsNull(0));
+}
+
+TEST(SystemTableReadInteTest, TestReadOptimizedSystemTable) {
+    arrow::FieldVector fields = {
+        arrow::field("k", arrow::int32()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "parquet"},
+                                                  {Options::MANIFEST_FORMAT, "avro"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::NUM_LEVELS, "3"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                         TestHelper::Create(dir->Str(), schema,
+                                            /*partition_keys=*/{},
+                                            /*primary_keys=*/{"k"}, options,
+                                            /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+    auto row_type = arrow::struct_(fields);
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch_1,
+                         TestHelper::MakeRecordBatch(row_type, R"([[1, 10], [2, 20]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(batch_1), /*commit_identifier=*/0, helper.get()));
+
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult compacted_result,
+                         ReadSystemTable(table_path + "$ro", options));
+    std::shared_ptr<arrow::DataType> expected_type =
+        arrow::struct_({arrow::field("_VALUE_KIND", arrow::int8()),
+                        arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())});
+    std::shared_ptr<arrow::ChunkedArray> expected_compacted;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, 10], [0, 2, 20]])"}, &expected_compacted)
+                    .ok());
+    ASSERT_TRUE(compacted_result.array->Equals(expected_compacted))
+        << compacted_result.array->ToString();
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch_2,
+                         TestHelper::MakeRecordBatch(row_type, R"([[1, 11], [3, 30]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch_2), /*commit_identifier=*/1,
+                                     /*expected_commit_messages=*/std::nullopt));
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult stale_result,
+                         ReadSystemTable(table_path + "$ro", options));
+    ASSERT_TRUE(stale_result.array->Equals(expected_compacted)) << stale_result.array->ToString();
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch_3,
+                         TestHelper::MakeRecordBatch(row_type, R"([[2, 21], [3, 31]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(batch_3), /*commit_identifier=*/2, helper.get()));
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult refreshed_result,
+                         ReadSystemTable(table_path + "$ro", options));
+    std::shared_ptr<arrow::ChunkedArray> expected_refreshed;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, 11], [0, 2, 21], [0, 3, 31]])"}, &expected_refreshed)
+                    .ok());
+    ASSERT_TRUE(refreshed_result.array->Equals(expected_refreshed))
+        << refreshed_result.array->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadOptimizedAppendOnlySystemTableWithStreamingScan) {
+    arrow::FieldVector fields = {
+        arrow::field("k", arrow::int32()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "parquet"},
+                                                  {Options::MANIFEST_FORMAT, "avro"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "k"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                         TestHelper::Create(dir->Str(), schema,
+                                            /*partition_keys=*/{},
+                                            /*primary_keys=*/{}, options,
+                                            /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([[1, 10], [2, 20]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult result,
+                         ReadSystemTable(table_path + "$ro", options, /*streaming_mode=*/true));
+    std::shared_ptr<arrow::DataType> expected_type =
+        arrow::struct_({arrow::field("_VALUE_KIND", arrow::int8()),
+                        arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())});
+    std::shared_ptr<arrow::ChunkedArray> expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, 10], [0, 2, 20]])"}, &expected)
+                    .ok());
+    ASSERT_TRUE(result.array->Equals(expected)) << result.array->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadOptimizedPrimaryKeyProjectionAndPredicatePushdown) {
+    arrow::FieldVector fields = {
+        arrow::field("k", arrow::int32()),
+        arrow::field("v", arrow::int32()),
+        arrow::field("extra", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {
+        {Options::FILE_SYSTEM, "local"},
+        {Options::FILE_FORMAT, "parquet"},
+        {Options::MANIFEST_FORMAT, "avro"},
+        {Options::BUCKET, "1"},
+        {Options::BUCKET_KEY, "k"},
+        {Options::WRITE_BATCH_SIZE, "1"},
+        {"parquet.page.size", "1"},
+        {"parquet.enable-dictionary", "false"},
+        {"parquet.write.enable-page-index", "true"},
+        {"parquet.write.max-row-group-length", "1"},
+        {"parquet.read.enable-page-index-filter", "true"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                         TestHelper::Create(dir->Str(), schema,
+                                            /*partition_keys=*/{}, /*primary_keys=*/{"k"}, options,
+                                            /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+    auto row_type = arrow::struct_(fields);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch_1,
+        TestHelper::MakeRecordBatch(row_type, R"([[1, 10, 100], [2, 20, 200], [3, 30, 300]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(batch_1), /*commit_identifier=*/0, helper.get()));
+
+    std::shared_ptr<Predicate> predicate =
+        PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"k", FieldType::INT, Literal(2));
+
+    ScanContextBuilder ro_scan_context_builder(table_path + "$ro");
+    ro_scan_context_builder.SetOptions(options).SetPredicate(predicate);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ScanContext> ro_scan_context,
+                         ro_scan_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableScan> ro_table_scan,
+                         TableScan::Create(std::move(ro_scan_context)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> ro_plan, ro_table_scan->CreatePlan());
+    ASSERT_OK_AND_ASSIGN(int64_t ro_file_count, CountDataFiles(ro_plan->Splits()));
+    ASSERT_EQ(ro_file_count, 1);
+
+    ReadContextBuilder read_context_builder(table_path + "$ro");
+    // Do not enable row-level predicate filtering: the result must come from the file reader's
+    // row-group/page predicate pushdown.
+    read_context_builder.SetOptions(options).SetPredicate(predicate).SetReadFieldNames({"k", "v"});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
+                         TableRead::Create(std::move(read_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
+                         table_read->CreateReader(ro_plan->Splits()));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result,
+                         ReadResultCollector::CollectResult(batch_reader.get()));
+    std::shared_ptr<arrow::DataType> expected_type =
+        arrow::struct_({arrow::field("_VALUE_KIND", arrow::int8()),
+                        arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())});
+    std::shared_ptr<arrow::ChunkedArray> expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(expected_type, {R"([[0, 2, 20]])"},
+                                                                 &expected)
+                    .ok());
+    ASSERT_TRUE(result->Equals(expected)) << result->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadOptimizedSystemTableNestedProjection) {
+    auto payload_type =
+        arrow::struct_({arrow::field("a", arrow::int32()), arrow::field("b", arrow::utf8())});
+    arrow::FieldVector fields = {
+        arrow::field("k", arrow::int32()),
+        arrow::field("payload", payload_type),
+        arrow::field("extra", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "parquet"},
+                                                  {Options::MANIFEST_FORMAT, "avro"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "k"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                         TestHelper::Create(dir->Str(), schema,
+                                            /*partition_keys=*/{}, /*primary_keys=*/{"k"}, options,
+                                            /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields),
+                                    R"([[1, [10, "x"], 100], [2, [20, "y"], 200]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(batch), /*commit_identifier=*/0, helper.get()));
+
+    ScanContextBuilder scan_context_builder(table_path + "$ro");
+    scan_context_builder.SetOptions(options);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ScanContext> scan_context, scan_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableScan> table_scan,
+                         TableScan::Create(std::move(scan_context)));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> plan, table_scan->CreatePlan());
+
+    auto projected_schema = arrow::schema({
+        arrow::field("k", arrow::int32()),
+        arrow::field("payload", arrow::struct_({arrow::field("a", arrow::int32())})),
+    });
+    auto c_projected_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*projected_schema, c_projected_schema.get()).ok());
+    ReadContextBuilder read_context_builder(table_path + "$ro");
+    read_context_builder.SetOptions(options).SetReadSchema(std::move(c_projected_schema));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
+                         TableRead::Create(std::move(read_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> batch_reader,
+                         table_read->CreateReader(plan->Splits()));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result,
+                         ReadResultCollector::CollectResult(batch_reader.get()));
+
+    std::shared_ptr<arrow::DataType> expected_type = arrow::struct_({
+        arrow::field("_VALUE_KIND", arrow::int8()),
+        arrow::field("k", arrow::int32()),
+        arrow::field("payload", arrow::struct_({arrow::field("a", arrow::int32())})),
+    });
+    std::shared_ptr<arrow::ChunkedArray> expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, [10]], [0, 2, [20]]])"}, &expected)
+                    .ok());
+    ASSERT_TRUE(result->Equals(expected)) << result->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadOptimizedSystemTableWithBranch) {
+    arrow::FieldVector fields = {
+        arrow::field("k", arrow::int32()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "parquet"},
+                                                  {Options::MANIFEST_FORMAT, "avro"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::NUM_LEVELS, "3"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TestHelper> helper,
+                         TestHelper::Create(dir->Str(), schema,
+                                            /*partition_keys=*/{},
+                                            /*primary_keys=*/{"k"}, options,
+                                            /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+    auto row_type = arrow::struct_(fields);
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> branch_batch,
+                         TestHelper::MakeRecordBatch(row_type, R"([[1, 10], [2, 20]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(branch_batch), /*commit_identifier=*/0, helper.get()));
+
+    std::string branch_path = PathUtil::JoinPath(table_path, "branch/branch-rt");
+    std::filesystem::create_directories(branch_path);
+    ASSERT_TRUE(TestUtil::CopyDirectory(PathUtil::JoinPath(table_path, "schema"),
+                                        PathUtil::JoinPath(branch_path, "schema")));
+    ASSERT_TRUE(TestUtil::CopyDirectory(PathUtil::JoinPath(table_path, "snapshot"),
+                                        PathUtil::JoinPath(branch_path, "snapshot")));
+
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> main_batch,
+                         TestHelper::MakeRecordBatch(row_type, R"([[1, 11], [3, 30]])",
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(main_batch), /*commit_identifier=*/1, helper.get()));
+
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult result,
+                         ReadSystemTable(table_path + "$branch_rt$ro", options));
+    std::shared_ptr<arrow::DataType> expected_type =
+        arrow::struct_({arrow::field("_VALUE_KIND", arrow::int8()),
+                        arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())});
+    std::shared_ptr<arrow::ChunkedArray> expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, 10], [0, 2, 20]])"}, &expected)
+                    .ok());
+    ASSERT_TRUE(result.array->Equals(expected)) << result.array->ToString();
+
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult main_result,
+                         ReadSystemTable(table_path + "$ro", options));
+    std::shared_ptr<arrow::ChunkedArray> expected_main;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, 11], [0, 2, 20], [0, 3, 30]])"}, &expected_main)
+                    .ok());
+    ASSERT_TRUE(main_result.array->Equals(expected_main)) << main_result.array->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadOptimizedSystemTableWithFirstRowMergeEngine) {
+    arrow::FieldVector fields = {
+        arrow::field("k", arrow::int32()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {
+        {Options::FILE_SYSTEM, "local"},     {Options::FILE_FORMAT, "parquet"},
+        {Options::MANIFEST_FORMAT, "avro"},  {Options::BUCKET, "1"},
+        {Options::BUCKET_KEY, "k"},          {Options::NUM_LEVELS, "5"},
+        {Options::MERGE_ENGINE, "first-row"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<TestHelper> helper,
+        TestHelper::Create(dir->Str(), schema,
+                           /*partition_keys=*/{},
+                           /*primary_keys=*/{"k"}, options,
+                           /*is_streaming_mode=*/true,
+                           /*ignore_if_exists=*/false, PathUtil::JoinPath(dir->Str(), "tmp")));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([[1, 10], [2, 20]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(WriteAndFullCompact(std::move(batch), /*commit_identifier=*/0, helper.get()));
+
+    ASSERT_OK_AND_ASSIGN(SystemTableReadResult result,
+                         ReadSystemTable(table_path + "$ro", options));
+    std::shared_ptr<arrow::DataType> expected_type =
+        arrow::struct_({arrow::field("_VALUE_KIND", arrow::int8()),
+                        arrow::field("k", arrow::int32()), arrow::field("v", arrow::int32())});
+    std::shared_ptr<arrow::ChunkedArray> expected;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    expected_type, {R"([[0, 1, 10], [0, 2, 20]])"}, &expected)
+                    .ok());
+    ASSERT_TRUE(result.array->Equals(expected)) << result.array->ToString();
+}
+
+TEST(SystemTableReadInteTest, TestReadFilesSystemTableForPartitionedTable) {
+    arrow::FieldVector fields = {
+        arrow::field("dt", arrow::utf8()),
+        arrow::field("pk", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(dir->Str(), schema,
+                                                         /*partition_keys=*/{"dt"},
+                                                         /*primary_keys=*/{"dt", "pk"}, options,
+                                                         /*is_streaming_mode=*/true));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["20260527", "a", 1]])",
+                                    /*partition_map=*/{{"dt", "20260527"}}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+    ASSERT_OK_AND_ASSIGN(auto files_result, ReadSystemTable(table_path + "$files", options));
+    auto files_array = SingleStructChunk(files_result);
+    ASSERT_EQ(files_array->length(), 1);
+    auto partition_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(0));
+    auto file_path_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(2));
+    auto min_key_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(8));
+    auto max_key_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(9));
+    auto null_value_counts_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(10));
+    auto min_value_stats_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(11));
+    auto max_value_stats_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(12));
+    ASSERT_TRUE(partition_array);
+    ASSERT_TRUE(file_path_array);
+    ASSERT_TRUE(min_key_array);
+    ASSERT_TRUE(max_key_array);
+    ASSERT_TRUE(null_value_counts_array);
+    ASSERT_TRUE(min_value_stats_array);
+    ASSERT_TRUE(max_value_stats_array);
+    ASSERT_EQ(partition_array->GetString(0), "{20260527}");
+    ASSERT_NE(file_path_array->GetString(0).find("/dt=20260527/bucket-0/"), std::string::npos);
+    ASSERT_EQ(min_key_array->GetString(0), "[a]");
+    ASSERT_EQ(max_key_array->GetString(0), "[a]");
+    ASSERT_EQ(null_value_counts_array->GetString(0), "{dt=0, pk=0, v=0}");
+    ASSERT_EQ(min_value_stats_array->GetString(0), "{dt=20260527, pk=a, v=1}");
+    ASSERT_EQ(max_value_stats_array->GetString(0), "{dt=20260527, pk=a, v=1}");
+}
+
+TEST(SystemTableReadInteTest, TestReadFilesSystemTableForPartitionedPartialWrite) {
+    arrow::FieldVector fields = {
+        arrow::field("dt", arrow::utf8()),
+        arrow::field("id", arrow::int32()),
+        arrow::field("score", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {
+        {Options::FILE_SYSTEM, "local"},         {Options::FILE_FORMAT, "parquet"},
+        {Options::MANIFEST_FORMAT, "avro"},      {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
+    };
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(dir->Str(), schema,
+                                                         /*partition_keys=*/{"dt"},
+                                                         /*primary_keys=*/{}, options,
+                                                         /*is_streaming_mode=*/true));
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+
+    WriteContextBuilder write_context_builder(table_path, "partial-write");
+    write_context_builder.WithWriteSchema({"score"});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriteContext> write_context,
+                         write_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreWrite> write,
+                         FileStoreWrite::Create(std::move(write_context)));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_({fields[2]}), R"([[10], [20]])",
+                                    /*partition_map=*/{{"dt", "20260724"}}, /*bucket=*/0, {}));
+    ASSERT_OK(write->Write(std::move(batch)));
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<CommitMessage>> commit_messages,
+                         write->PrepareCommit());
+    ASSERT_OK(write->Close());
+
+    CommitContextBuilder commit_context_builder(table_path, "partial-write");
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<CommitContext> commit_context,
+                         commit_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileStoreCommit> commit,
+                         FileStoreCommit::Create(std::move(commit_context)));
+    ASSERT_OK(commit->Commit(commit_messages));
+
+    ASSERT_OK_AND_ASSIGN(auto files_result, ReadSystemTable(table_path + "$files", options));
+    auto files_array = SingleStructChunk(files_result);
+    ASSERT_EQ(files_array->length(), 1);
+    auto partition_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(0));
+    auto null_value_counts_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(10));
+    auto min_value_stats_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(11));
+    auto max_value_stats_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(12));
+    auto write_cols_array = std::dynamic_pointer_cast<arrow::ListArray>(files_array->field(19));
+    ASSERT_TRUE(partition_array);
+    ASSERT_TRUE(null_value_counts_array);
+    ASSERT_TRUE(min_value_stats_array);
+    ASSERT_TRUE(max_value_stats_array);
+    ASSERT_TRUE(write_cols_array);
+
+    ASSERT_EQ(partition_array->GetString(0), "{20260724}");
+    ASSERT_EQ(null_value_counts_array->GetString(0), "{dt=0, id=2, score=0}");
+    ASSERT_EQ(min_value_stats_array->GetString(0), "{dt=20260724, id=null, score=10}");
+    ASSERT_EQ(max_value_stats_array->GetString(0), "{dt=20260724, id=null, score=20}");
+    auto write_cols_values =
+        std::dynamic_pointer_cast<arrow::StringArray>(write_cols_array->values());
+    ASSERT_TRUE(write_cols_values);
+    ASSERT_EQ(write_cols_values->length(), 1);
+    ASSERT_EQ(write_cols_values->GetString(0), "score");
+}
+
+TEST(SystemTableReadInteTest, TestReadFilesSystemTableForDatePartition) {
+    arrow::FieldVector fields = {
+        arrow::field("dt", arrow::date32()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "v"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(auto helper,
+                         TestHelper::Create(dir->Str(), schema, /*partition_keys=*/{"dt"},
+                                            /*primary_keys=*/{}, options,
+                                            /*is_streaming_mode=*/true));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([[10440, 1]])",
+                                    /*partition_map=*/{{"dt", "1998-08-02"}}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "foo.db/bar");
+    ASSERT_OK_AND_ASSIGN(auto files_result, ReadSystemTable(table_path + "$files", options));
+    auto files_array = SingleStructChunk(files_result);
+    ASSERT_EQ(files_array->length(), 1);
+    auto partition_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(0));
+    ASSERT_TRUE(partition_array);
+    ASSERT_EQ(partition_array->GetString(0), "{1998-08-02}");
+}
+
+TEST(SystemTableReadInteTest, TestReadFilesSystemTableWithSchemaEvolutionStats) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"}};
+    std::string table_path = paimon::test::GetDataDir() +
+                             "/orc/append_table_with_alter_table_with_dense_field.db/"
+                             "append_table_with_alter_table_with_dense_field";
+
+    ASSERT_OK_AND_ASSIGN(auto files_result, ReadSystemTable(table_path + "$files", options));
+    auto files_array = SingleStructChunk(files_result);
+    ASSERT_EQ(StructFieldNames(files_array), (std::vector<std::string>{"partition",
+                                                                       "bucket",
+                                                                       "file_path",
+                                                                       "file_format",
+                                                                       "schema_id",
+                                                                       "level",
+                                                                       "record_count",
+                                                                       "file_size_in_bytes",
+                                                                       "min_key",
+                                                                       "max_key",
+                                                                       "null_value_counts",
+                                                                       "min_value_stats",
+                                                                       "max_value_stats",
+                                                                       "min_sequence_number",
+                                                                       "max_sequence_number",
+                                                                       "creation_time",
+                                                                       "deleteRowCount",
+                                                                       "file_source",
+                                                                       "first_row_id",
+                                                                       "write_cols"}));
+    ASSERT_GT(files_array->length(), 0);
+
+    auto partition_array = std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(0));
+    auto schema_id_array = std::dynamic_pointer_cast<arrow::Int64Array>(files_array->field(4));
+    auto null_value_counts_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(10));
+    auto min_value_stats_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(11));
+    auto max_value_stats_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(files_array->field(12));
+    ASSERT_TRUE(partition_array);
+    ASSERT_TRUE(schema_id_array);
+    ASSERT_TRUE(null_value_counts_array);
+    ASSERT_TRUE(min_value_stats_array);
+    ASSERT_TRUE(max_value_stats_array);
+
+    bool found_old_schema_file = false;
+    bool found_latest_schema_file = false;
+    for (int64_t i = 0; i < files_array->length(); ++i) {
+        std::string partition = partition_array->GetString(i);
+        ASSERT_TRUE(partition == "{0}" || partition == "{1}");
+
+        std::string null_value_counts = null_value_counts_array->GetString(i);
+        std::string min_value_stats = min_value_stats_array->GetString(i);
+        std::string max_value_stats = max_value_stats_array->GetString(i);
+        ASSERT_NE(null_value_counts.find("f4="), std::string::npos);
+        ASSERT_NE(min_value_stats.find("f4="), std::string::npos);
+        ASSERT_NE(max_value_stats.find("f4="), std::string::npos);
+        ASSERT_EQ(null_value_counts.find("f0="), std::string::npos);
+        ASSERT_EQ(min_value_stats.find("f0="), std::string::npos);
+        ASSERT_EQ(max_value_stats.find("f0="), std::string::npos);
+
+        if (schema_id_array->Value(i) == 0) {
+            found_old_schema_file = true;
+            ASSERT_NE(null_value_counts.find("f4="), std::string::npos);
+            ASSERT_NE(min_value_stats.find("f4=null"), std::string::npos);
+            ASSERT_NE(max_value_stats.find("f4=null"), std::string::npos);
+        } else if (schema_id_array->Value(i) == 1) {
+            found_latest_schema_file = true;
+        }
+    }
+    ASSERT_TRUE(found_old_schema_file);
+    ASSERT_TRUE(found_latest_schema_file);
+}
+
+TEST(SystemTableReadInteTest, TestReadManifestAndFilesSystemTablesForEmptyTable) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = PathUtil::JoinPath(dir->Str(), "warehouse");
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    ASSERT_OK(catalog->CreateDatabase("db1", options, /*ignore_if_exists=*/false));
+
+    auto typed_schema = arrow::schema({arrow::field("f0", arrow::int32())});
+    ::ArrowSchema schema;
+    ASSERT_TRUE(arrow::ExportSchema(*typed_schema, &schema).ok());
+    ASSERT_OK(catalog->CreateTable(Identifier("db1", "tbl1"), &schema,
+                                   /*partition_keys=*/{}, /*primary_keys=*/{}, options,
+                                   /*ignore_if_exists=*/false));
+    ArrowSchemaRelease(&schema);
+
+    ASSERT_OK_AND_ASSIGN(std::string table_path,
+                         catalog->GetTableLocation(Identifier("db1", "tbl1")));
+    ASSERT_OK_AND_ASSIGN(auto manifests_result,
+                         ReadSystemTable(table_path + "$manifests", options));
+    ASSERT_EQ(manifests_result.array, nullptr);
+    ASSERT_OK_AND_ASSIGN(auto files_result, ReadSystemTable(table_path + "$files", options));
+    ASSERT_EQ(files_result.array, nullptr);
+}
+
+TEST(SystemTableReadInteTest, TestReadTagBranchAndConsumerSystemTables) {
+    const char* old_tz = std::getenv("TZ");
+    std::optional<std::string> old_timezone;
+    if (old_tz != nullptr) {
+        old_timezone = old_tz;
+    }
+    setenv("TZ", "Asia/Shanghai", /*overwrite=*/1);
+    tzset();
+    ScopeGuard timezone_guard([old_timezone]() {
+        if (old_timezone) {
+            setenv("TZ", old_timezone->c_str(), /*overwrite=*/1);
+        } else {
+            unsetenv("TZ");
+        }
+        tzset();
+    });
+
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string source_path =
+        GetDataDir() + "/parquet/append_table_with_rt_branch.db/append_table_with_rt_branch";
+    std::string table_path = PathUtil::JoinPath(dir->Str(), "metadata_table");
+    ASSERT_TRUE(TestUtil::CopyDirectory(std::filesystem::path(source_path),
+                                        std::filesystem::path(table_path)));
+
+    auto fs = std::make_shared<LocalFileSystem>();
+    ASSERT_OK_AND_ASSIGN(Tag tag,
+                         Tag::FromPath(fs, GetDataDir() + "/orc/append_table_with_tag.db/"
+                                                          "append_table_with_tag/tag/tag-1"));
+    ASSERT_OK_AND_ASSIGN(std::string tag_json, tag.ToJsonString());
+    ASSERT_OK(fs->Mkdirs(PathUtil::JoinPath(table_path, "tag")));
+    ASSERT_OK(fs->WriteFile(PathUtil::JoinPath(table_path, "tag/tag-release"), tag_json,
+                            /*overwrite=*/true));
+
+    ASSERT_OK(fs->Mkdirs(PathUtil::JoinPath(table_path, "consumer")));
+    ASSERT_OK(fs->WriteFile(PathUtil::JoinPath(table_path, "consumer/consumer-c1"),
+                            R"({"nextSnapshot":3})",
+                            /*overwrite=*/true));
+
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "parquet"},
+                                                  {Options::MANIFEST_FORMAT, "avro"}};
+
+    ASSERT_OK_AND_ASSIGN(auto branches_result, ReadSystemTable(table_path + "$branches", options));
+    auto branches_array = SingleStructChunk(branches_result);
+    ASSERT_EQ(branches_array->length(), 2);
+    auto branch_name_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(branches_array->field(0));
+    ASSERT_TRUE(branch_name_array);
+    ASSERT_EQ(branch_name_array->GetString(0), "main");
+    ASSERT_EQ(branch_name_array->GetString(1), "rt");
+
+    ASSERT_OK_AND_ASSIGN(auto tags_result, ReadSystemTable(table_path + "$tags", options));
+    auto tags_array = SingleStructChunk(tags_result);
+    ASSERT_EQ(StructFieldNames(tags_array),
+              (std::vector<std::string>{"tag_name", "snapshot_id", "schema_id", "commit_time",
+                                        "record_count", "create_time", "time_retained"}));
+    ASSERT_EQ(tags_array->length(), 1);
+    auto tag_name_array = std::dynamic_pointer_cast<arrow::StringArray>(tags_array->field(0));
+    auto tag_snapshot_array = std::dynamic_pointer_cast<arrow::Int64Array>(tags_array->field(1));
+    auto tag_commit_time_array =
+        std::dynamic_pointer_cast<arrow::TimestampArray>(tags_array->field(3));
+    auto tag_record_count_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(tags_array->field(4));
+    auto tag_create_time_array =
+        std::dynamic_pointer_cast<arrow::TimestampArray>(tags_array->field(5));
+    auto tag_time_retained_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(tags_array->field(6));
+    ASSERT_TRUE(tag_name_array);
+    ASSERT_TRUE(tag_snapshot_array);
+    ASSERT_TRUE(tag_commit_time_array);
+    ASSERT_TRUE(tag_record_count_array);
+    ASSERT_TRUE(tag_create_time_array);
+    ASSERT_TRUE(tag_time_retained_array);
+    ASSERT_EQ(tag_name_array->GetString(0), "release");
+    ASSERT_EQ(tag_snapshot_array->Value(0), tag.Id());
+    ASSERT_OK_AND_ASSIGN(
+        Timestamp tag_commit_time,
+        DateTimeUtils::ToLocalTimestamp(Timestamp::FromEpochMillis(tag.TimeMillis())));
+    ASSERT_EQ(tag_commit_time_array->Value(0), tag_commit_time.GetMillisecond());
+    ASSERT_EQ(tag_record_count_array->Value(0), tag.TotalRecordCount());
+    ASSERT_FALSE(tag_create_time_array->IsNull(0));
+    ASSERT_EQ(tag_create_time_array->Value(0), 1770185290000);
+    ASSERT_EQ(tag_time_retained_array->GetString(0), "3.000000");
+
+    ASSERT_OK_AND_ASSIGN(auto consumers_result,
+                         ReadSystemTable(table_path + "$consumers", options));
+    auto consumers_array = SingleStructChunk(consumers_result);
+    ASSERT_EQ(StructFieldNames(consumers_array),
+              (std::vector<std::string>{"consumer_id", "next_snapshot_id"}));
+    ASSERT_EQ(consumers_array->length(), 1);
+    auto consumer_id_array =
+        std::dynamic_pointer_cast<arrow::StringArray>(consumers_array->field(0));
+    auto next_snapshot_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(consumers_array->field(1));
+    ASSERT_TRUE(consumer_id_array);
+    ASSERT_TRUE(next_snapshot_array);
+    ASSERT_EQ(consumer_id_array->GetString(0), "c1");
+    ASSERT_EQ(next_snapshot_array->Value(0), 3);
 }
 
 TEST(SystemTableReadInteTest, TestReadAuditLogSystemTable) {
@@ -784,6 +1691,67 @@ TEST(SystemTableReadInteTest, TestReadAuditLogAndBinlogSystemTableWithChangelogR
     ])");
 }
 
+TEST(SystemTableReadInteTest, TestStreamingBinlogPacksUpdateBeforeAndAfter) {
+    arrow::FieldVector fields = {
+        arrow::field("pk", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    std::map<std::string, std::string> options = {
+        {Options::FILE_SYSTEM, "local"},    {Options::FILE_FORMAT, "parquet"},
+        {Options::MANIFEST_FORMAT, "avro"}, {Options::BUCKET, "1"},
+        {Options::WRITE_BUFFER_SIZE, "1"},  {Options::WRITE_BUFFER_SPILLABLE, "false"},
+    };
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(dir->Str(), schema,
+                                                         /*partition_keys=*/{},
+                                                         /*primary_keys=*/{"pk"}, options,
+                                                         /*is_streaming_mode=*/true));
+
+    std::vector<RecordBatch::RowKind> row_kinds_1 = {
+        RecordBatch::RowKind::INSERT,
+        RecordBatch::RowKind::UPDATE_BEFORE,
+    };
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch_1,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["a", 1], ["b", 2]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, row_kinds_1));
+    std::vector<RecordBatch::RowKind> row_kinds_2 = {
+        RecordBatch::RowKind::UPDATE_AFTER,
+        RecordBatch::RowKind::DELETE,
+    };
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch_2,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["b", 3], ["c", 4]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, row_kinds_2));
+    std::vector<std::unique_ptr<RecordBatch>> batches;
+    batches.push_back(std::move(batch_1));
+    batches.push_back(std::move(batch_2));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batches), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    std::map<std::string, std::string> streaming_options = options;
+    streaming_options[Options::SCAN_MODE] = "from-snapshot";
+    streaming_options[Options::SCAN_SNAPSHOT_ID] = "1";
+    ASSERT_OK_AND_ASSIGN(
+        auto result,
+        ReadSystemTable(PathUtil::JoinPath(dir->Str(), "foo.db/bar$binlog"), streaming_options,
+                        /*streaming_mode=*/true, /*predicate=*/nullptr,
+                        /*read_field_names=*/{}, /*read_next_plan=*/true));
+    ASSERT_TRUE(result.array);
+    ASSERT_EQ(result.array->num_chunks(), 2);
+    auto array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::Concatenate(result.array->chunks()).ValueOrDie());
+    ASSERT_TRUE(array);
+    ASSERT_EQ(StructFieldNames(array), (std::vector<std::string>{"rowkind", "pk", "v"}));
+    AssertStructArrayEqualsJson(array, R"([
+        ["+I", ["a"], [1]],
+        ["+U", ["b", "b"], [2, 3]],
+        ["-D", ["c"], [4]]
+    ])");
+}
+
 TEST(SystemTableReadInteTest, TestReadBinlogSystemTableWithNullValue) {
     arrow::FieldVector fields = {
         arrow::field("pk", arrow::utf8(), /*nullable=*/false),
@@ -910,7 +1878,7 @@ TEST_P(ReadInteTest, TestAppendReadWithMultipleBuckets) {
     std::string path =
         paimon::test::GetDataDir() + "/" + param.file_format + "/append_09.db/append_09";
     ReadContextBuilder context_builder(path);
-    context_builder.SetReadSchema({"f3", "f0", "f1"});
+    context_builder.SetReadFieldNames({"f3", "f0", "f1"});
     context_builder.SetPrefetchCacheMode(param.cache_mode);
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2")
@@ -990,7 +1958,7 @@ TEST_P(ReadInteTest, TestAppendReadWithPredicate) {
         paimon::test::GetDataDir() + "/" + param.file_format + "/append_09.db/append_09";
 
     ReadContextBuilder context_builder(path);
-    context_builder.SetReadSchema({"f3", "f0", "f1"});
+    context_builder.SetReadFieldNames({"f3", "f0", "f1"});
     context_builder.SetPrefetchCacheMode(param.cache_mode);
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .SetPredicate(predicate)
@@ -1094,7 +2062,7 @@ TEST_P(ReadInteTest, TestAppendReadWithComplexTypePredicate) {
                        "/append_complex_data.db/append_complex_data";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"f6", "f2", "f4", "f3", "f5"});
+    context_builder.SetReadFieldNames({"f6", "f2", "f4", "f3", "f5"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.SetPredicate(predicate);
@@ -1167,7 +2135,7 @@ TEST_P(ReadInteTest, TestAppendReadWithPredicateOnlyPushdown) {
 
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"f3", "f0", "f1"});
+    context_builder.SetReadFieldNames({"f3", "f0", "f1"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2")
         .AddOption("test.enable-adaptive-prefetch-strategy",
@@ -1243,7 +2211,7 @@ TEST_P(ReadInteTest, TestAppendReadWithPredicateAllFiltered) {
 
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"f3", "f0", "f1"});
+    context_builder.SetReadFieldNames({"f3", "f0", "f1"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2")
         .AddOption("test.enable-adaptive-prefetch-strategy",
@@ -1328,7 +2296,7 @@ TEST_P(ReadInteTest, TestAppendReadIOException) {
         io_hook->Reset(i, IOHook::Mode::RETURN_ERROR);
         ReadContextBuilder context_builder(paimon::test::GetDataDir() + "/" + param.file_format +
                                            "/append_09.db/append_09/");
-        context_builder.SetReadSchema({"f3", "f0", "f1"});
+        context_builder.SetReadFieldNames({"f3", "f0", "f1"});
         context_builder.SetPrefetchCacheMode(param.cache_mode);
         context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
             .AddOption("read.batch-size", "2")
@@ -1572,7 +2540,7 @@ TEST_P(ReadInteTest, TestPkTableWithSnapshot8) {
     std::string path = paimon::test::GetDataDir() + "/" + param.file_format + "/pk_09.db/pk_09";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"f0", "f3", "f1"});
+    context_builder.SetReadFieldNames({"f0", "f3", "f1"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.EnablePrefetch(param.enable_prefetch)
@@ -1746,7 +2714,7 @@ TEST_P(ReadInteTest, TestAppendReadWithSchemaEvolutionWithPredicateFilter) {
                        "/append_table_with_alter_table.db/append_table_with_alter_table/";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"a", "k", "key1", "d", "key0", "c"});
+    context_builder.SetReadFieldNames({"a", "k", "key1", "d", "key0", "c"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.SetPredicate(predicate);
@@ -1825,7 +2793,7 @@ TEST_P(ReadInteTest, TestAppendReadWithSchemaEvolutionWithPredicateOnlyPushDown)
                        "append_table_with_alter_table/";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"a", "k", "key1", "d", "key0", "c"});
+    context_builder.SetReadFieldNames({"a", "k", "key1", "d", "key0", "c"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.SetPredicate(predicate);
@@ -1898,7 +2866,7 @@ TEST_P(ReadInteTest, TestPkReadSnapshot5WithSchemaEvolution) {
                        "/pk_table_with_alter_table.db/pk_table_with_alter_table/";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"key1", "k", "key_2", "c", "d", "a", "key0", "e"});
+    context_builder.SetReadFieldNames({"key1", "k", "key_2", "c", "d", "a", "key0", "e"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.EnablePrefetch(param.enable_prefetch)
@@ -1983,7 +2951,7 @@ TEST_P(ReadInteTest, TestPkReadSnapshot6WithSchemaEvolution) {
                        "/pk_table_with_alter_table.db/pk_table_with_alter_table/";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"key1", "k", "key_2", "c", "d", "a", "key0", "e"});
+    context_builder.SetReadFieldNames({"key1", "k", "key_2", "c", "d", "a", "key0", "e"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.EnablePrefetch(param.enable_prefetch)
@@ -2067,7 +3035,7 @@ TEST_P(ReadInteTest, TestPkReadSnapshot6WithSchemaEvolutionWithPredicateOnlyPush
     ASSERT_OK_AND_ASSIGN(auto predicate, PredicateBuilder::And({equal, less_than}));
 
     ReadContextBuilder context_builder(path);
-    context_builder.SetReadSchema({{"key1", "k", "key_2", "c", "d", "a", "key0", "e"}});
+    context_builder.SetReadFieldNames({{"key1", "k", "key_2", "c", "d", "a", "key0", "e"}});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.SetPrefetchCacheMode(param.cache_mode);
@@ -2150,7 +3118,7 @@ TEST_P(ReadInteTest, TestPkReadSnapshot6WithSchemaEvolutionWithPredicateFilter) 
 
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"key1", "k", "key_2", "c", "d", "a", "key0", "e"});
+    context_builder.SetReadFieldNames({"key1", "k", "key_2", "c", "d", "a", "key0", "e"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.SetPredicate(predicate);
@@ -2242,7 +3210,7 @@ TEST_P(ReadInteTest, TestAppendReadWithSchemaEvolutionWithBuildInFieldId) {
 
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"key0", "key1", "k", "c", "d", "a", "e"});
+    context_builder.SetReadFieldNames({"key0", "key1", "k", "c", "d", "a", "e"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.EnablePrefetch(param.enable_prefetch)
@@ -2360,7 +3328,7 @@ TEST_P(ReadInteTest, TestAppendReadWithSchemaEvolutionWithCast) {
                        "append_table_alter_table_with_cast/";
     ReadContextBuilder context_builder(path);
     context_builder.SetPrefetchCacheMode(param.cache_mode);
-    context_builder.SetReadSchema({"f4", "key0", "key1", "f3", "f1", "f2", "f0", "f6"});
+    context_builder.SetReadFieldNames({"f4", "key0", "key1", "f3", "f1", "f2", "f0", "f6"});
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
     context_builder.EnablePrefetch(param.enable_prefetch)
@@ -2441,7 +3409,7 @@ TEST_P(ReadInteTest, TestAppendReadWithSchemaEvolutionWithCastWithPredicatePushD
                        "/append_table_alter_table_with_cast.db/"
                        "append_table_alter_table_with_cast/";
     ReadContextBuilder context_builder(path);
-    context_builder.SetReadSchema({"f4", "key0", "key1", "f3", "f1", "f2", "f0", "f6"});
+    context_builder.SetReadFieldNames({"f4", "key0", "key1", "f3", "f1", "f2", "f0", "f6"});
     context_builder.SetPrefetchCacheMode(param.cache_mode);
     context_builder.AddOption(Options::FILE_FORMAT, param.file_format)
         .AddOption("read.batch-size", "2");
@@ -2759,7 +3727,8 @@ TEST_P(ReadInteTest, TestReadWithAppendPtBranch) {
 TEST_P(ReadInteTest, TestSpecificFs) {
     class CountableInputStream : public InputStream {
      public:
-        CountableInputStream(const std::shared_ptr<InputStream>& input, size_t* io_count)
+        CountableInputStream(const std::shared_ptr<InputStream>& input,
+                             std::atomic<size_t>* io_count)
             : input_(input), io_count_(io_count) {}
         ~CountableInputStream() override = default;
 
@@ -2769,17 +3738,17 @@ TEST_P(ReadInteTest, TestSpecificFs) {
         Result<int64_t> GetPos() const override {
             return input_->GetPos();
         }
-        Result<int32_t> Read(char* buffer, uint32_t size) override {
-            (*io_count_)++;
+        Result<int64_t> Read(char* buffer, int64_t size) override {
+            io_count_->fetch_add(1, std::memory_order_relaxed);
             return input_->Read(buffer, size);
         }
-        Result<int32_t> Read(char* buffer, uint32_t size, uint64_t offset) override {
-            (*io_count_)++;
+        Result<int64_t> Read(char* buffer, int64_t size, int64_t offset) override {
+            io_count_->fetch_add(1, std::memory_order_relaxed);
             return input_->Read(buffer, size, offset);
         }
-        void ReadAsync(char* buffer, uint32_t size, uint64_t offset,
+        void ReadAsync(char* buffer, int64_t size, int64_t offset,
                        std::function<void(Status)>&& callback) override {
-            (*io_count_)++;
+            io_count_->fetch_add(1, std::memory_order_relaxed);
             return input_->ReadAsync(buffer, size, offset, std::move(callback));
         }
 
@@ -2789,17 +3758,17 @@ TEST_P(ReadInteTest, TestSpecificFs) {
         Result<std::string> GetUri() const override {
             return input_->GetUri();
         }
-        Result<uint64_t> Length() const override {
+        Result<int64_t> Length() const override {
             return input_->Length();
         }
 
         std::shared_ptr<InputStream> input_;
-        size_t* io_count_;
+        std::atomic<size_t>* io_count_;
     };
 
     class CountableFileSystem : public FileSystem {
      public:
-        CountableFileSystem(const std::shared_ptr<FileSystem>& fs, size_t* io_count)
+        CountableFileSystem(const std::shared_ptr<FileSystem>& fs, std::atomic<size_t>* io_count)
             : fs_(fs), io_count_(io_count) {}
         ~CountableFileSystem() override = default;
 
@@ -2837,10 +3806,10 @@ TEST_P(ReadInteTest, TestSpecificFs) {
         }
 
         std::shared_ptr<FileSystem> fs_;
-        size_t* io_count_;
+        std::atomic<size_t>* io_count_;
     };
 
-    size_t io_count = 0;
+    std::atomic<size_t> io_count = {0};
     auto param = GetParam();
     std::string path =
         paimon::test::GetDataDir() + "/" + param.file_format + "/append_09.db/append_09";
@@ -2893,7 +3862,439 @@ TEST_P(ReadInteTest, TestSpecificFs) {
                                                                          &expected_array);
     ASSERT_TRUE(array_status.ok());
     ASSERT_TRUE(result_array->Equals(expected_array));
-    ASSERT_GT(io_count, 0);
+    ASSERT_GT(io_count.load(std::memory_order_relaxed), 0);
+}
+
+// =============================================================================
+// Global System Table Tests
+// =============================================================================
+
+namespace {
+
+Result<SystemTableReadResult> ReadGlobalSystemTable(
+    const std::string& table_name, Catalog* catalog, const std::shared_ptr<FileSystem>& fs,
+    const std::string& warehouse, const std::map<std::string, std::string>& options) {
+    GlobalSystemTableContext ctx;
+    ctx.catalog = catalog;
+    ctx.fs = fs;
+    ctx.warehouse = warehouse;
+    ctx.catalog_options = options;
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<SystemTable> system_table,
+                           GlobalSystemTableLoader::Load(table_name, ctx));
+
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Schema> arrow_schema,
+                           system_table->ArrowSchema());
+
+    std::string sys_path = PathUtil::JoinPath(PathUtil::JoinPath(warehouse, "sys"), table_name);
+
+    ScanContextBuilder scan_context_builder(sys_path);
+    scan_context_builder.SetOptions(options);
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<ScanContext> scan_context,
+                           scan_context_builder.Finish());
+    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableScan> table_scan,
+                           system_table->NewScan(scan_context));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<Plan> plan, table_scan->CreatePlan());
+
+    ReadContextBuilder read_context_builder(sys_path);
+    read_context_builder.SetOptions(options);
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<ReadContext> read_context,
+                           read_context_builder.Finish());
+    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<TableRead> table_read,
+                           system_table->NewRead(read_context));
+    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<BatchReader> batch_reader,
+                           table_read->CreateReader(plan->Splits()));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::ChunkedArray> result,
+                           ReadResultCollector::CollectResult(batch_reader.get()));
+    return SystemTableReadResult(std::move(batch_reader), result);
+}
+
+}  // namespace
+
+TEST(SystemTableReadInteTest, TestReadGlobalCatalogOptions) {
+    std::map<std::string, std::string> options = {
+        {Options::FILE_SYSTEM, "local"},
+        {Options::FILE_FORMAT, "orc"},
+        {CatalogOptionsSystemTable::kEnabledOption, "true"},
+        {"custom.catalog.option", "test-value"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = PathUtil::JoinPath(dir->Str(), "warehouse");
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadGlobalSystemTable("catalog_options", catalog.get(),
+                                               catalog->GetFileSystem(), warehouse, options));
+    auto struct_array = SingleStructChunk(result);
+    ASSERT_TRUE(struct_array);
+    auto key_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(0));
+    auto value_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(1));
+    ASSERT_TRUE(key_array);
+    ASSERT_TRUE(value_array);
+
+    // Build a map from the result
+    std::map<std::string, std::string> result_map;
+    for (int64_t i = 0; i < struct_array->length(); ++i) {
+        result_map[key_array->GetString(i)] = value_array->GetString(i);
+    }
+    ASSERT_EQ(result_map["file-system"], "local");
+    ASSERT_EQ(result_map["file.format"], "orc");
+}
+
+TEST(SystemTableReadInteTest, TestReadGlobalAllTableOptions) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {"table.option.custom", "my-value"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = PathUtil::JoinPath(dir->Str(), "warehouse");
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    // Create a database and table
+    ASSERT_OK(catalog->CreateDatabase("test_db", options, /*ignore_if_exists=*/false));
+    auto typed_schema = arrow::schema({arrow::field("f0", arrow::int32())});
+    ::ArrowSchema schema;
+    ASSERT_TRUE(arrow::ExportSchema(*typed_schema, &schema).ok());
+    ASSERT_OK(catalog->CreateTable(Identifier("test_db", "test_tbl"), &schema,
+                                   /*partition_keys=*/{}, /*primary_keys=*/{}, options,
+                                   /*ignore_if_exists=*/false));
+    ArrowSchemaRelease(&schema);
+
+    // Verify basic enumeration works
+    ASSERT_OK_AND_ASSIGN(auto dbs, catalog->ListDatabases());
+    ASSERT_TRUE(std::find(dbs.begin(), dbs.end(), "test_db") != dbs.end());
+    ASSERT_OK_AND_ASSIGN(auto tbls, catalog->ListTables("test_db"));
+    ASSERT_TRUE(std::find(tbls.begin(), tbls.end(), "test_tbl") != tbls.end());
+
+    // Verify schema loads and has Options
+    ASSERT_OK_AND_ASSIGN(auto loaded_schema,
+                         catalog->LoadTableSchema(Identifier("test_db", "test_tbl")));
+    auto ds = std::dynamic_pointer_cast<DataSchema>(loaded_schema);
+    ASSERT_TRUE(ds != nullptr) << "LoadTableSchema did not return DataSchema";
+    ASSERT_FALSE(ds->Options().empty()) << "Table schema has no options";
+
+    // Directly test BuildRows
+    {
+        GlobalSystemTableContext ctx;
+        ctx.catalog = catalog.get();
+        ctx.fs = catalog->GetFileSystem();
+        ctx.warehouse = warehouse;
+        ctx.catalog_options = options;
+        AllTableOptionsSystemTable table(ctx);
+        ASSERT_OK_AND_ASSIGN(auto rows, table.BuildRows());
+        ASSERT_GT(rows.size(), 0) << "BuildRows returned empty, expected at least 1 row";
+    }
+
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadGlobalSystemTable("all_table_options", catalog.get(),
+                                               catalog->GetFileSystem(), warehouse, options));
+    auto struct_array = SingleStructChunk(result);
+    ASSERT_TRUE(struct_array);
+    ASSERT_GE(struct_array->length(), 1) << "result has " << struct_array->length() << " rows";
+
+    auto db_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(0));
+    auto tbl_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(1));
+    auto key_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(2));
+    auto val_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(3));
+    ASSERT_TRUE(db_array);
+    ASSERT_TRUE(tbl_array);
+    ASSERT_TRUE(key_array);
+    ASSERT_TRUE(val_array);
+
+    // Verify that our table's options appear in the result
+    bool found_db = false;
+    bool found_format = false;
+    for (int64_t i = 0; i < struct_array->length(); ++i) {
+        auto db_name = std::string(db_array->GetString(i));
+        auto tbl_name = std::string(tbl_array->GetString(i));
+        if (db_name == "test_db" && tbl_name == "test_tbl") {
+            found_db = true;
+            auto key_str = std::string(key_array->GetString(i));
+            if (key_str == "file.format") {
+                EXPECT_EQ(std::string(val_array->GetString(i)), "orc");
+                found_format = true;
+            }
+        }
+    }
+    ASSERT_TRUE(found_db) << "test_db.test_tbl not found in sys.all_table_options";
+    ASSERT_TRUE(found_format) << "file.format option not found in sys.all_table_options";
+}
+
+TEST(SystemTableReadInteTest, TestReadGlobalTables) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"},
+                                                  {"owner", "alice"},
+                                                  {"createdAt", "1000"},
+                                                  {"createdBy", "creator"},
+                                                  {"updatedAt", "2000"},
+                                                  {"updatedBy", "updater"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = PathUtil::JoinPath(dir->Str(), "warehouse");
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    auto fs = catalog->GetFileSystem();
+
+    // Create a database and a PK table
+    ASSERT_OK(catalog->CreateDatabase("test_db", options, /*ignore_if_exists=*/false));
+    auto typed_schema = arrow::schema({
+        arrow::field("pk", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    });
+    ::ArrowSchema schema;
+    ASSERT_TRUE(arrow::ExportSchema(*typed_schema, &schema).ok());
+    ASSERT_OK(catalog->CreateTable(Identifier("test_db", "test_tbl"), &schema,
+                                   /*partition_keys=*/{}, /*primary_keys=*/{"pk"}, options,
+                                   /*ignore_if_exists=*/false));
+    ArrowSchemaRelease(&schema);
+
+    ASSERT_OK_AND_ASSIGN(std::string table_path,
+                         catalog->GetTableLocation(Identifier("test_db", "test_tbl")));
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(table_path, options,
+                                                         /*is_streaming_mode=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(typed_schema->fields()), R"([["k", 1]])",
+                                    /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    std::map<std::string, std::string> no_pk_options = options;
+    no_pk_options[Options::BUCKET_KEY] = "pk";
+    ::ArrowSchema no_pk_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*typed_schema, &no_pk_schema).ok());
+    ASSERT_OK(catalog->CreateTable(Identifier("test_db", "test_no_pk_tbl"), &no_pk_schema,
+                                   /*partition_keys=*/{}, /*primary_keys=*/{}, no_pk_options,
+                                   /*ignore_if_exists=*/false));
+    ArrowSchemaRelease(&no_pk_schema);
+
+    ASSERT_OK_AND_ASSIGN(auto result,
+                         ReadGlobalSystemTable("tables", catalog.get(), fs, warehouse, options));
+    auto struct_array = SingleStructChunk(result);
+    ASSERT_TRUE(struct_array);
+    ASSERT_GE(struct_array->length(), 1);
+    ASSERT_EQ(StructFieldNames(struct_array),
+              (std::vector<std::string>{
+                  "database_name", "table_name", "table_type", "partitioned", "primary_key",
+                  "owner", "created_at", "created_by", "updated_at", "updated_by", "record_count",
+                  "file_size_in_bytes", "file_count", "last_file_creation_time"}));
+
+    auto db_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(0));
+    auto tbl_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(1));
+    auto type_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(2));
+    auto part_array = std::dynamic_pointer_cast<arrow::BooleanArray>(struct_array->field(3));
+    auto pk_array = std::dynamic_pointer_cast<arrow::BooleanArray>(struct_array->field(4));
+    auto owner_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(5));
+    auto created_at_array = std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(6));
+    auto created_by_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(7));
+    auto updated_at_array = std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(8));
+    auto updated_by_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(9));
+    auto record_count_array = std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(10));
+    auto file_size_array = std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(11));
+    auto file_count_array = std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(12));
+    auto last_creation_time_array =
+        std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(13));
+    ASSERT_TRUE(db_array);
+    ASSERT_TRUE(tbl_array);
+    ASSERT_TRUE(type_array);
+    ASSERT_TRUE(part_array);
+    ASSERT_TRUE(pk_array);
+    ASSERT_TRUE(owner_array);
+    ASSERT_TRUE(created_at_array);
+    ASSERT_TRUE(created_by_array);
+    ASSERT_TRUE(updated_at_array);
+    ASSERT_TRUE(updated_by_array);
+    ASSERT_TRUE(record_count_array);
+    ASSERT_TRUE(file_size_array);
+    ASSERT_TRUE(file_count_array);
+    ASSERT_TRUE(last_creation_time_array);
+
+    // Find our table by table name
+    bool found = false;
+    bool found_no_pk = false;
+    for (int64_t i = 0; i < struct_array->length(); ++i) {
+        if (std::string(tbl_array->GetString(i)) == "test_tbl") {
+            EXPECT_EQ(std::string(db_array->GetString(i)), "test_db");
+            EXPECT_EQ(std::string(type_array->GetString(i)), "table");
+            EXPECT_FALSE(part_array->Value(i));
+            EXPECT_TRUE(pk_array->Value(i));
+            EXPECT_EQ(owner_array->GetString(i), "alice");
+            EXPECT_EQ(created_at_array->Value(i), 1000);
+            EXPECT_EQ(created_by_array->GetString(i), "creator");
+            EXPECT_EQ(updated_at_array->Value(i), 2000);
+            EXPECT_EQ(updated_by_array->GetString(i), "updater");
+            EXPECT_TRUE(record_count_array->IsNull(i));
+            EXPECT_TRUE(file_size_array->IsNull(i));
+            EXPECT_TRUE(file_count_array->IsNull(i));
+            EXPECT_TRUE(last_creation_time_array->IsNull(i));
+            found = true;
+        } else if (std::string(tbl_array->GetString(i)) == "test_no_pk_tbl") {
+            EXPECT_FALSE(pk_array->Value(i));
+            found_no_pk = true;
+        }
+    }
+    ASSERT_TRUE(found) << "table not found in sys.tables";
+    ASSERT_TRUE(found_no_pk) << "no-PK table not found in sys.tables";
+}
+
+TEST(SystemTableReadInteTest, TestReadGlobalPartitions) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "v"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = dir->Str();
+
+    arrow::FieldVector fields = {
+        arrow::field("dt", arrow::utf8()),
+        arrow::field("region", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(warehouse, schema,
+                                                         /*partition_keys=*/{"dt", "region"},
+                                                         /*primary_keys=*/{}, options,
+                                                         /*is_streaming_mode=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["2026-07-13", "cn", 1]])",
+                                    /*partition_map=*/{{"dt", "2026-07-13"}, {"region", "cn"}},
+                                    /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    auto fs = catalog->GetFileSystem();
+    ASSERT_OK_AND_ASSIGN(auto part_result, ReadGlobalSystemTable("partitions", catalog.get(), fs,
+                                                                 warehouse, options));
+    auto struct_array = SingleStructChunk(part_result);
+    ASSERT_TRUE(struct_array);
+    ASSERT_EQ(StructFieldNames(struct_array),
+              (std::vector<std::string>{"database_name", "table_name", "partition_name",
+                                        "record_count", "file_size_in_bytes", "file_count",
+                                        "last_file_creation_time", "done"}));
+    ASSERT_EQ(struct_array->length(), 1);
+    auto db_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(0));
+    auto table_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(1));
+    auto partition_array = std::dynamic_pointer_cast<arrow::StringArray>(struct_array->field(2));
+    auto creation_time_array = std::dynamic_pointer_cast<arrow::Int64Array>(struct_array->field(6));
+    auto done_array = std::dynamic_pointer_cast<arrow::BooleanArray>(struct_array->field(7));
+    ASSERT_TRUE(db_array);
+    ASSERT_TRUE(table_array);
+    ASSERT_TRUE(partition_array);
+    ASSERT_TRUE(creation_time_array);
+    ASSERT_TRUE(done_array);
+    EXPECT_EQ(db_array->GetString(0), "foo");
+    EXPECT_EQ(table_array->GetString(0), "bar");
+    EXPECT_EQ(partition_array->GetString(0), "dt=2026-07-13/region=cn");
+    EXPECT_FALSE(creation_time_array->IsNull(0));
+    EXPECT_FALSE(done_array->Value(0));
+}
+
+TEST(SystemTableReadInteTest, TestGlobalSystemTablesPropagateCorruptSchema) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "v"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = dir->Str();
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    ASSERT_OK(catalog->CreateDatabase("test_db", options, /*ignore_if_exists=*/false));
+
+    auto typed_schema = arrow::schema({arrow::field("v", arrow::int32())});
+    ::ArrowSchema schema;
+    ASSERT_TRUE(arrow::ExportSchema(*typed_schema, &schema).ok());
+    Identifier identifier("test_db", "test_tbl");
+    ASSERT_OK(catalog->CreateTable(identifier, &schema,
+                                   /*partition_keys=*/{}, /*primary_keys=*/{}, options,
+                                   /*ignore_if_exists=*/false));
+    ArrowSchemaRelease(&schema);
+
+    ASSERT_OK_AND_ASSIGN(std::string table_path, catalog->GetTableLocation(identifier));
+    std::shared_ptr<FileSystem> fs = catalog->GetFileSystem();
+    ASSERT_OK(fs->WriteFile(PathUtil::JoinPath(table_path, "schema/schema-0"), "{invalid-json",
+                            /*overwrite=*/true));
+
+    for (const std::string system_table : {"all_table_options", "tables", "partitions"}) {
+        ASSERT_NOK(ReadGlobalSystemTable(system_table, catalog.get(), fs, warehouse, options));
+    }
+}
+
+TEST(SystemTableReadInteTest, TestPartitionsSystemTablePropagatesCorruptSnapshot) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "v"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = dir->Str();
+
+    arrow::FieldVector fields = {
+        arrow::field("dt", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(warehouse, schema,
+                                                         /*partition_keys=*/{"dt"},
+                                                         /*primary_keys=*/{}, options,
+                                                         /*is_streaming_mode=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["2026-07-19", 1]])",
+                                    /*partition_map=*/{{"dt", "2026-07-19"}}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    std::shared_ptr<FileSystem> fs = catalog->GetFileSystem();
+    std::string table_path = PathUtil::JoinPath(warehouse, "foo.db/bar");
+    ASSERT_OK(fs->WriteFile(PathUtil::JoinPath(table_path, "snapshot/snapshot-1"), "{invalid-json",
+                            /*overwrite=*/true));
+
+    ASSERT_NOK(ReadGlobalSystemTable("partitions", catalog.get(), fs, warehouse, options));
+}
+
+TEST(SystemTableReadInteTest, TestPartitionsSystemTablePropagatesCorruptManifest) {
+    std::map<std::string, std::string> options = {{Options::FILE_SYSTEM, "local"},
+                                                  {Options::FILE_FORMAT, "orc"},
+                                                  {Options::MANIFEST_FORMAT, "orc"},
+                                                  {Options::BUCKET, "1"},
+                                                  {Options::BUCKET_KEY, "v"}};
+    auto dir = UniqueTestDirectory::Create();
+    ASSERT_TRUE(dir);
+    std::string warehouse = dir->Str();
+
+    arrow::FieldVector fields = {
+        arrow::field("dt", arrow::utf8()),
+        arrow::field("v", arrow::int32()),
+    };
+    auto schema = arrow::schema(fields);
+    ASSERT_OK_AND_ASSIGN(auto helper, TestHelper::Create(warehouse, schema,
+                                                         /*partition_keys=*/{"dt"},
+                                                         /*primary_keys=*/{}, options,
+                                                         /*is_streaming_mode=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        std::unique_ptr<RecordBatch> batch,
+        TestHelper::MakeRecordBatch(arrow::struct_(fields), R"([["2026-07-19", 1]])",
+                                    /*partition_map=*/{{"dt", "2026-07-19"}}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    ASSERT_OK_AND_ASSIGN(auto catalog, Catalog::Create(warehouse, options));
+    std::shared_ptr<FileSystem> fs = catalog->GetFileSystem();
+    std::string table_path = PathUtil::JoinPath(warehouse, "foo.db/bar");
+    SnapshotManager snapshot_manager(fs, table_path);
+    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot, snapshot_manager.LatestSnapshot());
+    ASSERT_TRUE(snapshot);
+    ASSERT_OK(fs->WriteFile(
+        PathUtil::JoinPath(table_path, "manifest/" + snapshot->BaseManifestList()), "corrupt",
+        /*overwrite=*/true));
+
+    ASSERT_NOK(ReadGlobalSystemTable("partitions", catalog.get(), fs, warehouse, options));
 }
 
 }  // namespace paimon::test

@@ -20,6 +20,7 @@
 #include "paimon/table/source/table_scan.h"
 
 #include <map>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -29,6 +30,7 @@
 #include "paimon/common/predicate/predicate_validator.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/fields_comparator.h"
+#include "paimon/common/utils/options_utils.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/index/index_file_handler.h"
 #include "paimon/core/manifest/index_manifest_file.h"
@@ -49,6 +51,7 @@
 #include "paimon/core/table/source/data_table_batch_scan.h"
 #include "paimon/core/table/source/data_table_stream_scan.h"
 #include "paimon/core/table/source/merge_tree_split_generator.h"
+#include "paimon/core/table/source/read_optimized_scan_options.h"
 #include "paimon/core/table/source/snapshot/snapshot_reader.h"
 #include "paimon/core/table/source/split_generator.h"
 #include "paimon/core/table/system/system_table.h"
@@ -89,7 +92,7 @@ class TableScanImpl {
         PAIMON_ASSIGN_OR_RAISE(
             std::shared_ptr<ManifestList> manifest_list,
             ManifestList::Create(fs, manifest_file_format, core_options.GetManifestCompression(),
-                                 path_factory, memory_pool));
+                                 path_factory, core_options.GetCache(), memory_pool));
         PAIMON_ASSIGN_OR_RAISE(
             std::shared_ptr<arrow::Schema> partition_schema,
             FieldMapping::GetPartitionSchema(arrow_schema, table_schema->PartitionKeys()));
@@ -98,19 +101,35 @@ class TableScanImpl {
             ManifestFile::Create(fs, manifest_file_format, core_options.GetManifestCompression(),
                                  path_factory, core_options.GetManifestTargetFileSize(),
                                  memory_pool, core_options, partition_schema));
+        std::unique_ptr<FileStoreScan> scan;
         if (table_schema->PrimaryKeys().empty()) {
             if (core_options.DataEvolutionEnabled()) {
-                return DataEvolutionFileStoreScan::Create(
-                    snapshot_manager, schema_manager, manifest_list, manifest_file, table_schema,
-                    arrow_schema, context->GetScanFilters(), core_options, executor, memory_pool);
+                PAIMON_ASSIGN_OR_RAISE(
+                    scan, DataEvolutionFileStoreScan::Create(
+                              snapshot_manager, schema_manager, manifest_list, manifest_file,
+                              table_schema, arrow_schema, context->GetScanFilters(), core_options,
+                              executor, memory_pool));
+            } else {
+                PAIMON_ASSIGN_OR_RAISE(
+                    scan, AppendOnlyFileStoreScan::Create(
+                              snapshot_manager, schema_manager, manifest_list, manifest_file,
+                              table_schema, arrow_schema, context->GetScanFilters(), core_options,
+                              executor, memory_pool));
             }
-            return AppendOnlyFileStoreScan::Create(
-                snapshot_manager, schema_manager, manifest_list, manifest_file, table_schema,
-                arrow_schema, context->GetScanFilters(), core_options, executor, memory_pool);
+        } else {
+            PAIMON_ASSIGN_OR_RAISE(
+                scan, KeyValueFileStoreScan::Create(snapshot_manager, schema_manager, manifest_list,
+                                                    manifest_file, table_schema, arrow_schema,
+                                                    context->GetScanFilters(), core_options,
+                                                    executor, memory_pool));
         }
-        return KeyValueFileStoreScan::Create(
-            snapshot_manager, schema_manager, manifest_list, manifest_file, table_schema,
-            arrow_schema, context->GetScanFilters(), core_options, executor, memory_pool);
+        return WithTablePath(std::move(scan), context);
+    }
+
+    static std::unique_ptr<FileStoreScan> WithTablePath(std::unique_ptr<FileStoreScan>&& scan,
+                                                        const ScanContext* context) {
+        scan->WithTablePath(context->GetPath());
+        return std::move(scan);
     }
 
     static Result<std::unique_ptr<SplitGenerator>> CreateSplitGenerator(
@@ -120,8 +139,9 @@ class TableScanImpl {
         auto source_split_open_file_cost = core_options.GetSourceSplitOpenFileCost();
         if (table_schema->PrimaryKeys().empty()) {
             if (core_options.DataEvolutionEnabled()) {
-                return std::make_unique<DataEvolutionSplitGenerator>(source_split_target_size,
-                                                                     source_split_open_file_cost);
+                return std::make_unique<DataEvolutionSplitGenerator>(
+                    source_split_target_size, source_split_open_file_cost,
+                    core_options.BlobSplitByFileSize());
             }
             BucketMode bucket_mode = (core_options.GetBucket() == -1 ? BucketMode::BUCKET_UNAWARE
                                                                      : BucketMode::HASH_FIXED);
@@ -177,7 +197,7 @@ Result<std::unique_ptr<TableScan>> TableScan::Create(std::unique_ptr<ScanContext
     // load schema
     PAIMON_ASSIGN_OR_RAISE(CoreOptions tmp_options,
                            CoreOptions::FromMap(shared_context->GetOptions(),
-                                                shared_context->GetSpecificFileSystem()));
+                                                shared_context->GetSpecificFileSystem(), {}));
     PAIMON_ASSIGN_OR_RAISE(std::optional<SystemTablePath> system_table_path,
                            SystemTableLoader::TryParsePath(shared_context->GetPath()));
     if (system_table_path) {
@@ -195,27 +215,33 @@ namespace {
 Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanContext>& context) {
     PAIMON_ASSIGN_OR_RAISE(
         CoreOptions tmp_options,
-        CoreOptions::FromMap(context->GetOptions(), context->GetSpecificFileSystem()));
+        CoreOptions::FromMap(context->GetOptions(), context->GetSpecificFileSystem(), {}));
     std::string branch = BranchManager::NormalizeBranch(tmp_options.GetBranch());
-    SchemaManager schema_manager(tmp_options.GetFileSystem(), context->GetPath(), branch);
-    PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<TableSchema>> latest_table_schema,
-                           schema_manager.Latest());
-    if (latest_table_schema == std::nullopt) {
-        return Status::Invalid("not found latest schema");
+    std::shared_ptr<TableSchema> table_schema;
+    const auto& specific_table_schema = context->GetSpecificTableSchema();
+    if (branch == BranchManager::DEFAULT_MAIN_BRANCH && specific_table_schema) {
+        PAIMON_ASSIGN_OR_RAISE(table_schema,
+                               TableSchema::CreateFromJson(specific_table_schema.value()));
+    } else {
+        SchemaManager schema_manager(tmp_options.GetFileSystem(), context->GetPath(), branch);
+        PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<TableSchema>> latest_table_schema,
+                               schema_manager.Latest());
+        if (latest_table_schema == std::nullopt) {
+            return Status::Invalid("not found latest schema");
+        }
+        table_schema = latest_table_schema.value();
     }
-    const auto& table_schema = latest_table_schema.value();
-    if (table_schema->Id() != TableSchema::FIRST_SCHEMA_ID &&
-        !table_schema->PrimaryKeys().empty()) {
-        return Status::NotImplemented(
-            "do not support schema evolution in pk table while scan process");
-    }
+    PAIMON_ASSIGN_OR_RAISE(bool read_optimized,
+                           OptionsUtils::GetValueFromMap<bool>(context->GetOptions(),
+                                                               kReadOptimizedScanOption, false));
     // merge options
     auto options = table_schema->Options();
     for (const auto& [key, value] : context->GetOptions()) {
         options[key] = value;
     }
     PAIMON_ASSIGN_OR_RAISE(CoreOptions core_options,
-                           CoreOptions::FromMap(options, context->GetSpecificFileSystem()));
+                           CoreOptions::FromMap(options, context->GetSpecificFileSystem(), {}));
+    core_options.WithCache(context->GetCache());
     // validate options
     if (core_options.GetBucket() == -1) {
         if (!table_schema->PrimaryKeys().empty()) {
@@ -263,12 +289,16 @@ Result<std::unique_ptr<TableScan>> NewDataTableScan(const std::shared_ptr<ScanCo
                                                                  context->GetMemoryPool()));
     auto snapshot_reader = std::make_shared<SnapshotReader>(
         file_store_scan, path_factory, std::move(split_generator), std::move(index_file_handler));
+    const bool pk_table = !table_schema->PrimaryKeys().empty();
+    if (read_optimized && pk_table && context->IsStreamingMode()) {
+        return Status::NotImplemented(
+            "read-optimized system table does not support streaming scan for primary key table");
+    }
     if (context->IsStreamingMode()) {
         return std::make_unique<DataTableStreamScan>(core_options, snapshot_reader);
     }
-    auto batch_scan =
-        std::make_unique<DataTableBatchScan>(/*pk_table=*/!table_schema->PrimaryKeys().empty(),
-                                             core_options, snapshot_reader, context->GetLimit());
+    auto batch_scan = std::make_unique<DataTableBatchScan>(
+        /*pk_table=*/pk_table, core_options, snapshot_reader, read_optimized, context->GetLimit());
     if (!core_options.DataEvolutionEnabled()) {
         return batch_scan;
     }

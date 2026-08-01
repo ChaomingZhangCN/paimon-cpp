@@ -42,7 +42,9 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_EQ(64 * 1024L, core_options.GetPageSize());
     ASSERT_EQ(256 * 1024 * 1024L, core_options.GetTargetFileSize(/*has_primary_key=*/false));
     ASSERT_EQ(128 * 1024 * 1024L, core_options.GetTargetFileSize(/*has_primary_key=*/true));
+    ASSERT_EQ(std::numeric_limits<int64_t>::max(), core_options.GetTargetFileRowNum());
     ASSERT_EQ(256 * 1024 * 1024L, core_options.GetBlobTargetFileSize());
+    ASSERT_TRUE(core_options.BlobSplitByFileSize());
     ASSERT_EQ(187904815, core_options.GetCompactionFileSize(/*has_primary_key=*/false));
     ASSERT_EQ(93952404, core_options.GetCompactionFileSize(/*has_primary_key=*/true));
 
@@ -57,6 +59,8 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_EQ(8 * 1024 * 1024L, core_options.GetManifestTargetFileSize());
     ASSERT_EQ(16 * 1024 * 1024L, core_options.GetManifestFullCompactionThresholdSize());
     ASSERT_EQ(30, core_options.GetManifestMergeMinCount());
+    ASSERT_EQ(0, core_options.GetScanManifestEntryCacheMaxSnapshots());
+    ASSERT_EQ(nullptr, core_options.GetCache());
     ASSERT_EQ(128 * 1024 * 1024L, core_options.GetSourceSplitTargetSize());
     ASSERT_EQ(4 * 1024 * 1024L, core_options.GetSourceSplitOpenFileCost());
     ASSERT_EQ(1024, core_options.GetReadBatchSize());
@@ -68,8 +72,13 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_EQ("zstd", core_options.GetSpillCompressOptions().compress);
     ASSERT_EQ(1, core_options.GetSpillCompressOptions().zstd_level);
     ASSERT_FALSE(core_options.CommitForceCompact());
+    ASSERT_TRUE(core_options.DynamicPartitionOverwrite());
+    ASSERT_TRUE(core_options.OverwriteUpgrade());
     ASSERT_EQ(std::numeric_limits<int64_t>::max(), core_options.GetCommitTimeout());
     ASSERT_EQ(10, core_options.GetCommitMaxRetries());
+    ASSERT_EQ(10, core_options.GetCommitMinRetryWait());
+    ASSERT_EQ(10 * 1000, core_options.GetCommitMaxRetryWait());
+    ASSERT_FALSE(core_options.CommitDiscardDuplicateFiles());
     ExpireConfig expire_config = core_options.GetExpireConfig();
     ASSERT_EQ(10, expire_config.GetSnapshotRetainMin());
     ASSERT_EQ(std::numeric_limits<int32_t>::max(), expire_config.GetSnapshotRetainMax());
@@ -82,6 +91,9 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_EQ(SortEngine::LOSER_TREE, core_options.GetSortEngine());
     ASSERT_FALSE(core_options.IgnoreDelete());
     ASSERT_FALSE(core_options.WriteOnly());
+    ASSERT_FALSE(core_options.BucketAppendOrdered());
+    ASSERT_EQ(CoreOptions::SequenceNumberInitMode::SCAN,
+              core_options.WriteSequenceNumberInitMode());
     ASSERT_EQ(5, core_options.GetCompactionMinFileNum());
     ASSERT_FALSE(core_options.CompactionForceRewriteAllFiles());
     ASSERT_FALSE(core_options.CompactionForceUpLevel0());
@@ -90,6 +102,10 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_FALSE(core_options.FieldAggIgnoreRetract("f1").value());
     ASSERT_EQ(",", core_options.FieldListAggDelimiter("f1").value());
     ASSERT_FALSE(core_options.FieldCollectAggDistinct("f1").value());
+    ASSERT_EQ(MapStorageLayout::DEFAULT, core_options.GetMapStorageLayout("any_col").value());
+    ASSERT_EQ(256, core_options.GetMapSharedShreddingMaxColumns("any_col").value());
+    ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::LRU,
+              core_options.GetMapSharedShreddingColumnPlacementPolicy("any_col").value());
     ASSERT_FALSE(core_options.DeletionVectorsEnabled());
     ASSERT_FALSE(core_options.DeletionVectorsBitmap64());
     ASSERT_EQ(2 * 1024 * 1024, core_options.DeletionVectorTargetFileSize());
@@ -119,8 +135,8 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_TRUE(core_options.GetBlobDescriptorFields().empty());
     ASSERT_TRUE(core_options.GetBlobViewFields().empty());
     ASSERT_TRUE(core_options.GetBlobInlineFields().empty());
-    ASSERT_TRUE(core_options.GetBlobExternalStorageFields().empty());
-    ASSERT_EQ(std::nullopt, core_options.GetBlobExternalStoragePath());
+    ASSERT_EQ(std::nullopt, core_options.GetBlobViewUpstreamWarehouse());
+    ASSERT_TRUE(core_options.BlobViewResolveEnabled());
     ASSERT_TRUE(core_options.LegacyPartitionNameEnabled());
     ASSERT_TRUE(core_options.GlobalIndexEnabled());
     ASSERT_EQ(std::nullopt, core_options.GetGlobalIndexExternalPath());
@@ -163,6 +179,7 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::BUCKET, "3"},
         {Options::PAGE_SIZE, "128 kb"},
         {Options::TARGET_FILE_SIZE, "512MB"},
+        {Options::TARGET_FILE_ROW_NUM, "123"},
         {Options::BLOB_TARGET_FILE_SIZE, "1G"},
         {Options::PARTITION_DEFAULT_NAME, "foo"},
         {Options::MANIFEST_TARGET_FILE_SIZE, "16MB"},
@@ -180,8 +197,14 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::COMMIT_FORCE_COMPACT, "true"},
         {Options::COMMIT_TIMEOUT, "120s"},
         {Options::COMMIT_MAX_RETRIES, "20"},
+        {Options::COMMIT_MIN_RETRY_WAIT, "5ms"},
+        {Options::COMMIT_MAX_RETRY_WAIT, "3s"},
+        {Options::COMMIT_DISCARD_DUPLICATE_FILES, "true"},
+        {Options::DYNAMIC_PARTITION_OVERWRITE, "false"},
+        {Options::OVERWRITE_UPGRADE, "false"},
         {Options::SCAN_SNAPSHOT_ID, "5"},
         {Options::SCAN_MODE, "from-snapshot-full"},
+        {Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS, "7"},
         {Options::SNAPSHOT_NUM_RETAINED_MIN, "15"},
         {Options::SNAPSHOT_NUM_RETAINED_MAX, "30"},
         {Options::SNAPSHOT_EXPIRE_LIMIT, "20"},
@@ -222,15 +245,18 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::DATA_EVOLUTION_ENABLED, "true"},
         {Options::BLOB_FIELD, "blob1,blob2"},
         {Options::BLOB_DESCRIPTOR_FIELD, "blob3,blob4"},
+        {Options::BLOB_AS_DESCRIPTOR, "true"},
         {Options::BLOB_VIEW_FIELD, "blob5"},
-        {Options::BLOB_EXTERNAL_STORAGE_FIELD, "blob3,blob4"},
-        {Options::BLOB_EXTERNAL_STORAGE_PATH, "FILE:///tmp/blob_external_storage/"},
+        {Options::BLOB_VIEW_UPSTREAM_WAREHOUSE, "FILE:///tmp/blob_view_upstream_warehouse/"},
+        {Options::BLOB_VIEW_RESOLVE_ENABLED, "false"},
         {Options::PARTITION_GENERATE_LEGACY_NAME, "false"},
         {Options::GLOBAL_INDEX_ENABLED, "false"},
         {Options::GLOBAL_INDEX_THREAD_NUM, "4"},
         {Options::GLOBAL_INDEX_EXTERNAL_PATH, "FILE:///tmp/global_index/"},
         {Options::SCAN_TAG_NAME, "test-tag"},
         {Options::WRITE_ONLY, "true"},
+        {Options::BUCKET_APPEND_ORDERED, "true"},
+        {Options::WRITE_SEQUENCE_NUMBER_INIT_MODE, "snapshot"},
         {Options::COMPACTION_MIN_FILE_NUM, "10"},
         {Options::COMPACTION_FORCE_REWRITE_ALL_FILES, "true"},
         {Options::COMPACTION_FORCE_UP_LEVEL_0, "true"},
@@ -262,7 +288,10 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::LOOKUP_REMOTE_LEVEL_THRESHOLD, "2"},
         {Options::TABLE_READ_SEQUENCE_NUMBER_ENABLED, "true"},
         {Options::KEY_VALUE_SEQUENCE_NUMBER_ENABLED, "true"},
-        {Options::BUCKET_FUNCTION_TYPE, "mod"}};
+        {Options::BUCKET_FUNCTION_TYPE, "mod"},
+        {"fields.metrics.map.storage-layout", "shared-shredding"},
+        {"fields.metrics.map.shared-shredding.max-columns", "128"},
+        {"fields.metrics.map.shared-shredding.column-placement-policy", "lru"}};
 
     ASSERT_OK_AND_ASSIGN(CoreOptions core_options, CoreOptions::FromMap(options));
     auto fs = core_options.GetFileSystem();
@@ -280,11 +309,13 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_EQ(128 * 1024L, core_options.GetPageSize());
     ASSERT_EQ(512 * 1024 * 1024L, core_options.GetTargetFileSize(/*has_primary_key=*/true));
     ASSERT_EQ(512 * 1024 * 1024L, core_options.GetTargetFileSize(/*has_primary_key=*/false));
+    ASSERT_EQ(123, core_options.GetTargetFileRowNum());
     ASSERT_EQ(1024 * 1024 * 1024L, core_options.GetBlobTargetFileSize());
     ASSERT_EQ("foo", core_options.GetPartitionDefaultName());
     ASSERT_EQ(16 * 1024 * 1024L, core_options.GetManifestTargetFileSize());
     ASSERT_EQ(32 * 1024 * 1024L, core_options.GetManifestFullCompactionThresholdSize());
     ASSERT_EQ(2, core_options.GetManifestMergeMinCount());
+    ASSERT_EQ(nullptr, core_options.GetCache());
     ASSERT_EQ(24 * 1024 * 1024L, core_options.GetSourceSplitTargetSize());
     ASSERT_EQ(32 * 1024 * 1024L, core_options.GetSourceSplitOpenFileCost());
     ASSERT_EQ(2048, core_options.GetReadBatchSize());
@@ -296,9 +327,15 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_EQ("lz4", core_options.GetSpillCompressOptions().compress);
     ASSERT_EQ(2, core_options.GetSpillCompressOptions().zstd_level);
     ASSERT_TRUE(core_options.CommitForceCompact());
+    ASSERT_FALSE(core_options.DynamicPartitionOverwrite());
+    ASSERT_FALSE(core_options.OverwriteUpgrade());
     ASSERT_EQ(120 * 1000, core_options.GetCommitTimeout());
     ASSERT_EQ(20, core_options.GetCommitMaxRetries());
+    ASSERT_EQ(5, core_options.GetCommitMinRetryWait());
+    ASSERT_EQ(3 * 1000, core_options.GetCommitMaxRetryWait());
+    ASSERT_TRUE(core_options.CommitDiscardDuplicateFiles());
     ASSERT_EQ(5, core_options.GetScanSnapshotId().value_or(-1));
+    ASSERT_EQ(7, core_options.GetScanManifestEntryCacheMaxSnapshots());
     ExpireConfig expire_config = core_options.GetExpireConfig();
     ASSERT_EQ(15, expire_config.GetSnapshotRetainMin());
     ASSERT_EQ(30, expire_config.GetSnapshotRetainMax());
@@ -355,13 +392,13 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_TRUE(core_options.DataEvolutionEnabled());
     ASSERT_EQ(core_options.GetBlobFields(), std::vector<std::string>({"blob1", "blob2"}));
     ASSERT_EQ(core_options.GetBlobDescriptorFields(), std::vector<std::string>({"blob3", "blob4"}));
+    ASSERT_FALSE(core_options.BlobSplitByFileSize());
     ASSERT_EQ(core_options.GetBlobViewFields(), std::vector<std::string>({"blob5"}));
     ASSERT_EQ(core_options.GetBlobInlineFields(),
               std::vector<std::string>({"blob3", "blob4", "blob5"}));
-    ASSERT_EQ(core_options.GetBlobExternalStorageFields(),
-              std::vector<std::string>({"blob3", "blob4"}));
-    ASSERT_EQ(core_options.GetBlobExternalStoragePath(),
-              std::optional<std::string>("FILE:///tmp/blob_external_storage/"));
+    ASSERT_EQ(core_options.GetBlobViewUpstreamWarehouse(),
+              std::optional<std::string>("FILE:///tmp/blob_view_upstream_warehouse/"));
+    ASSERT_FALSE(core_options.BlobViewResolveEnabled());
     ASSERT_FALSE(core_options.LegacyPartitionNameEnabled());
     ASSERT_FALSE(core_options.GlobalIndexEnabled());
     ASSERT_EQ(core_options.GetGlobalIndexThreadNum(), 4);
@@ -372,6 +409,9 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_EQ(375809637, core_options.GetCompactionFileSize(/*has_primary_key=*/true));
     ASSERT_EQ(375809637, core_options.GetCompactionFileSize(/*has_primary_key=*/false));
     ASSERT_TRUE(core_options.WriteOnly());
+    ASSERT_TRUE(core_options.BucketAppendOrdered());
+    ASSERT_EQ(CoreOptions::SequenceNumberInitMode::SNAPSHOT,
+              core_options.WriteSequenceNumberInitMode());
     ASSERT_EQ(10, core_options.GetCompactionMinFileNum());
     ASSERT_EQ(123, core_options.GetCompactionMaxSizeAmplificationPercent());
     ASSERT_EQ(9, core_options.GetCompactionSizeRatio());
@@ -402,9 +442,16 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_TRUE(core_options.LookupRemoteFileEnabled());
     ASSERT_EQ(core_options.GetLookupRemoteLevelThreshold(), 2);
     ASSERT_EQ(BucketFunctionType::MOD, core_options.GetBucketFunctionType());
+    ASSERT_EQ(MapStorageLayout::SHARED_SHREDDING,
+              core_options.GetMapStorageLayout("metrics").value());
+    ASSERT_EQ(128, core_options.GetMapSharedShreddingMaxColumns("metrics").value());
+    ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::LRU,
+              core_options.GetMapSharedShreddingColumnPlacementPolicy("metrics").value());
 }
 
 TEST(CoreOptionsTest, TestInvalidCase) {
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::TARGET_FILE_ROW_NUM, "0"}}),
+                        "target-file-row-num should be at least 1");
     ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::BUCKET, "3.5"}}),
                         "Invalid Config [bucket: 3.5]");
     ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::SCAN_SNAPSHOT_ID, "3.5"}}),
@@ -422,10 +469,16 @@ TEST(CoreOptionsTest, TestInvalidCase) {
     ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::LOOKUP_COMPACT_MAX_INTERVAL, "invalid"}}),
                         "Invalid Config [lookup-compact.max-interval: invalid]");
     ASSERT_NOK_WITH_MSG(
+        CoreOptions::FromMap({{Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS, "-1"}}),
+        "scan.manifest-entry-cache.max-snapshots must be non-negative");
+    ASSERT_NOK_WITH_MSG(
         CoreOptions::FromMap({{Options::LOOKUP_CACHE_HIGH_PRIO_POOL_RATIO, "1.1"}}),
         "The high priority pool ratio should in the range [0, 1), while input is 1.1");
     ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::BUCKET_FUNCTION_TYPE, "invalid"}}),
                         "invalid bucket function type: invalid");
+    ASSERT_NOK_WITH_MSG(
+        CoreOptions::FromMap({{Options::WRITE_SEQUENCE_NUMBER_INIT_MODE, "invalid"}}),
+        "invalid write sequence number init mode: invalid");
 }
 
 TEST(CoreOptionsTest, TestLookupCompactMaxIntervalComputedValue) {
@@ -435,6 +488,27 @@ TEST(CoreOptionsTest, TestLookupCompactMaxIntervalComputedValue) {
     };
     ASSERT_OK_AND_ASSIGN(CoreOptions core_options, CoreOptions::FromMap(options));
     ASSERT_EQ(13, core_options.GetLookupCompactMaxInterval());
+}
+
+TEST(CoreOptionsTest, TestDynamicPartitionOverwriteOption) {
+    {
+        ASSERT_OK_AND_ASSIGN(CoreOptions core_options, CoreOptions::FromMap({}));
+        ASSERT_TRUE(core_options.DynamicPartitionOverwrite());
+    }
+
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions core_options,
+            CoreOptions::FromMap({{Options::DYNAMIC_PARTITION_OVERWRITE, "false"}}));
+        ASSERT_FALSE(core_options.DynamicPartitionOverwrite());
+    }
+
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions core_options,
+            CoreOptions::FromMap({{Options::DYNAMIC_PARTITION_OVERWRITE, "true"}}));
+        ASSERT_TRUE(core_options.DynamicPartitionOverwrite());
+    }
 }
 
 TEST(CoreOptionsTest, TestNumSortedRunsStopTriggerFloorAndDefault) {
@@ -781,6 +855,7 @@ TEST(CoreOptionsTest, TestCopyAssignmentOperator) {
         {Options::BUCKET, "3"},
         {Options::PAGE_SIZE, "128 kb"},
         {Options::TARGET_FILE_SIZE, "512MB"},
+        {Options::TARGET_FILE_ROW_NUM, "4321"},
         {Options::FILE_FORMAT, "ORC"},
         {Options::FILE_COMPRESSION, "lz4"},
         {Options::FILE_COMPRESSION_ZSTD_LEVEL, "5"},
@@ -809,6 +884,9 @@ TEST(CoreOptionsTest, TestCopyAssignmentOperator) {
         {Options::DATA_FILE_PREFIX, "test-data-"},
         {Options::ROW_TRACKING_ENABLED, "true"},
         {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::VARIANT_SHREDDING_INFERENCE_MODE, "adaptive"},
+        {Options::VARIANT_SHREDDING_ADAPTIVE_MAX_INFER_BUFFER_ROW, "77"},
+        {Options::VARIANT_SHREDDING_ADAPTIVE_RETENTION_RATIO, "0.02"},
         {Options::BUCKET_FUNCTION_TYPE, "mod"},
     };
     ASSERT_OK_AND_ASSIGN(CoreOptions source, CoreOptions::FromMap(options));
@@ -822,6 +900,7 @@ TEST(CoreOptionsTest, TestCopyAssignmentOperator) {
     // Verify all fields are correctly copied
     ASSERT_EQ(3, target.GetBucket());
     ASSERT_EQ(128 * 1024L, target.GetPageSize());
+    ASSERT_EQ(4321, target.GetTargetFileRowNum());
     ASSERT_EQ("orc", target.GetFileFormat()->Identifier());
     ASSERT_EQ("lz4", target.GetFileCompression());
     ASSERT_EQ(5, target.GetFileCompressionZstdLevel());
@@ -850,13 +929,18 @@ TEST(CoreOptionsTest, TestCopyAssignmentOperator) {
     ASSERT_EQ("test-data-", target.DataFilePrefix());
     ASSERT_TRUE(target.RowTrackingEnabled());
     ASSERT_TRUE(target.DataEvolutionEnabled());
+    ASSERT_EQ(VariantShreddingInferenceMode::ADAPTIVE, target.GetVariantShreddingInferenceMode());
+    ASSERT_EQ(77, target.GetVariantShreddingAdaptiveMaxInferBufferRow());
+    ASSERT_DOUBLE_EQ(0.02, target.GetVariantShreddingAdaptiveRetentionRatio());
     ASSERT_EQ(BucketFunctionType::MOD, target.GetBucketFunctionType());
 
     // Verify the target's ToMap matches the source's ToMap
     ASSERT_EQ(source.ToMap(), target.ToMap());
+    ASSERT_EQ(source.GetCache(), target.GetCache());
 
     CoreOptions target2 = source;
     ASSERT_EQ(source.ToMap(), target2.ToMap());
+    ASSERT_EQ(source.GetCache(), target2.GetCache());
 }
 
 TEST(CoreOptionsTest, TestAssignmentIndependence) {
@@ -904,5 +988,216 @@ TEST(CoreOptionsTest, TestFallback) {
         ASSERT_EQ(options.GetBlobDescriptorFields(),
                   std::vector<std::string>({"new_b1", "new_b2"}));
     }
+    {
+        ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                             CoreOptions::FromMap({{Options::BLOB_AS_DESCRIPTOR, "true"},
+                                                   {Options::BLOB_SPLIT_BY_FILE_SIZE, "true"}}));
+        ASSERT_TRUE(options.BlobSplitByFileSize());
+    }
 }
+
+TEST(CoreOptionsTest, TestIgnoreDeleteFallbackKeys) {
+    {
+        // Tables written by Java may carry first-row.ignore-delete instead of ignore-delete.
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{Options::MERGE_ENGINE, "first-row"},
+                                  {Options::FALLBACK_FIRST_ROW_IGNORE_DELETE, "true"}}));
+        ASSERT_TRUE(options.IgnoreDelete());
+    }
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{Options::FALLBACK_DEDUPLICATE_IGNORE_DELETE, "true"}}));
+        ASSERT_TRUE(options.IgnoreDelete());
+    }
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{Options::FALLBACK_PARTIAL_UPDATE_IGNORE_DELETE, "true"}}));
+        ASSERT_TRUE(options.IgnoreDelete());
+    }
+    {
+        // The primary key takes precedence over fallback keys, matching Java CoreOptions.
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{Options::IGNORE_DELETE, "false"},
+                                  {Options::FALLBACK_FIRST_ROW_IGNORE_DELETE, "true"}}));
+        ASSERT_FALSE(options.IgnoreDelete());
+    }
+    {
+        // Fallback keys are checked in declaration order.
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{Options::FALLBACK_FIRST_ROW_IGNORE_DELETE, "false"},
+                                  {Options::FALLBACK_DEDUPLICATE_IGNORE_DELETE, "true"}}));
+        ASSERT_FALSE(options.IgnoreDelete());
+    }
+    {
+        ASSERT_NOK_WITH_MSG(
+            CoreOptions::FromMap({{Options::FALLBACK_FIRST_ROW_IGNORE_DELETE, "invalid"}}),
+            "Invalid Config [first-row.ignore-delete: invalid]");
+    }
+}
+
+TEST(CoreOptionsTest, TestMapStorageLayout) {
+    // Test shared-shredding layout configured for a specific column
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{"fields.ext_map.map.storage-layout", "shared-shredding"},
+                                  {"fields.ext_map.map.shared-shredding.max-columns", "64"},
+                                  {"fields.normal_map.map.storage-layout", "default"}}));
+        ASSERT_EQ(MapStorageLayout::SHARED_SHREDDING,
+                  options.GetMapStorageLayout("ext_map").value());
+        ASSERT_EQ(64, options.GetMapSharedShreddingMaxColumns("ext_map").value());
+        ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::LRU,
+                  options.GetMapSharedShreddingColumnPlacementPolicy("ext_map").value());
+        ASSERT_EQ(MapStorageLayout::DEFAULT, options.GetMapStorageLayout("normal_map").value());
+        // Unconfigured column falls back to default
+        ASSERT_EQ(MapStorageLayout::DEFAULT, options.GetMapStorageLayout("other").value());
+        ASSERT_EQ(256, options.GetMapSharedShreddingMaxColumns("other").value());
+        ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::LRU,
+                  options.GetMapSharedShreddingColumnPlacementPolicy("other").value());
+    }
+    // Test case-insensitive layout value
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{"fields.metrics.map.storage-layout", "Shared-Shredding"}}));
+        ASSERT_EQ(MapStorageLayout::SHARED_SHREDDING,
+                  options.GetMapStorageLayout("metrics").value());
+    }
+    // Test invalid layout value
+    {
+        ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                             CoreOptions::FromMap({{"fields.col.map.storage-layout", "invalid"}}));
+        ASSERT_NOK_WITH_MSG(options.GetMapStorageLayout("col"),
+                            "invalid map.storage-layout: invalid");
+    }
+    // Test invalid max-columns value
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{"fields.col.map.shared-shredding.max-columns", "0"}}));
+        ASSERT_NOK_WITH_MSG(options.GetMapSharedShreddingMaxColumns("col"),
+                            "options map.shared-shredding.max-columns must > 0");
+    }
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{"fields.col.map.shared-shredding.max-columns", "-1"}}));
+        ASSERT_NOK_WITH_MSG(options.GetMapSharedShreddingMaxColumns("col"),
+                            "options map.shared-shredding.max-columns must > 0");
+    }
+    // Test placement policy values
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap(
+                {{"fields.col.map.shared-shredding.column-placement-policy", "PLAIN"}}));
+        ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::PLAIN,
+                  options.GetMapSharedShreddingColumnPlacementPolicy("col").value());
+    }
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap(
+                {{"fields.col.map.shared-shredding.column-placement-policy", "sequential"}}));
+        ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::SEQUENTIAL,
+                  options.GetMapSharedShreddingColumnPlacementPolicy("col").value());
+    }
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap(
+                {{"fields.col.map.shared-shredding.column-placement-policy", "LRU"}}));
+        ASSERT_EQ(MapSharedShreddingColumnPlacementPolicy::LRU,
+                  options.GetMapSharedShreddingColumnPlacementPolicy("col").value());
+    }
+    {
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap(
+                {{"fields.col.map.shared-shredding.column-placement-policy", "invalid"}}));
+        ASSERT_NOK_WITH_MSG(options.GetMapSharedShreddingColumnPlacementPolicy("col"),
+                            "invalid map.shared-shredding.column-placement-policy: invalid");
+    }
+}
+
+TEST(CoreOptionsTest, TestVariantOptions) {
+    {
+        // Defaults.
+        ASSERT_OK_AND_ASSIGN(CoreOptions options, CoreOptions::FromMap({}));
+        ASSERT_EQ(options.GetVariantShreddingSchema(), std::nullopt);
+        ASSERT_FALSE(options.VariantInferShreddingSchemaEnabled());
+        ASSERT_EQ(options.GetVariantShreddingInferenceMode(),
+                  VariantShreddingInferenceMode::PER_FILE);
+        ASSERT_EQ(options.GetVariantShreddingMaxSchemaWidth(), 300);
+        ASSERT_EQ(options.GetVariantShreddingMaxSchemaDepth(), 50);
+        ASSERT_DOUBLE_EQ(options.GetVariantShreddingMinFieldCardinalityRatio(), 0.1);
+        ASSERT_EQ(options.GetVariantShreddingMaxInferBufferRow(), 4096);
+        ASSERT_EQ(options.GetVariantShreddingAdaptiveMaxInferBufferRow(), 256);
+        ASSERT_DOUBLE_EQ(options.GetVariantShreddingAdaptiveRetentionRatio(), 0.05);
+    }
+    {
+        // Configured values.
+        ASSERT_OK_AND_ASSIGN(
+            CoreOptions options,
+            CoreOptions::FromMap({{"variant.shreddingSchema", "{\"type\": \"ROW\"}"},
+                                  {"variant.inferShreddingSchema", "true"},
+                                  {"variant.shredding.inferenceMode", "ADAPTIVE"},
+                                  {"variant.shredding.maxSchemaWidth", "20"},
+                                  {"variant.shredding.maxSchemaDepth", "5"},
+                                  {"variant.shredding.minFieldCardinalityRatio", "0.25"},
+                                  {"variant.shredding.maxInferBufferRow", "128"},
+                                  {"variant.shredding.adaptive.maxInferBufferRow", "64"},
+                                  {"variant.shredding.adaptive.retentionRatio", "0.2"}}));
+        ASSERT_EQ(options.GetVariantShreddingSchema(), "{\"type\": \"ROW\"}");
+        ASSERT_TRUE(options.VariantInferShreddingSchemaEnabled());
+        ASSERT_EQ(options.GetVariantShreddingInferenceMode(),
+                  VariantShreddingInferenceMode::ADAPTIVE);
+        ASSERT_EQ(options.GetVariantShreddingMaxSchemaWidth(), 20);
+        ASSERT_EQ(options.GetVariantShreddingMaxSchemaDepth(), 5);
+        ASSERT_DOUBLE_EQ(options.GetVariantShreddingMinFieldCardinalityRatio(), 0.25);
+        ASSERT_EQ(options.GetVariantShreddingMaxInferBufferRow(), 128);
+        ASSERT_EQ(options.GetVariantShreddingAdaptiveMaxInferBufferRow(), 64);
+        ASSERT_DOUBLE_EQ(options.GetVariantShreddingAdaptiveRetentionRatio(), 0.2);
+    }
+    {
+        // The legacy parquet-prefixed key is a fallback for the shredding schema.
+        ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                             CoreOptions::FromMap({{"parquet.variant.shreddingSchema", "{}"}}));
+        ASSERT_EQ(options.GetVariantShreddingSchema(), "{}");
+    }
+    // Invalid values fail when the options are parsed, not when they are used.
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{"variant.inferShreddingSchema", "not_a_bool"}}),
+                        "variant.inferShreddingSchema");
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{"variant.shredding.inferenceMode", "invalid"}}),
+                        "invalid variant shredding inference mode: invalid");
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{"variant.shredding.maxSchemaWidth", "abc"}}),
+                        "variant.shredding.maxSchemaWidth");
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{"variant.shredding.maxSchemaWidth", "0"}}),
+                        "should be positive");
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{"variant.shredding.maxSchemaDepth", "-1"}}),
+                        "should be positive");
+    ASSERT_NOK_WITH_MSG(
+        CoreOptions::FromMap({{"variant.shredding.minFieldCardinalityRatio", "1.5"}}),
+        "should be in the range [0, 1]");
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{"variant.shredding.maxInferBufferRow", "0"}}),
+                        "should be positive");
+    ASSERT_NOK_WITH_MSG(
+        CoreOptions::FromMap({{"variant.shredding.inferenceMode", "adaptive"},
+                              {"variant.shredding.adaptive.maxInferBufferRow", "0"}}),
+        "variant.shredding.adaptive.maxInferBufferRow");
+    ASSERT_NOK_WITH_MSG(
+        CoreOptions::FromMap({{"variant.shredding.inferenceMode", "adaptive"},
+                              {"variant.shredding.adaptive.retentionRatio", "-0.01"}}),
+        "variant.shredding.adaptive.retentionRatio");
+    ASSERT_NOK_WITH_MSG(
+        CoreOptions::FromMap({{"variant.shredding.inferenceMode", "adaptive"},
+                              {"variant.shredding.adaptive.retentionRatio", "0.11"}}),
+        "should be in the range [0, variant.shredding.minFieldCardinalityRatio]");
+}
+
 }  // namespace paimon::test

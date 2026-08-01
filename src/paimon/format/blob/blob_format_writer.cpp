@@ -19,38 +19,51 @@
 #include "paimon/format/blob/blob_format_writer.h"
 
 #include <algorithm>
+#include <map>
+#include <string>
 
 #include "arrow/api.h"
 #include "arrow/c/bridge.h"
 #include "paimon/common/data/blob_defs.h"
+#include "paimon/common/data/blob_descriptor.h"
 #include "paimon/common/data/blob_utils.h"
 #include "paimon/common/memory/memory_segment_utils.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/utils/arrow/status_utils.h"
 #include "paimon/common/utils/delta_varint_compressor.h"
 #include "paimon/data/blob.h"
+#include "paimon/fs/file_system.h"
 #include "paimon/io/byte_array_input_stream.h"
+#include "paimon/logging.h"
 
 namespace paimon::blob {
 
-BlobFormatWriter::BlobFormatWriter(bool blob_as_descriptor,
-                                   const std::shared_ptr<OutputStream>& out,
+BlobFormatWriter::BlobFormatWriter(const std::shared_ptr<OutputStream>& out, const std::string& uri,
                                    const std::shared_ptr<arrow::DataType>& data_type,
+                                   bool write_null_on_missing_file,
+                                   bool write_null_on_fetch_failure, bool write_placeholder,
                                    const std::shared_ptr<FileSystem>& fs,
                                    const std::shared_ptr<MemoryPool>& pool)
-    : blob_as_descriptor_(blob_as_descriptor),
-      out_(out),
+    : out_(out),
+      uri_(uri),
       data_type_(data_type),
       fs_(fs),
-      pool_(pool) {
+      pool_(pool),
+      write_null_on_missing_file_(write_null_on_missing_file),
+      write_null_on_fetch_failure_(write_null_on_fetch_failure),
+      write_placeholder_(write_placeholder) {
+    // Create() has already checked that data_type has exactly one BLOB field.
+    blob_field_name_ = data_type_->field(0)->name();
     metrics_ = std::make_shared<MetricsImpl>();
     tmp_buffer_ = Bytes::AllocateBytes(kTmpBufferSize, pool_.get());
+    magic_number_bytes_ = IntegerToLittleEndian<int32_t>(BlobDefs::kMagicNumber, pool_);
+    logger_ = Logger::GetLogger("BlobFormatWriter");
 }
 
 Result<std::unique_ptr<BlobFormatWriter>> BlobFormatWriter::Create(
-    bool blob_as_descriptor, const std::shared_ptr<OutputStream>& out,
-    const std::shared_ptr<arrow::DataType>& data_type, const std::shared_ptr<FileSystem>& fs,
-    const std::shared_ptr<MemoryPool>& pool) {
+    const std::shared_ptr<OutputStream>& out, const std::shared_ptr<arrow::DataType>& data_type,
+    bool write_null_on_missing_file, bool write_null_on_fetch_failure, bool write_placeholder,
+    const std::shared_ptr<FileSystem>& fs, const std::shared_ptr<MemoryPool>& pool) {
     if (out == nullptr) {
         return Status::Invalid("blob format writer create failed. out is nullptr");
     }
@@ -60,6 +73,9 @@ Result<std::unique_ptr<BlobFormatWriter>> BlobFormatWriter::Create(
     if (pool == nullptr) {
         return Status::Invalid("blob format writer create failed. pool is nullptr");
     }
+    if (fs == nullptr) {
+        return Status::Invalid("blob format writer create failed. fs is nullptr");
+    }
     if (data_type->num_fields() != 1) {
         return Status::Invalid(
             fmt::format("blob data type field number {} is not 1", data_type->num_fields()));
@@ -68,8 +84,10 @@ Result<std::unique_ptr<BlobFormatWriter>> BlobFormatWriter::Create(
         return Status::Invalid(
             fmt::format("field {} is not BLOB", data_type->field(0)->ToString()));
     }
+    PAIMON_ASSIGN_OR_RAISE(std::string uri, out->GetUri());
     return std::unique_ptr<BlobFormatWriter>(
-        new BlobFormatWriter(blob_as_descriptor, out, data_type, fs, pool));
+        new BlobFormatWriter(out, uri, data_type, write_null_on_missing_file,
+                             write_null_on_fetch_failure, write_placeholder, fs, pool));
 }
 
 Status BlobFormatWriter::AddBatch(ArrowArray* batch) {
@@ -103,13 +121,25 @@ Status BlobFormatWriter::AddBatch(ArrowArray* batch) {
     const auto& blob_array =
         arrow::internal::checked_cast<const arrow::LargeBinaryArray&>(*child_array);
     assert(blob_array.length() == 1);
-    PAIMON_RETURN_NOT_OK(WriteBlob(blob_array.GetView(0)));
-
+    std::string_view blob_data = blob_array.GetView(0);
+    // Only a data-evolution partial-update write interprets the sentinel, which marks a row
+    // the update did not touch; any other write stores the bytes verbatim. See
+    // BlobDefs::kPlaceholderSentinel for the accepted collision with a sentinel-equal user
+    // value.
+    if (write_placeholder_ && BlobDefs::IsPlaceholderSentinel(blob_data.data(), blob_data.size())) {
+        bin_lengths_.push_back(BlobDefs::kPlaceholderBinLength);
+        return Status::OK();
+    }
+    PAIMON_RETURN_NOT_OK(WriteBlob(blob_data));
     PAIMON_RETURN_NOT_OK(Flush());
     return Status::OK();
 }
 
 Status BlobFormatWriter::Flush() {
+    metrics_->SetCounter(BlobMetrics::WRITE_NULL_ON_MISSING_FILE_COUNT,
+                         null_on_missing_file_count_);
+    metrics_->SetCounter(BlobMetrics::WRITE_NULL_ON_FETCH_FAILURE_COUNT,
+                         null_on_fetch_failure_count_);
     return out_->Flush();
 }
 
@@ -131,36 +161,45 @@ Status BlobFormatWriter::Finish() {
 }
 
 Status BlobFormatWriter::WriteBlob(std::string_view blob_data) {
+    // Open the blob input stream before writing any bytes, so that a failed fetch can be
+    // converted to a NULL element without leaving partial data in the output stream.
+    // Whether blob_data is a serialized BlobDescriptor is detected by its magic header rather
+    // than taken from a blob_as_descriptor option, so each row may hold either form.
+    std::unique_ptr<InputStream> in;
+    PAIMON_ASSIGN_OR_RAISE(bool is_descriptor,
+                           BlobDescriptor::IsBlobDescriptor(blob_data.data(), blob_data.size()));
+    if (is_descriptor) {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<InputStream> descriptor_in,
+                               OpenDescriptorInputStream(blob_data));
+        // A null stream means a write-null option already converted the failure.
+        if (descriptor_in == nullptr) {
+            bin_lengths_.push_back(BlobDefs::kNullBinLength);
+            return Status::OK();
+        }
+        in = std::move(descriptor_in);
+    } else {
+        in = std::make_unique<ByteArrayInputStream>(blob_data.data(), blob_data.size());
+    }
+    PAIMON_ASSIGN_OR_RAISE(int64_t file_length, in->Length());
+
     crc32_ = 0;
     PAIMON_ASSIGN_OR_RAISE(int64_t previous_pos, out_->GetPos());
 
     // write magic number
-    static PAIMON_UNIQUE_PTR<Bytes> kMagicNumberBytes =
-        IntegerToLittleEndian<int32_t>(BlobDefs::kMagicNumber, pool_);
-    PAIMON_RETURN_NOT_OK(WriteWithCrc32(kMagicNumberBytes->data(), kMagicNumberBytes->size()));
-
-    // write blob content
-    std::unique_ptr<InputStream> in;
-    if (blob_as_descriptor_) {
-        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<Blob> blob,
-                               Blob::FromDescriptor(blob_data.data(), blob_data.size()));
-        PAIMON_ASSIGN_OR_RAISE(in, blob->NewInputStream(fs_));
-    } else {
-        in = std::make_unique<ByteArrayInputStream>(blob_data.data(), blob_data.size());
-    }
-    PAIMON_ASSIGN_OR_RAISE(uint64_t file_length, in->Length());
-    uint64_t total_read_length = 0;
-    auto read_len = static_cast<uint32_t>(std::min<uint64_t>(file_length, tmp_buffer_->size()));
+    PAIMON_RETURN_NOT_OK(WriteWithCrc32(magic_number_bytes_->data(), magic_number_bytes_->size()));
+    int64_t total_read_length = 0;
+    int64_t read_len = std::min(file_length, static_cast<int64_t>(tmp_buffer_->size()));
     while (read_len > 0) {
-        PAIMON_ASSIGN_OR_RAISE(int32_t actual_read_len, in->Read(tmp_buffer_->data(), read_len));
-        if (static_cast<uint32_t>(actual_read_len) != read_len) {
-            return Status::Invalid("actual read length {}, not match with expect length {}",
-                                   actual_read_len, read_len);
+        PAIMON_ASSIGN_OR_RAISE(int64_t actual_read_len, in->Read(tmp_buffer_->data(), read_len));
+        if (actual_read_len != read_len) {
+            return Status::Invalid(
+                fmt::format("actual read length {}, not match with expect length {}",
+                            actual_read_len, read_len));
         }
         PAIMON_RETURN_NOT_OK(WriteWithCrc32(tmp_buffer_->data(), actual_read_len));
         total_read_length += actual_read_len;
-        read_len = static_cast<uint32_t>(
-            std::min<uint64_t>(file_length - total_read_length, tmp_buffer_->size()));
+        read_len =
+            std::min(file_length - total_read_length, static_cast<int64_t>(tmp_buffer_->size()));
     }
 
     // write bin length
@@ -180,16 +219,86 @@ Status BlobFormatWriter::WriteBlob(std::string_view blob_data) {
     return Status::OK();
 }
 
-Status BlobFormatWriter::WriteBytes(const char* data, int32_t length) {
-    PAIMON_ASSIGN_OR_RAISE(int32_t actual, out_->Write(data, length));
+Result<std::unique_ptr<InputStream>> BlobFormatWriter::OpenDescriptorInputStream(
+    std::string_view blob_data) {
+    // A descriptor that cannot be deserialized is a fetch failure: the referenced data cannot be
+    // reached. Its URI is inside the unreadable bytes, hence the placeholder; the underlying
+    // status comes from the byte reader and never mentions blobs, hence the added context.
+    Result<std::unique_ptr<Blob>> blob_result =
+        Blob::FromDescriptor(blob_data.data(), blob_data.size());
+    if (!blob_result.ok()) {
+        const Status& status = blob_result.status();
+        return HandleFetchFailure(
+            "<unknown>", status.WithMessage("invalid blob descriptor: ", status.message()));
+    }
+    std::unique_ptr<Blob> blob = std::move(blob_result).value();
+
+    // A missing file is identified by FileSystem::Exists rather than by the status of a failed
+    // open, since file system implementations disagree on which status a missing file maps to.
+    // The check runs only when `write_null_on_missing_file_` needs the classification; otherwise
+    // a missing file gets the same treatment as any other failed open.
+    if (write_null_on_missing_file_) {
+        Result<bool> exists = fs_->Exists(blob->Uri());
+        if (exists.ok()) {
+            if (!exists.value()) {
+                return HandleMissingFile(blob->Uri());
+            }
+        } else if (!write_null_on_fetch_failure_) {
+            // The check cannot answer whether the file is there; with no fetch-failure handling
+            // to defer to, fail rather than assume either answer.
+            const Status& status = exists.status();
+            return status.WithMessage("failed to check existence of blob file '", blob->Uri(),
+                                      "': ", status.message());
+        }
+        // A failed check is otherwise deferred to the open below, which can still succeed.
+    }
+
+    Result<std::unique_ptr<InputStream>> opened = blob->NewInputStream(fs_);
+    if (!opened.ok()) {
+        // The file can be deleted between the check above and this open. Classifying that from
+        // `opened.status()` would reintroduce the plugin-specific status codes this writer avoids,
+        // so ask FileSystem::Exists once more. This narrows the window rather than closing it; a
+        // check that cannot answer falls through to the open failure.
+        if (write_null_on_missing_file_) {
+            Result<bool> exists = fs_->Exists(blob->Uri());
+            if (exists.ok() && !exists.value()) {
+                return HandleMissingFile(blob->Uri());
+            }
+        }
+        return HandleFetchFailure(blob->Uri(), opened.status());
+    }
+    return std::move(opened).value();
+}
+
+std::unique_ptr<InputStream> BlobFormatWriter::HandleMissingFile(const std::string& blob_uri) {
+    PAIMON_LOG_WARN(logger_, "Blob file %s does not exist, writing NULL for BLOB field %s into %s",
+                    blob_uri.c_str(), blob_field_name_.c_str(), uri_.c_str());
+    ++null_on_missing_file_count_;
+    return std::unique_ptr<InputStream>();
+}
+
+Result<std::unique_ptr<InputStream>> BlobFormatWriter::HandleFetchFailure(
+    const std::string& blob_uri, const Status& status) {
+    if (!write_null_on_fetch_failure_) {
+        return status;
+    }
+    PAIMON_LOG_WARN(logger_, "Failed to fetch blob %s, writing NULL for BLOB field %s into %s: %s",
+                    blob_uri.c_str(), blob_field_name_.c_str(), uri_.c_str(),
+                    status.ToString().c_str());
+    ++null_on_fetch_failure_count_;
+    return std::unique_ptr<InputStream>();
+}
+
+Status BlobFormatWriter::WriteBytes(const char* data, int64_t length) {
+    PAIMON_ASSIGN_OR_RAISE(int64_t actual, out_->Write(data, length));
     if (actual != length) {
-        return Status::Invalid("not suppose actual length {} not match with expect {}", actual,
-                               length);
+        return Status::Invalid(
+            fmt::format("unexpected actual length {} not match with expect {}", actual, length));
     }
     return Status::OK();
 }
 
-Status BlobFormatWriter::WriteWithCrc32(const char* data, int32_t length) {
+Status BlobFormatWriter::WriteWithCrc32(const char* data, int64_t length) {
     crc32_ = arrow::internal::crc32(crc32_, data, length);
     return WriteBytes(data, length);
 }
@@ -197,6 +306,10 @@ Status BlobFormatWriter::WriteWithCrc32(const char* data, int32_t length) {
 Result<bool> BlobFormatWriter::ReachTargetSize(bool suggested_check, int64_t target_size) const {
     PAIMON_ASSIGN_OR_RAISE(int64_t current_pos, out_->GetPos());
     return current_pos >= target_size;
+}
+
+Status BlobFormatWriter::AddMetadata(const std::map<std::string, std::string>& /*metadata*/) {
+    return Status::NotImplemented("AddMetadata is not supported by blob format writer.");
 }
 
 template <typename T>

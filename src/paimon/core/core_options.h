@@ -26,11 +26,15 @@
 #include <vector>
 
 #include "paimon/bucket/bucket_function_type.h"
+#include "paimon/cache/cache.h"
+#include "paimon/common/data/variant/variant_defs.h"
 #include "paimon/core/options/changelog_producer.h"
 #include "paimon/core/options/compress_options.h"
 #include "paimon/core/options/external_path_strategy.h"
 #include "paimon/core/options/lookup_compact_mode.h"
 #include "paimon/core/options/lookup_strategy.h"
+#include "paimon/core/options/map_shared_shredding_column_placement_policy.h"
+#include "paimon/core/options/map_storage_layout.h"
 #include "paimon/core/options/merge_engine.h"
 #include "paimon/core/options/sort_engine.h"
 #include "paimon/format/file_format.h"
@@ -43,9 +47,19 @@
 namespace paimon {
 
 class ExpireConfig;
+class Cache;
 
 class PAIMON_EXPORT CoreOptions {
  public:
+    /// Specifies how to initialize the next sequence number for primary key table writers.
+    enum class SequenceNumberInitMode {
+        // initialize by scanning existing file metadata.
+        SCAN,
+        // initialize from the maximum sequence number recorded in snapshot properties,
+        // which can avoid scanning existing file metadata in write-only mode.
+        SNAPSHOT,
+    };
+
     static Result<CoreOptions> FromMap(
         const std::map<std::string, std::string>& options_map,
         const std::shared_ptr<FileSystem>& specified_file_system = nullptr,
@@ -65,7 +79,9 @@ class PAIMON_EXPORT CoreOptions {
     int32_t GetFileCompressionZstdLevel() const;
     int64_t GetPageSize() const;
     int64_t GetTargetFileSize(bool has_primary_key) const;
+    int64_t GetTargetFileRowNum() const;
     int64_t GetBlobTargetFileSize() const;
+    bool BlobSplitByFileSize() const;
     int64_t GetCompactionFileSize(bool has_primary_key) const;
     std::string GetPartitionDefaultName() const;
 
@@ -77,8 +93,11 @@ class PAIMON_EXPORT CoreOptions {
     int64_t GetSourceSplitOpenFileCost() const;
     std::optional<int64_t> GetScanSnapshotId() const;
     std::optional<int64_t> GetScanTimestampMillis() const;
+    int32_t GetScanManifestEntryCacheMaxSnapshots() const;
 
     int64_t GetManifestTargetFileSize() const;
+    std::shared_ptr<Cache> GetCache() const;
+    CoreOptions& WithCache(const std::shared_ptr<Cache>& cache);
     StartupMode GetStartupMode() const;
 
     int32_t GetReadBatchSize() const;
@@ -96,6 +115,11 @@ class PAIMON_EXPORT CoreOptions {
     bool CompactionForceUpLevel0() const;
     int64_t GetCommitTimeout() const;
     int32_t GetCommitMaxRetries() const;
+    int64_t GetCommitMinRetryWait() const;
+    int64_t GetCommitMaxRetryWait() const;
+    bool CommitDiscardDuplicateFiles() const;
+    bool DynamicPartitionOverwrite() const;
+    bool OverwriteUpgrade() const;
     int32_t GetCompactionMinFileNum() const;
     int32_t GetCompactionMaxSizeAmplificationPercent() const;
     int32_t GetCompactionSizeRatio() const;
@@ -111,12 +135,32 @@ class PAIMON_EXPORT CoreOptions {
     SortEngine GetSortEngine() const;
     bool IgnoreDelete() const;
     bool WriteOnly() const;
+    bool BucketAppendOrdered() const;
+    SequenceNumberInitMode WriteSequenceNumberInitMode() const;
 
     std::optional<std::string> GetFieldsDefaultFunc() const;
     Result<std::optional<std::string>> GetFieldAggFunc(const std::string& field_name) const;
     Result<bool> FieldAggIgnoreRetract(const std::string& field_name) const;
     Result<std::string> FieldListAggDelimiter(const std::string& field_name) const;
     Result<bool> FieldCollectAggDistinct(const std::string& field_name) const;
+
+    Result<MapStorageLayout> GetMapStorageLayout(const std::string& field_name) const;
+    Result<int32_t> GetMapSharedShreddingMaxColumns(const std::string& field_name) const;
+    Result<MapSharedShreddingColumnPlacementPolicy> GetMapSharedShreddingColumnPlacementPolicy(
+        const std::string& field_name) const;
+
+    /// The configured variant shredding schema JSON, if any (falls back to
+    /// "parquet.variant.shreddingSchema").
+    std::optional<std::string> GetVariantShreddingSchema() const;
+    bool VariantInferShreddingSchemaEnabled() const;
+    VariantShreddingInferenceMode GetVariantShreddingInferenceMode() const;
+    int32_t GetVariantShreddingMaxSchemaWidth() const;
+    int32_t GetVariantShreddingMaxSchemaDepth() const;
+    double GetVariantShreddingMinFieldCardinalityRatio() const;
+    int32_t GetVariantShreddingMaxInferBufferRow() const;
+    int32_t GetVariantShreddingAdaptiveMaxInferBufferRow() const;
+    double GetVariantShreddingAdaptiveRetentionRatio() const;
+
     bool DeletionVectorsEnabled() const;
     bool DeletionVectorsBitmap64() const;
     int64_t DeletionVectorTargetFileSize() const;
@@ -185,9 +229,9 @@ class PAIMON_EXPORT CoreOptions {
     const std::vector<std::string>& GetBlobFields() const;
     const std::vector<std::string>& GetBlobDescriptorFields() const;
     const std::vector<std::string>& GetBlobViewFields() const;
+    std::optional<std::string> GetBlobViewUpstreamWarehouse() const;
+    bool BlobViewResolveEnabled() const;
     std::vector<std::string> GetBlobInlineFields() const;
-    const std::vector<std::string>& GetBlobExternalStorageFields() const;
-    std::optional<std::string> GetBlobExternalStoragePath() const;
 
     const std::map<std::string, std::string>& ToMap() const;
 

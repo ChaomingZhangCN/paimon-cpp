@@ -83,7 +83,8 @@ Result<std::unique_ptr<BatchReader>> RawFileSplitRead::CreateReader(
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<std::unique_ptr<FileBatchReader>> raw_file_readers,
         CreateRawFileReaders(partition, data_files, raw_read_schema_, predicate, dv_factory,
-                             /*row_ranges=*/{}, data_file_path_factory));
+                             /*row_ranges=*/{}, data_file_path_factory,
+                             /*extra_format_options=*/{}));
 
     auto raw_readers =
         ObjectUtils::MoveVector<std::unique_ptr<BatchReader>>(std::move(raw_file_readers));
@@ -98,7 +99,8 @@ Result<std::unique_ptr<BatchReader>> RawFileSplitRead::CreateReader(
     const std::vector<std::shared_ptr<DataFileMeta>>& data_files,
     const std::vector<std::optional<DeletionFile>>& deletion_files) {
     auto dv_factory = DeletionVector::CreateFactory(
-        options_.GetFileSystem(), CreateDeletionFileMap(data_files, deletion_files), pool_);
+        options_.GetFileSystem(), DeletionVector::CreateDeletionFileMap(data_files, deletion_files),
+        pool_);
     return CreateReader(partition, bucket, data_files, dv_factory);
 }
 

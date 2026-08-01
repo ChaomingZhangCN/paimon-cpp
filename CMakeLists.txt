@@ -17,7 +17,11 @@
 # Adapted from Apache Arrow:
 # https://github.com/apache/arrow/blob/apache-arrow-17.0.0/cpp/CMakeLists.txt
 
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.22)
+# 3.22 is the minimum required by Corrosion-rs (used for the Rust<->C++ FFI
+# integration, see crates/tantivy_ffi). Ubuntu 24.04 ships CMake 3.28 and
+# CentOS 8+/RHEL 9+ ship 3.20+, so older distributions need a newer CMake
+# installation.
 message(STATUS "Building using CMake version: ${CMAKE_VERSION}")
 
 # https://cmake.org/cmake/help/latest/policy/CMP0135.html
@@ -37,7 +41,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 project(paimon
-        VERSION 0.2.3
+        VERSION 0.3.0
         DESCRIPTION "Paimon C++ Project")
 
 string(TOUPPER "${CMAKE_BUILD_TYPE}" UPPERCASE_BUILD_TYPE)
@@ -50,14 +54,19 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 option(PAIMON_BUILD_STATIC "Build static library" ON)
 option(PAIMON_BUILD_SHARED "Build shared library" ON)
 option(PAIMON_BUILD_TESTS "Build tests" OFF)
+option(PAIMON_BUILD_BENCHMARKS "Build benchmarks" OFF)
 option(PAIMON_USE_ASAN "Use Address Sanitizer" OFF)
 option(PAIMON_USE_UBSAN "Use Undefined Behavior Sanitizer" OFF)
 option(PAIMON_USE_CXX11_ABI "Use C++11 ABI" ON)
 option(PAIMON_ENABLE_AVRO "Whether to enable avro file format" ON)
 option(PAIMON_ENABLE_ORC "Whether to enable orc file format" ON)
 option(PAIMON_ENABLE_JINDO "Whether to enable jindo file system" OFF)
+option(PAIMON_ENABLE_S3 "Whether to enable S3 file system" OFF)
+option(PAIMON_ENABLE_NETWORK_TESTS
+       "Whether to enable tests that access real remote services over the network" OFF)
 option(PAIMON_ENABLE_LUCENE "Whether to enable lucene index" OFF)
-
+option(PAIMON_ENABLE_TANTIVY
+       "Whether to enable tantivy-fulltext global index (Rust FFI, experimental)" OFF)
 if(PAIMON_ENABLE_ORC)
     add_definitions(-DPAIMON_ENABLE_ORC)
 endif()
@@ -66,6 +75,12 @@ if(PAIMON_ENABLE_AVRO)
 endif()
 if(PAIMON_ENABLE_JINDO)
     add_definitions(-DPAIMON_ENABLE_JINDO)
+endif()
+if(PAIMON_ENABLE_S3)
+    add_definitions(-DPAIMON_ENABLE_S3)
+endif()
+if(PAIMON_ENABLE_NETWORK_TESTS)
+    add_definitions(-DPAIMON_ENABLE_NETWORK_TESTS)
 endif()
 if(PAIMON_USE_CXX11_ABI)
     add_definitions(-D_GLIBCXX_USE_CXX11_ABI=1)
@@ -82,6 +97,10 @@ endif()
 
 if(PAIMON_ENABLE_LUCENE)
     add_definitions(-DPAIMON_ENABLE_LUCENE)
+endif()
+
+if(PAIMON_ENABLE_TANTIVY)
+    add_definitions(-DPAIMON_ENABLE_TANTIVY)
 endif()
 
 add_definitions(-DSNAPPY_CODEC_AVAILABLE)
@@ -286,8 +305,18 @@ set(PAIMON_SHARED_PRIVATE_LINK_LIBS ${PAIMON_STATIC_LINK_LIBS})
 add_subdirectory(third_party/roaring_bitmap EXCLUDE_FROM_ALL)
 add_subdirectory(third_party/xxhash EXCLUDE_FROM_ALL)
 
-list(APPEND PAIMON_LINK_LIBS ${CMAKE_DL_LIBS})
-list(APPEND PAIMON_SHARED_INSTALL_INTERFACE_LIBS ${CMAKE_DL_LIBS})
+# ---- tantivy-fulltext Rust FFI via Corrosion-rs --------------------------------
+# Corrosion wraps the Cargo crate as a CMake target named `paimon_tantivy_ffi`.
+# `corrosion_experimental_cbindgen` runs cbindgen from CMake and writes the
+# header to a stable path; it also adds that path to the target's INTERFACE
+# include dirs so C++ consumers pick it up via target_link_libraries.
+if(PAIMON_ENABLE_TANTIVY)
+    include(CorrosionFetch)
+    corrosion_import_crate(MANIFEST_PATH crates/tantivy_ffi/Cargo.toml CRATES
+                           paimon_tantivy_ffi)
+    corrosion_experimental_cbindgen(TARGET paimon_tantivy_ffi HEADER_NAME
+                                    paimon_tantivy_ffi.h)
+endif()
 
 if(PAIMON_ENABLE_LUCENE)
     set(PAIMON_DICT_DEST "share/paimon/dict")
@@ -325,10 +354,36 @@ add_compile_definitions("GLOG_USE_GLOG_EXPORT")
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_package(Threads REQUIRED)
-set(PAIMON_VERSION_SCRIPT_FLAGS
-    "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/paimon/symbols.map")
+set(PAIMON_VERSION_SCRIPT_FLAGS)
+if(NOT APPLE)
+    set(PAIMON_VERSION_SCRIPT_FLAGS
+        "-Wl,--version-script=${CMAKE_SOURCE_DIR}/src/paimon/symbols.map")
+endif()
 
 set(ENV{PAIMON_TEST_DATA} "${CMAKE_SOURCE_DIR}/test/test_data")
+
+if(PAIMON_BUILD_TESTS OR PAIMON_BUILD_BENCHMARKS)
+    resolve_dependency(GTest)
+    include_directories(SYSTEM ${GTEST_INCLUDE_DIR})
+
+    paimon_link_libraries_whole_archive(PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS
+                                        paimon_local_file_system_static)
+    paimon_link_libraries_no_as_needed(PAIMON_LOCAL_FILE_SYSTEM_SHARED_LINK_LIBS
+                                       paimon_local_file_system_shared)
+    paimon_link_libraries_whole_archive(PAIMON_BLOB_FILE_FORMAT_STATIC_LINK_LIBS
+                                        paimon_blob_file_format_static)
+    paimon_link_libraries_whole_archive(PAIMON_PARQUET_FILE_FORMAT_STATIC_LINK_LIBS
+                                        paimon_parquet_file_format_static)
+
+    if(PAIMON_ENABLE_ORC)
+        paimon_link_libraries_whole_archive(PAIMON_ORC_FILE_FORMAT_STATIC_LINK_LIBS
+                                            paimon_orc_file_format_static)
+    endif()
+    if(PAIMON_ENABLE_AVRO)
+        paimon_link_libraries_whole_archive(PAIMON_AVRO_FILE_FORMAT_STATIC_LINK_LIBS
+                                            paimon_avro_file_format_static)
+    endif()
+endif()
 
 if(PAIMON_BUILD_TESTS)
     if(NOT PAIMON_ENABLE_ORC)
@@ -341,7 +396,6 @@ if(PAIMON_BUILD_TESTS)
     endif()
     # Adding unit tests part of the "paimon" portion of the test suite
     add_custom_target(paimon-tests)
-    resolve_dependency(GTest)
 
     add_custom_target(unittest
                       ctest
@@ -351,46 +405,78 @@ if(PAIMON_BUILD_TESTS)
                       --output-on-failure)
     add_dependencies(unittest paimon-tests)
 
-    include_directories(SYSTEM ${GTEST_INCLUDE_DIR})
     include_directories("${CMAKE_SOURCE_DIR}/test/")
 
-    set(TEST_STATIC_LINK_LIBS
-        "-Wl,--whole-archive"
+    paimon_link_libraries_whole_archive(
+        TEST_WHOLE_ARCHIVE_LINK_LIBS
         paimon_file_index_static
         paimon_global_index_static
         paimon_local_file_system_static
-        paimon_mock_file_format_static
-        "-Wl,--no-whole-archive"
-        "-Wl,--no-as-needed"
-        paimon_parquet_file_format_shared
-        paimon_blob_file_format_shared
-        "-Wl,--as-needed")
+        paimon_mock_file_format_static)
+    paimon_link_libraries_no_as_needed(
+        TEST_PLUGIN_LINK_LIBS paimon_parquet_file_format_shared
+        paimon_blob_file_format_shared)
+    set(TEST_STATIC_LINK_LIBS ${TEST_WHOLE_ARCHIVE_LINK_LIBS} ${TEST_PLUGIN_LINK_LIBS})
+    paimon_link_libraries_whole_archive(PAIMON_LOCAL_FILE_SYSTEM_STATIC_LINK_LIBS
+                                        paimon_local_file_system_static)
+    paimon_link_libraries_no_as_needed(PAIMON_LOCAL_FILE_SYSTEM_SHARED_LINK_LIBS
+                                       paimon_local_file_system_shared)
+    paimon_link_libraries_whole_archive(PAIMON_BLOB_FILE_FORMAT_STATIC_LINK_LIBS
+                                        paimon_blob_file_format_static)
+    paimon_link_libraries_whole_archive(PAIMON_PARQUET_FILE_FORMAT_STATIC_LINK_LIBS
+                                        paimon_parquet_file_format_static)
 
     if(PAIMON_ENABLE_ORC)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--no-as-needed")
-        list(APPEND TEST_STATIC_LINK_LIBS paimon_orc_file_format_shared)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--as-needed")
+        paimon_link_libraries_no_as_needed(TEST_PLUGIN_LINK_LIBS
+                                           paimon_orc_file_format_shared)
+        list(APPEND TEST_STATIC_LINK_LIBS ${TEST_PLUGIN_LINK_LIBS})
     endif()
     if(PAIMON_ENABLE_AVRO)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--no-as-needed")
-        list(APPEND TEST_STATIC_LINK_LIBS paimon_avro_file_format_shared)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--as-needed")
+        paimon_link_libraries_no_as_needed(TEST_PLUGIN_LINK_LIBS
+                                           paimon_avro_file_format_shared)
+        list(APPEND TEST_STATIC_LINK_LIBS ${TEST_PLUGIN_LINK_LIBS})
     endif()
     if(PAIMON_ENABLE_JINDO)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--no-as-needed")
-        list(APPEND TEST_STATIC_LINK_LIBS paimon_jindo_file_system_shared)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--as-needed")
+        paimon_link_libraries_whole_archive(PAIMON_JINDO_FILE_SYSTEM_STATIC_LINK_LIBS
+                                            paimon_jindo_file_system_static)
+        paimon_link_libraries_no_as_needed(TEST_PLUGIN_LINK_LIBS
+                                           paimon_jindo_file_system_shared)
+        list(APPEND TEST_STATIC_LINK_LIBS ${TEST_PLUGIN_LINK_LIBS})
+    endif()
+    if(PAIMON_ENABLE_S3)
+        paimon_link_libraries_whole_archive(PAIMON_S3_FILE_SYSTEM_STATIC_LINK_LIBS
+                                            paimon_s3_file_system_static)
+        paimon_link_libraries_no_as_needed(TEST_PLUGIN_LINK_LIBS
+                                           paimon_s3_file_system_shared)
+        list(APPEND TEST_STATIC_LINK_LIBS ${TEST_PLUGIN_LINK_LIBS})
     endif()
     if(PAIMON_ENABLE_LUMINA)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--no-as-needed")
-        list(APPEND TEST_STATIC_LINK_LIBS paimon_lumina_index_shared)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--as-needed")
+        paimon_link_libraries_whole_archive(PAIMON_LUMINA_INDEX_STATIC_LINK_LIBS
+                                            paimon_lumina_index_static)
+        paimon_link_libraries_no_as_needed(TEST_PLUGIN_LINK_LIBS
+                                           paimon_lumina_index_shared)
+        list(APPEND TEST_STATIC_LINK_LIBS ${TEST_PLUGIN_LINK_LIBS})
     endif()
     if(PAIMON_ENABLE_LUCENE)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--no-as-needed")
-        list(APPEND TEST_STATIC_LINK_LIBS paimon_lucene_index_shared)
-        list(APPEND TEST_STATIC_LINK_LIBS "-Wl,--as-needed")
+        paimon_link_libraries_whole_archive(PAIMON_LUCENE_INDEX_STATIC_LINK_LIBS
+                                            paimon_lucene_index_static)
+        paimon_link_libraries_no_as_needed(TEST_PLUGIN_LINK_LIBS
+                                           paimon_lucene_index_shared)
+        list(APPEND TEST_STATIC_LINK_LIBS ${TEST_PLUGIN_LINK_LIBS})
     endif()
+endif()
+
+if(PAIMON_BUILD_BENCHMARKS)
+    add_custom_target(paimon-benchmarks)
+    add_custom_target(benchmark
+                      ctest
+                      -j4
+                      -L
+                      benchmark
+                      --output-on-failure)
+    add_dependencies(benchmark paimon-benchmarks)
+
+    set(PAIMON_BENCHMARK_LINK_TOOLCHAIN benchmark::benchmark)
 endif()
 
 paimon_print_dependency_resolution_summary()
@@ -411,11 +497,15 @@ install(FILES "${CMAKE_CURRENT_BINARY_DIR}/PaimonConfig.cmake"
 
 config_summary_message()
 
+if(PAIMON_ENABLE_S3)
+    find_package(CURL REQUIRED)
+endif()
 add_subdirectory(src/paimon)
 add_subdirectory(src/paimon/fs/local)
 if(PAIMON_ENABLE_JINDO)
     add_subdirectory(src/paimon/fs/jindo)
 endif()
+add_subdirectory(src/paimon/fs/s3)
 add_subdirectory(src/paimon/format/blob)
 add_subdirectory(src/paimon/format/orc)
 add_subdirectory(src/paimon/format/parquet)
@@ -424,9 +514,20 @@ if(PAIMON_ENABLE_LUMINA)
     add_subdirectory(src/paimon/global_index/lumina)
 endif()
 add_subdirectory(src/paimon/global_index/lucene)
+if(PAIMON_ENABLE_TANTIVY)
+    add_subdirectory(src/paimon/global_index/tantivy)
+endif()
 add_subdirectory(src/paimon/testing/mock)
 add_subdirectory(src/paimon/testing/utils)
 add_subdirectory(test/inte)
+
+install(EXPORT PaimonTargets
+        NAMESPACE Paimon::
+        DESTINATION ${PAIMON_CMAKE_INSTALL_DIR})
+
+if(PAIMON_BUILD_BENCHMARKS)
+    add_subdirectory(benchmark)
+endif()
 
 install(EXPORT PaimonTargets
         NAMESPACE Paimon::

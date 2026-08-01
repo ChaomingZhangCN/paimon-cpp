@@ -17,7 +17,7 @@
  * under the License.
  */
 
-#include "paimon/common/memory/memory_segment.h"
+#include "paimon/memory/memory_segment.h"
 
 #include <climits>
 #include <cstdlib>
@@ -558,10 +558,7 @@ TEST(MemorySegmentTest, TestDoubleAccess) {
     delete[] occupied;
 }
 
-// ------------------------------------------------------------------------
-//  Bulk Byte Movements
-// ------------------------------------------------------------------------
-
+// Bulk Byte Movements
 TEST(MemorySegmentTest, TestBulkByteAccess) {
     auto pool = paimon::GetDefaultPool();
     // test expected correct behavior with default offset / length

@@ -19,9 +19,10 @@
 #pragma once
 
 #include <cstdint>
-#include <functional>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -29,7 +30,6 @@
 #include "paimon/core/compact/compact_manager.h"
 #include "paimon/core/core_options.h"
 #include "paimon/core/io/data_file_meta.h"
-#include "paimon/core/io/single_file_writer.h"
 #include "paimon/core/utils/batch_writer.h"
 #include "paimon/result.h"
 #include "paimon/status.h"
@@ -47,12 +47,12 @@ class CommitIncrement;
 class RecordBatch;
 template <typename T, typename R>
 class RollingFileWriter;
+template <typename T, typename R>
+class SingleFileWriterFactory;
 class LongCounter;
 class DataFilePathFactory;
 class MemoryPool;
 class Metrics;
-class FormatStatsExtractor;
-class WriterBuilder;
 
 class AppendOnlyWriter : public BatchWriter {
  public:
@@ -91,26 +91,26 @@ class AppendOnlyWriter : public BatchWriter {
     }
 
  private:
-    using SingleFileWriterCreator = std::function<
-        Result<std::unique_ptr<SingleFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>>>>()>;
+    using WriterFactory =
+        std::shared_ptr<SingleFileWriterFactory<::ArrowArray*, std::shared_ptr<DataFileMeta>>>;
     using RollingFileWriterResult =
         Result<std::unique_ptr<RollingFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>>>>;
 
-    RollingFileWriterResult CreateRollingRowWriter() const;
+    RollingFileWriterResult CreateRollingRowWriter();
     RollingFileWriterResult CreateRollingBlobWriter(
-        const BlobUtils::SeparatedSchemas& schemas) const;
+        const BlobUtils::SeparatedSchemas& schemas,
+        const std::set<std::string>& inline_fields) const;
 
     Result<CommitIncrement> DrainIncrement();
     Status Flush(bool wait_for_latest_compaction, bool forced_full_compaction);
 
-    SingleFileWriterCreator GetDataFileWriterCreator(
+    Result<WriterFactory> GetDataFileWriterFactory(
         const std::shared_ptr<arrow::Schema>& schema,
         const std::optional<std::vector<std::string>>& write_cols) const;
 
-    SingleFileWriterCreator GetBlobFileWriterCreator(
-        const std::shared_ptr<WriterBuilder>& writer_builder,
-        const std::shared_ptr<FormatStatsExtractor>& stats_extractor,
-        const std::optional<std::vector<std::string>>& write_cols) const;
+    WriterFactory GetBlobFileWriterFactory(
+        const std::shared_ptr<arrow::Schema>& single_field_schema,
+        const std::optional<std::vector<std::string>>& write_cols, bool write_placeholder) const;
 
     Status TrySyncLatestCompaction(bool blocking);
     Status UpdateCompactDeletionFile(const std::shared_ptr<CompactDeletionFile>& new_deletion_file);
@@ -132,6 +132,8 @@ class AppendOnlyWriter : public BatchWriter {
 
     std::shared_ptr<CompactDeletionFile> compact_deletion_file_;
     std::unique_ptr<RollingFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>>> writer_;
+    std::set<std::string> inline_descriptor_fields_;
+    std::set<std::string> inline_view_fields_;
 };
 
 }  // namespace paimon

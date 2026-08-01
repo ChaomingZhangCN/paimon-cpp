@@ -144,7 +144,9 @@ class UnPooledBooleanBuilder : public EmptyBuilder {
     }
 
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
 
     arrow::Status SetData(const uint8_t* data, int64_t length) {
@@ -189,7 +191,9 @@ class UnPooledPrimitiveBuilder : public arrow::NumericBuilder<Type> {
     }
 
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
 
     arrow::Status FinishInternal(std::shared_ptr<arrow::ArrayData>* out) override {
@@ -230,7 +234,9 @@ class UnPooledLargeBinaryBuilder : public arrow::LargeBinaryBuilder {
         length_ += length;
     }
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
     arrow::Status FinishInternal(std::shared_ptr<arrow::ArrayData>* out) override {
         std::shared_ptr<arrow::Buffer> null_bitmap;
@@ -275,7 +281,9 @@ class UnPooledBinaryBuilder : public arrow::BinaryBuilder {
     }
 
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
 
     arrow::Status FinishInternal(std::shared_ptr<arrow::ArrayData>* out) override {
@@ -315,7 +323,9 @@ class UnPooledListBuilder : public EmptyBuilder {
     }
 
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
 
     void SetOffsets(const std::shared_ptr<arrow::Buffer>& offsets) {
@@ -357,13 +367,15 @@ class UnPooledStructBuilder : public EmptyBuilder {
         arrow::FieldVector fields;
         fields.reserve(children_.size());
         for (size_t i = 0; i < children_.size(); i++) {
-            fields.emplace_back(arrow::field(type_->field(i)->name(), children_[i]->type()));
+            fields.emplace_back(type_->field(i)->WithType(children_[i]->type()));
         }
         return arrow::struct_(fields);
     }
 
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
 
     arrow::Status FinishInternal(std::shared_ptr<arrow::ArrayData>* out) override {
@@ -489,7 +501,9 @@ class UnPooledStringDictionaryBuilder : public EmptyBuilder {
         indices_ = indices;
     }
     arrow::Status SetNulls(const uint8_t* valid_bytes, int64_t length) {
-        return arrow::ArrayBuilder::AppendToBitmap(valid_bytes, length);
+        ARROW_RETURN_NOT_OK(this->Reserve(length));
+        this->UnsafeAppendToBitmap(valid_bytes, length);
+        return arrow::Status::OK();
     }
     arrow::Status FinishInternal(std::shared_ptr<arrow::ArrayData>* out) override {
         std::shared_ptr<arrow::Buffer> null_bitmap;
@@ -639,19 +653,26 @@ Result<std::shared_ptr<arrow::ArrayBuilder>> MakeOrcBackedTimestampBuilder(
                                      : nullptr;
     const int64_t* seconds = typed_batch->data.data();
     const int64_t* nanos = typed_batch->nanoseconds.data();
+    const bool has_nulls = typed_batch->hasNulls;
+    const auto* not_null = typed_batch->notNull.data();
+    auto is_null = [has_nulls, not_null](int64_t index) { return has_nulls && !not_null[index]; };
     auto timestamp_type = arrow::internal::checked_pointer_cast<arrow::TimestampType>(type);
     assert(timestamp_type);
     int32_t precision = DateTimeUtils::GetPrecisionFromType(timestamp_type);
     // TODO(lisizhuo.lsz): check nano overflow in arrow
     if (precision == Timestamp::MIN_PRECISION) {
         auto transform_iter = arrow::internal::MakeLazyRange(
-            [seconds](int64_t index) { return seconds[index]; }, typed_batch->numElements);
+            [seconds, is_null](int64_t index) { return is_null(index) ? 0 : seconds[index]; },
+            typed_batch->numElements);
         PAIMON_RETURN_NOT_OK_FROM_ARROW(
             builder->AppendValues(transform_iter.begin(), transform_iter.end(), valid_bytes));
         return builder;
     } else if (precision == Timestamp::MILLIS_PRECISION) {
         auto transform_iter = arrow::internal::MakeLazyRange(
-            [seconds, nanos](int64_t index) {
+            [seconds, nanos, is_null](int64_t index) {
+                if (is_null(index)) {
+                    return int64_t{0};
+                }
                 return seconds[index] *
                            DateTimeUtils::CONVERSION_FACTORS[DateTimeUtils::TimeType::MILLISECOND] +
                        nanos[index] /
@@ -663,7 +684,10 @@ Result<std::shared_ptr<arrow::ArrayBuilder>> MakeOrcBackedTimestampBuilder(
         return builder;
     } else if (precision == Timestamp::DEFAULT_PRECISION) {
         auto transform_iter = arrow::internal::MakeLazyRange(
-            [seconds, nanos](int64_t index) {
+            [seconds, nanos, is_null](int64_t index) {
+                if (is_null(index)) {
+                    return int64_t{0};
+                }
                 return seconds[index] *
                            DateTimeUtils::CONVERSION_FACTORS[DateTimeUtils::TimeType::MICROSECOND] +
                        nanos[index] /
@@ -675,7 +699,10 @@ Result<std::shared_ptr<arrow::ArrayBuilder>> MakeOrcBackedTimestampBuilder(
         return builder;
     } else if (precision == Timestamp::MAX_PRECISION) {
         auto transform_iter = arrow::internal::MakeLazyRange(
-            [seconds, nanos](int64_t index) {
+            [seconds, nanos, is_null](int64_t index) {
+                if (is_null(index)) {
+                    return int64_t{0};
+                }
                 return seconds[index] *
                            DateTimeUtils::CONVERSION_FACTORS[DateTimeUtils::TimeType::NANOSECOND] +
                        nanos[index];
@@ -940,7 +967,7 @@ arrow::Result<std::shared_ptr<arrow::Array>> NormalizeArray(
                 auto child_length = struct_array->data()->child_data[i]->length;
                 auto child_offset = struct_array->data()->child_data[i]->offset;
                 // field function will change length & offset in child data
-                std::shared_ptr<arrow::Array> child = struct_array->field(static_cast<int>(i));
+                std::shared_ptr<arrow::Array> child = struct_array->field(static_cast<int32_t>(i));
                 const std::shared_ptr<arrow::Buffer> child_bitmap = child->null_bitmap();
                 std::shared_ptr<arrow::Buffer> final_child_bitmap;
                 if (child_bitmap == nullptr && bitmap == nullptr) {
@@ -1214,7 +1241,7 @@ arrow::Status WriteStructBatch(const arrow::Array& array,
     for (std::size_t i = 0; i < size; i++) {
         batch->fields[i]->resize(arrow_length);
         ARROW_RETURN_NOT_OK(
-            WriteBatch(*(struct_array->field(static_cast<int>(i))), batch->fields[i]));
+            WriteBatch(*(struct_array->field(static_cast<int32_t>(i))), batch->fields[i]));
     }
     return arrow::Status::OK();
 }
@@ -1316,6 +1343,9 @@ arrow::Status WriteBatch(const arrow::Array& array, ::orc::ColumnVectorBatch* co
         case arrow::Type::type::BINARY:
             return WriteGenericBatch<arrow::BinaryType, ::orc::StringVectorBatch>(
                 array, column_vector_batch);
+        case arrow::Type::type::LARGE_BINARY:
+            return WriteGenericBatch<arrow::LargeBinaryType, ::orc::StringVectorBatch>(
+                array, column_vector_batch);
         case arrow::Type::type::STRING:
             return WriteGenericBatch<arrow::StringType, ::orc::StringVectorBatch>(
                 array, column_vector_batch);
@@ -1379,6 +1409,7 @@ arrow::Result<std::unique_ptr<::orc::Type>> GetOrcType(const arrow::DataType& ty
         case arrow::Type::type::STRING:
             return ::orc::createPrimitiveType(::orc::TypeKind::STRING);
         case arrow::Type::type::BINARY:
+        case arrow::Type::type::LARGE_BINARY:
             return ::orc::createPrimitiveType(::orc::TypeKind::BINARY);
         case arrow::Type::type::DATE32:
             return ::orc::createPrimitiveType(::orc::TypeKind::DATE);

@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-if(PAIMON_BUILD_TESTS)
+if(PAIMON_BUILD_TESTS OR PAIMON_BUILD_BENCHMARKS)
 
     set(PAIMON_TEST_UTILS testharness.cpp data_generator.cpp)
 
@@ -29,14 +29,25 @@ if(PAIMON_BUILD_TESTS)
                    paimon_static
                    ${GTEST_LINK_TOOLCHAIN})
 
+    # testharness.cpp includes <gtest/gtest.h>, but the objlib compile step does
+    # not link the gtest targets, so it has no ordering dependency on the
+    # googletest ExternalProject. Without this it can race ahead and compile
+    # before googletest_ep extracts its headers (observed as a flaky
+    # "gtest/gtest.h: No such file" in Release builds). Force the headers to
+    # exist before compiling test_utils.
+    if(TARGET googletest_ep)
+        add_dependencies(test_utils_objlib googletest_ep)
+    endif()
+endif()
+
+if(PAIMON_BUILD_TESTS)
+
     add_paimon_test(test_utils_test
                     SOURCES
                     data_generator_test.cpp
                     STATIC_LINK_LIBS
                     paimon_shared
-                    "-Wl,--whole-archive"
-                    paimon_local_file_system_shared
-                    "-Wl,--no-whole-archive"
+                    ${PAIMON_LOCAL_FILE_SYSTEM_SHARED_LINK_LIBS}
                     test_utils_static
                     ${GTEST_LINK_TOOLCHAIN})
 

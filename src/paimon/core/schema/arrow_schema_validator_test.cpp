@@ -24,6 +24,10 @@
 
 #include "arrow/type.h"
 #include "gtest/gtest.h"
+#include "paimon/common/data/blob_utils.h"
+#include "paimon/common/data/variant/variant_access_utils.h"
+#include "paimon/common/data/variant/variant_defs.h"
+#include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/testing/utils/testharness.h"
@@ -151,6 +155,51 @@ TEST(ArrowSchemaValidatorTest, TestInvalidDataType) {
     }
 }
 
+TEST(ArrowSchemaValidatorTest, TestBlobFieldMustBeTopLevel) {
+    {
+        auto arrow_schema =
+            arrow::schema(arrow::FieldVector({BlobUtils::ToArrowField("blob", true)}));
+        ASSERT_OK(ArrowSchemaValidator::ValidateSchema(*arrow_schema));
+    }
+    {
+        std::vector<DataField> fields = {DataField(0, BlobUtils::ToArrowField("blob", true))};
+        auto arrow_schema = DataField::ConvertDataFieldsToArrowSchema(fields);
+        ASSERT_OK(ArrowSchemaValidator::ValidateSchemaWithFieldId(*arrow_schema));
+    }
+    {
+        auto nested_blob_field =
+            arrow::field("nested", arrow::struct_({BlobUtils::ToArrowField("blob", true)}));
+        auto arrow_schema = arrow::schema(arrow::FieldVector({nested_blob_field}));
+        ASSERT_NOK_WITH_MSG(ArrowSchemaValidator::ValidateSchema(*arrow_schema),
+                            "Blob field must be a top-level field.");
+    }
+    {
+        auto array_blob_field =
+            arrow::field("array_blob", arrow::list(BlobUtils::ToArrowField("item", true)));
+        auto arrow_schema = arrow::schema(arrow::FieldVector({array_blob_field}));
+        ASSERT_NOK_WITH_MSG(ArrowSchemaValidator::ValidateSchema(*arrow_schema),
+                            "Blob field must be a top-level field.");
+    }
+    {
+        auto map_blob_field = arrow::field(
+            "map_blob",
+            arrow::map(arrow::utf8(), arrow::struct_({BlobUtils::ToArrowField("blob", true)})));
+        auto arrow_schema = arrow::schema(arrow::FieldVector({map_blob_field}));
+        ASSERT_NOK_WITH_MSG(ArrowSchemaValidator::ValidateSchema(*arrow_schema),
+                            "Blob field must be a top-level field.");
+    }
+    {
+        std::vector<DataField> nested_fields = {
+            DataField(1, BlobUtils::ToArrowField("blob", true))};
+        std::vector<DataField> fields = {DataField(
+            0,
+            arrow::field("nested", DataField::ConvertDataFieldsToArrowStructType(nested_fields)))};
+        auto arrow_schema = DataField::ConvertDataFieldsToArrowSchema(fields);
+        ASSERT_NOK_WITH_MSG(ArrowSchemaValidator::ValidateSchemaWithFieldId(*arrow_schema),
+                            "Blob field must be a top-level field.");
+    }
+}
+
 TEST(ArrowSchemaValidatorTest, ValidateDataTypeWithFieldId) {
     {
         std::vector<DataField> fields = {DataField(3, arrow::field("f3", arrow::float64())),
@@ -268,8 +317,50 @@ TEST(ArrowSchemaValidatorTest, ValidateDataTypeWithFieldId) {
         auto struct_type = DataField::ConvertDataFieldsToArrowStructType(fields);
         std::set<int32_t> field_id_set;
         ASSERT_NOK_WITH_MSG(ArrowSchemaValidator::ValidateDataTypeWithFieldId(
-                                struct_type, /*key_value_metadata=*/nullptr, &field_id_set),
+                                struct_type, /*key_value_metadata=*/nullptr,
+                                /*allow_blob=*/true, &field_id_set),
                             "Unknown or unsupported arrow type: large_string");
+    }
+}
+
+TEST(ArrowSchemaValidatorTest, ValidateVariantField) {
+    // A variant field validates as a leaf: its fixed child ids 0/1 do not join the global field
+    // id uniqueness check, even when top-level fields use ids 0/1.
+    {
+        std::vector<DataField> fields = {DataField(0, arrow::field("f0", arrow::utf8())),
+                                         DataField(1, VariantTypeUtils::ToArrowField("v1")),
+                                         DataField(2, VariantTypeUtils::ToArrowField("v2"))};
+        auto arrow_schema = DataField::ConvertDataFieldsToArrowSchema(fields);
+        ASSERT_OK(ArrowSchemaValidator::ValidateSchemaWithFieldId(*arrow_schema))
+            << ArrowSchemaValidator::ValidateSchemaWithFieldId(*arrow_schema).ToString();
+    }
+    // A variant-access projection (variant marker + description-carrying children) validates
+    // as a leaf instead of being shape-checked.
+    {
+        auto age_child =
+            arrow::field("0", arrow::int64(), true,
+                         arrow::KeyValueMetadata::Make(
+                             {DataField::DESCRIPTION},
+                             {VariantAccessUtils::BuildVariantMetadata("$.age", true, "UTC")}));
+        std::unordered_map<std::string, std::string> metadata = {
+            {VariantDefs::kExtensionTypeKey, VariantDefs::kExtensionTypeValue}};
+        auto access_field = arrow::field("v", arrow::struct_({age_child}), true,
+                                         std::make_shared<arrow::KeyValueMetadata>(metadata));
+        auto arrow_schema = arrow::schema({access_field});
+        ASSERT_OK(ArrowSchemaValidator::ValidateSchema(*arrow_schema))
+            << ArrowSchemaValidator::ValidateSchema(*arrow_schema).ToString();
+    }
+    // A variant-marked struct with the wrong physical shape is rejected.
+    {
+        std::unordered_map<std::string, std::string> metadata = {
+            {VariantDefs::kExtensionTypeKey, VariantDefs::kExtensionTypeValue}};
+        auto bad_variant =
+            arrow::field("v",
+                         arrow::struct_({arrow::field("value", arrow::binary(), true),
+                                         arrow::field("metadata", arrow::binary(), true)}),
+                         true, std::make_shared<arrow::KeyValueMetadata>(metadata));
+        auto arrow_schema = arrow::schema({bad_variant});
+        ASSERT_NOK(ArrowSchemaValidator::ValidateSchema(*arrow_schema));
     }
 }
 

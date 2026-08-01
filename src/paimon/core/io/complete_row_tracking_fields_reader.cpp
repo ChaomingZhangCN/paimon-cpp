@@ -28,34 +28,46 @@
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/object_utils.h"
 
 namespace paimon {
 CompleteRowTrackingFieldsBatchReader::CompleteRowTrackingFieldsBatchReader(
     std::unique_ptr<FileBatchReader>&& reader, const std::optional<int64_t>& first_row_id,
-    int64_t snapshot_id, const std::shared_ptr<MemoryPool>& pool)
+    int64_t snapshot_id, const std::optional<std::vector<std::string>>& file_field_names,
+    const std::shared_ptr<MemoryPool>& pool)
     : first_row_id_(first_row_id),
       snapshot_id_(snapshot_id),
+      file_field_names_(file_field_names),
       arrow_pool_(GetArrowPool(pool)),
       reader_(std::move(reader)) {}
 
 Status CompleteRowTrackingFieldsBatchReader::SetReadSchema(
     ::ArrowSchema* read_schema, const std::shared_ptr<Predicate>& predicate,
     const std::optional<RoaringBitmap32>& selection_bitmap) {
-    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<::ArrowSchema> c_file_schema, reader_->GetFileSchema());
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> file_schema,
-                                      arrow::ImportSchema(c_file_schema.get()));
+    // The physical fields of the file decide which special fields must be stripped from the
+    // format reader's schema: a format without a self-describing file schema (e.g. blob)
+    // declares them via file_field_names_, self-describing formats are queried directly.
+    std::vector<std::string> file_field_names;
+    if (file_field_names_) {
+        file_field_names = file_field_names_.value();
+    } else {
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<::ArrowSchema> c_file_schema,
+                               reader_->GetFileSchema());
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> file_schema,
+                                          arrow::ImportSchema(c_file_schema.get()));
+        file_field_names = file_schema->field_names();
+    }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> arrow_schema,
                                       arrow::ImportSchema(read_schema));
     read_schema_ = arrow_schema;
     int32_t row_id_idx = arrow_schema->GetFieldIndex(SpecialFields::RowId().Name());
-    if (row_id_idx != -1 && file_schema->GetFieldIndex(SpecialFields::RowId().Name()) == -1) {
-        // read special fields but file not exist, remove special fields to format reader
+    if (row_id_idx != -1 &&
+        !ObjectUtils::Contains(file_field_names, SpecialFields::RowId().Name())) {
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(arrow_schema, arrow_schema->RemoveField(row_id_idx));
     }
     int32_t sequence_id_idx = arrow_schema->GetFieldIndex(SpecialFields::SequenceNumber().Name());
     if (sequence_id_idx != -1 &&
-        file_schema->GetFieldIndex(SpecialFields::SequenceNumber().Name()) == -1) {
-        // read special fields but file not exist, remove special fields to format reader
+        !ObjectUtils::Contains(file_field_names, SpecialFields::SequenceNumber().Name())) {
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(arrow_schema, arrow_schema->RemoveField(sequence_id_idx));
     }
     ArrowSchema c_schema;
@@ -88,15 +100,14 @@ CompleteRowTrackingFieldsBatchReader::NextBatchWithBitmap() {
     std::string row_id_field_name = SpecialFields::RowId().Name();
     if (read_schema_->GetFieldIndex(row_id_field_name) != -1) {
         row_id_array = src_struct_array->GetFieldByName(row_id_field_name);
-        PAIMON_ASSIGN_OR_RAISE(uint64_t previous_batch_first_row_number,
-                               reader_->GetPreviousBatchFirstRowNumber());
-        auto row_id_convert_func = [previous_batch_first_row_number,
-                                    this](int32_t idx_in_array) -> Result<int64_t> {
+        auto row_id_convert_func = [this](int32_t idx_in_array) -> Result<int64_t> {
             if (first_row_id_ == std::nullopt) {
                 return Status::Invalid(
                     "unexpected: read _ROW_ID special field, but first row id is null in meta");
             }
-            return first_row_id_.value() + previous_batch_first_row_number + idx_in_array;
+            PAIMON_ASSIGN_OR_RAISE(uint64_t file_row_id,
+                                   reader_->GetPreviousBatchFileRowId(idx_in_array));
+            return first_row_id_.value() + file_row_id;
         };
         PAIMON_RETURN_NOT_OK(ConvertRowTrackingField(src_struct_array->length(), /*init_value=*/0,
                                                      row_id_convert_func, &row_id_array));

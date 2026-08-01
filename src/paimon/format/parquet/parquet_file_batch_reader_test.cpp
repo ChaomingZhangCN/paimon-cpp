@@ -18,8 +18,12 @@
 
 #include "paimon/format/parquet/parquet_file_batch_reader.h"
 
+#include <atomic>
+#include <functional>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <string>
 
 #include "arrow/api.h"
 #include "arrow/array/array_base.h"
@@ -30,22 +34,27 @@
 #include "arrow/c/bridge.h"
 #include "arrow/io/caching.h"
 #include "arrow/io/interfaces.h"
+#include "arrow/ipc/api.h"
 #include "arrow/ipc/json_simple.h"
 #include "gtest/gtest.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/arrow_input_stream_adapter.h"
+#include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/defs.h"
+#include "paimon/format/parquet/parquet_field_id_converter.h"
 #include "paimon/format/parquet/parquet_format_defs.h"
 #include "paimon/format/parquet/parquet_format_writer.h"
+#include "paimon/format/parquet/parquet_reader_builder.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/memory/memory_pool.h"
 #include "paimon/predicate/literal.h"
 #include "paimon/predicate/predicate_builder.h"
 #include "paimon/reader/batch_reader.h"
+#include "paimon/testing/utils/counting_cache_test_utils.h"
 #include "paimon/testing/utils/read_result_collector.h"
 #include "paimon/testing/utils/testharness.h"
 #include "paimon/testing/utils/timezone_guard.h"
@@ -58,9 +67,69 @@ class Predicate;
 
 namespace paimon::parquet::test {
 
+std::string SerializeSchemaToString(const std::shared_ptr<arrow::Schema>& schema) {
+    std::shared_ptr<arrow::Buffer> serialized = arrow::ipc::SerializeSchema(*schema).ValueOrDie();
+    return std::string(reinterpret_cast<const char*>(serialized->data()),
+                       static_cast<size_t>(serialized->size()));
+}
+
+class FailedUriInputStream : public InputStream {
+ public:
+    explicit FailedUriInputStream(const std::shared_ptr<InputStream>& input) : input_(input) {}
+
+    Status Seek(int64_t offset, SeekOrigin origin) override {
+        return input_->Seek(offset, origin);
+    }
+
+    Result<int64_t> GetPos() const override {
+        return input_->GetPos();
+    }
+
+    Result<int64_t> Read(char* buffer, int64_t size) override {
+        return input_->Read(buffer, size);
+    }
+
+    Result<int64_t> Read(char* buffer, int64_t size, int64_t offset) override {
+        return input_->Read(buffer, size, offset);
+    }
+
+    void ReadAsync(char* buffer, int64_t size, int64_t offset,
+                   std::function<void(Status)>&& callback) override {
+        return input_->ReadAsync(buffer, size, offset, std::move(callback));
+    }
+
+    Result<std::string> GetUri() const override {
+        return Status::Invalid("failed to get uri");
+    }
+
+    Result<int64_t> Length() const override {
+        return input_->Length();
+    }
+
+    Status Close() override {
+        return input_->Close();
+    }
+
+ private:
+    std::shared_ptr<InputStream> input_;
+};
+
 class ParquetFileBatchReaderTest : public ::testing::Test,
                                    public ::testing::WithParamInterface<bool> {
  public:
+    static std::shared_ptr<arrow::Field> WithMapSelectedKeys(
+        const std::shared_ptr<arrow::Field>& field, const std::string& selected_keys) {
+        auto metadata =
+            field->metadata() ? field->metadata()->Copy() : arrow::key_value_metadata({});
+        auto set_status = metadata->Set(DataField::MAP_SELECTED_KEYS, selected_keys);
+        EXPECT_TRUE(set_status.ok()) << set_status.ToString();
+        return field->WithMetadata(metadata);
+    }
+
+    static std::shared_ptr<arrow::Schema> MakeReadSchema(const arrow::FieldVector& fields) {
+        return arrow::schema(fields);
+    }
+
     void SetUp() override {
         dir_ = paimon::test::UniqueTestDirectory::Create();
         ASSERT_TRUE(dir_);
@@ -103,12 +172,15 @@ class ParquetFileBatchReaderTest : public ::testing::Test,
 
     void WriteArray(const std::string& file_path, const std::shared_ptr<arrow::Array>& src_array,
                     const std::shared_ptr<arrow::Schema>& arrow_schema, int64_t write_batch_size,
-                    bool enable_dictionary, int64_t max_row_group_length) const {
+                    bool enable_dictionary, int64_t max_row_group_length,
+                    int64_t max_page_size = 1024 * 1024 * 1024) const {
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> out,
                              fs_->Create(file_path, /*overwrite=*/true));
         ::parquet::WriterProperties::Builder builder;
         builder.write_batch_size(write_batch_size);
         builder.max_row_group_length(max_row_group_length);
+        builder.data_pagesize(max_page_size);
+        builder.enable_write_page_index();
         enable_dictionary ? builder.enable_dictionary() : builder.disable_dictionary();
         auto writer_properties = builder.build();
         ASSERT_OK_AND_ASSIGN(auto format_writer, ParquetFormatWriter::Create(
@@ -127,14 +199,19 @@ class ParquetFileBatchReaderTest : public ::testing::Test,
     std::unique_ptr<ParquetFileBatchReader> PrepareParquetFileBatchReader(
         const std::string& file_name, const std::shared_ptr<arrow::Schema>& read_schema,
         const std::shared_ptr<Predicate>& predicate,
-        const std::optional<RoaringBitmap32>& selection_bitmap, int32_t batch_size) const {
+        const std::optional<RoaringBitmap32>& selection_bitmap, int32_t batch_size,
+        bool enable_page_level_filter = false) const {
         EXPECT_OK_AND_ASSIGN(auto input_stream, fs_->Open(file_name));
         auto length = fs_->GetFileStatus(file_name).value()->GetLen();
         auto in_stream =
-            std::make_unique<ArrowInputStreamAdapter>(std::move(input_stream), pool_, length);
-        std::map<std::string, std::string> options = {};
+            std::make_unique<ArrowInputStreamAdapter>(std::move(input_stream), length, pool_);
+        auto storage_read_bytes = in_stream->StorageReadBytes();
+        std::map<std::string, std::string> options;
+        options[PARQUET_READ_ENABLE_PAGE_INDEX_FILTER] =
+            enable_page_level_filter ? "true" : "false";
         return PrepareParquetFileBatchReader(std::move(in_stream), options, read_schema, predicate,
-                                             selection_bitmap, batch_size);
+                                             selection_bitmap, batch_size,
+                                             std::move(storage_read_bytes));
     }
 
     std::unique_ptr<paimon::parquet::ParquetFileBatchReader> PrepareParquetFileBatchReader(
@@ -142,10 +219,12 @@ class ParquetFileBatchReaderTest : public ::testing::Test,
         const std::map<std::string, std::string>& options,
         const std::shared_ptr<arrow::Schema>& read_schema,
         const std::shared_ptr<Predicate>& predicate,
-        const std::optional<RoaringBitmap32>& selection_bitmap, int32_t batch_size) const {
-        EXPECT_OK_AND_ASSIGN(
-            auto parquet_batch_reader,
-            ParquetFileBatchReader::Create(std::move(in_stream), pool_, options, batch_size));
+        const std::optional<RoaringBitmap32>& selection_bitmap, int32_t batch_size,
+        std::shared_ptr<std::atomic<uint64_t>> storage_read_bytes = nullptr) const {
+        EXPECT_OK_AND_ASSIGN(auto parquet_batch_reader,
+                             ParquetFileBatchReader::Create(
+                                 std::move(in_stream), options, batch_size,
+                                 /*file_metadata=*/nullptr, std::move(storage_read_bytes), pool_));
         std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
         auto arrow_status = arrow::ExportSchema(*read_schema, c_schema.get());
         EXPECT_TRUE(arrow_status.ok());
@@ -153,7 +232,7 @@ class ParquetFileBatchReaderTest : public ::testing::Test,
         return parquet_batch_reader;
     }
 
- private:
+ protected:
     std::string file_path_;
     std::unique_ptr<paimon::test::UniqueTestDirectory> dir_;
     std::shared_ptr<FileSystem> fs_;
@@ -162,6 +241,128 @@ class ParquetFileBatchReaderTest : public ::testing::Test,
     std::shared_ptr<arrow::Schema> schema_;
     std::shared_ptr<arrow::StructArray> struct_array_;
 };
+
+static std::shared_ptr<arrow::StructArray> MakeSequentialIntData(int32_t num_rows) {
+    arrow::Int32Builder val_builder;
+    EXPECT_TRUE(val_builder.Reserve(num_rows).ok());
+    for (int32_t i = 0; i < num_rows; ++i) {
+        val_builder.UnsafeAppend(i);
+    }
+    auto val_array = val_builder.Finish().ValueOrDie();
+    auto field = arrow::field("f0", arrow::int32());
+    return arrow::StructArray::Make({val_array}, {field}).ValueOrDie();
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestParquetMetadataCacheReusesSerializedFooter) {
+    WriteArray(file_path_, struct_array_, schema_, /*write_batch_size=*/struct_array_->length(),
+               /*enable_dictionary=*/false,
+               /*max_row_group_length=*/struct_array_->length());
+
+    auto cache = std::make_shared<paimon::test::CountingRoutingCache>(CacheKind::DATA_FILE_FOOTER,
+                                                                      128 * 1024 * 1024);
+    auto open_reader = [&]() -> Result<std::unique_ptr<ParquetFileBatchReader>> {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<InputStream> input_stream, fs_->Open(file_path_));
+        std::map<std::string, std::string> options;
+        ParquetReaderBuilder builder(options, batch_size_);
+        builder.WithMemoryPool(GetDefaultPool())->WithCache(cache);
+        PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileBatchReader> reader,
+                               builder.Build(input_stream));
+        auto parquet_reader = dynamic_cast<ParquetFileBatchReader*>(reader.release());
+        if (parquet_reader == nullptr) {
+            return Status::Invalid("failed to cast FileBatchReader to ParquetFileBatchReader");
+        }
+        return std::unique_ptr<ParquetFileBatchReader>(parquet_reader);
+    };
+
+    ASSERT_OK_AND_ASSIGN(auto reader1, open_reader());
+    ASSERT_OK_AND_ASSIGN(auto schema1, reader1->GetFileSchema());
+    ASSERT_TRUE(schema1);
+    ASSERT_TRUE(schema1->release);
+    schema1->release(schema1.get());
+    ASSERT_EQ(1, cache->GetCount());
+    ASSERT_EQ(1, cache->SupplierCallCount());
+    ASSERT_EQ(1, cache->Size());
+    ASSERT_EQ(CacheKind::DATA_FILE_FOOTER, cache->LastKind());
+
+    ASSERT_OK_AND_ASSIGN(auto reader2, open_reader());
+    ASSERT_OK_AND_ASSIGN(auto schema2, reader2->GetFileSchema());
+    ASSERT_TRUE(schema2);
+    ASSERT_TRUE(schema2->release);
+    schema2->release(schema2.get());
+    ASSERT_EQ(2, cache->GetCount());
+    ASSERT_EQ(1, cache->SupplierCallCount());
+    ASSERT_EQ(1, cache->Size());
+    ASSERT_EQ(CacheKind::DATA_FILE_FOOTER, cache->LastKind());
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestParquetMetadataCacheBypassesWhenGetUriFails) {
+    WriteArray(file_path_, struct_array_, schema_, /*write_batch_size=*/struct_array_->length(),
+               /*enable_dictionary=*/false,
+               /*max_row_group_length=*/struct_array_->length());
+
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> input_stream, fs_->Open(file_path_));
+    auto failed_uri_input_stream = std::make_shared<FailedUriInputStream>(input_stream);
+    auto cache = std::make_shared<paimon::test::CountingRoutingCache>(CacheKind::DATA_FILE_FOOTER,
+                                                                      128 * 1024 * 1024);
+
+    std::map<std::string, std::string> options;
+    ParquetReaderBuilder builder(options, batch_size_);
+    builder.WithMemoryPool(GetDefaultPool())->WithCache(cache);
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FileBatchReader> reader,
+                         builder.Build(failed_uri_input_stream));
+    auto parquet_reader = dynamic_cast<ParquetFileBatchReader*>(reader.get());
+    ASSERT_TRUE(parquet_reader);
+    ASSERT_OK_AND_ASSIGN(auto file_schema, parquet_reader->GetFileSchema());
+    ASSERT_TRUE(file_schema);
+    ASSERT_TRUE(file_schema->release);
+    file_schema->release(file_schema.get());
+
+    ASSERT_EQ(0, cache->GetCount());
+    ASSERT_EQ(0, cache->SupplierCallCount());
+    ASSERT_EQ(0, cache->Size());
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestReadBinaryWrittenFromBinaryAndLargeBinary) {
+    auto check_binary_read_result = [&](const std::shared_ptr<arrow::DataType>& write_type,
+                                        const std::string& file_name) {
+        std::string data_json = R"([
+        ["descriptor-1"],
+        [""],
+        [null],
+        ["descriptor-2"]
+    ])";
+        auto write_field = arrow::field("f0", write_type);
+        auto write_schema = arrow::schema({write_field});
+        auto write_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({write_field}), data_json)
+                .ValueOrDie());
+
+        std::string file_path = PathUtil::JoinPath(dir_->Str(), file_name);
+        WriteArray(file_path, write_array, write_schema, /*write_batch_size=*/write_array->length(),
+                   /*enable_dictionary=*/false, /*max_row_group_length=*/write_array->length());
+
+        auto read_field = arrow::field("f0", arrow::binary());
+        auto read_schema = arrow::schema({read_field});
+        auto parquet_batch_reader =
+            PrepareParquetFileBatchReader(file_path, read_schema, /*predicate=*/nullptr,
+                                          /*selection_bitmap=*/std::nullopt, batch_size_);
+
+        ASSERT_OK_AND_ASSIGN(auto c_file_schema, parquet_batch_reader->GetFileSchema());
+        auto file_schema = arrow::ImportSchema(c_file_schema.get()).ValueOrDie();
+        ASSERT_TRUE(file_schema->Equals(*read_schema));
+
+        auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({read_field}), data_json)
+                .ValueOrDie());
+        auto expected_chunked_array = std::make_shared<arrow::ChunkedArray>(expected_array);
+        ASSERT_OK_AND_ASSIGN(auto result_array, paimon::test::ReadResultCollector::CollectResult(
+                                                    parquet_batch_reader.get()));
+        ASSERT_TRUE(result_array->Equals(expected_chunked_array));
+    };
+
+    check_binary_read_result(arrow::binary(), "binary.parquet");
+    check_binary_read_result(arrow::large_binary(), "large-binary.parquet");
+}
 
 TEST_F(ParquetFileBatchReaderTest, TestSimple) {
     std::string file_name = paimon::test::GetDataDir() +
@@ -185,11 +386,12 @@ TEST_F(ParquetFileBatchReaderTest, TestSetReadSchema) {
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> input_stream, fs_->Open(file_name));
     auto length = fs_->GetFileStatus(file_name).value()->GetLen();
     auto in_stream =
-        std::make_unique<ArrowInputStreamAdapter>(std::move(input_stream), pool_, length);
+        std::make_unique<ArrowInputStreamAdapter>(std::move(input_stream), length, pool_);
     std::map<std::string, std::string> options;
-    ASSERT_OK_AND_ASSIGN(
-        auto parquet_batch_reader,
-        ParquetFileBatchReader::Create(std::move(in_stream), pool_, options, batch_size_));
+    ASSERT_OK_AND_ASSIGN(auto parquet_batch_reader,
+                         ParquetFileBatchReader::Create(std::move(in_stream), options, batch_size_,
+                                                        /*file_metadata=*/nullptr,
+                                                        /*storage_read_bytes=*/nullptr, pool_));
     // test GetFileSchema()
     ASSERT_OK_AND_ASSIGN(auto c_file_schema, parquet_batch_reader->GetFileSchema());
     auto arrow_file_schema = arrow::ImportSchema(c_file_schema.get()).ValueOrDie();
@@ -232,6 +434,36 @@ TEST_F(ParquetFileBatchReaderTest, TestSetReadSchema) {
     ASSERT_FALSE(result_with_read_schema);
 }
 
+TEST_F(ParquetFileBatchReaderTest, TestSetReadSchemaWithLegacyParquetMissingFieldIds) {
+    std::string file_name = paimon::test::GetDataDir() +
+                            "/parquet/append_09.db/append_09/f1=20/bucket-0/"
+                            "data-b446f78a-2cfb-4b3b-add8-31295d24a277-0.parquet";
+
+    std::vector<DataField> read_fields = {
+        DataField(0, arrow::field("f0", arrow::utf8())),
+        DataField(2, arrow::field("f2", arrow::int32())),
+        DataField(3, arrow::field("f3", arrow::float64())),
+    };
+    auto read_schema = DataField::ConvertDataFieldsToArrowSchema(read_fields);
+
+    auto parquet_batch_reader =
+        PrepareParquetFileBatchReader(file_name, read_schema, /*predicate=*/nullptr,
+                                      /*selection_bitmap=*/std::nullopt, batch_size_);
+
+    ASSERT_OK_AND_ASSIGN(auto result_array, paimon::test::ReadResultCollector::CollectResult(
+                                                parquet_batch_reader.get()));
+
+    std::shared_ptr<arrow::ChunkedArray> expected_array;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    arrow::struct_(read_schema->fields()), {R"([
+        ["Lucy", 1, 14.1]
+    ])"},
+                    &expected_array)
+                    .ok());
+    ASSERT_TRUE(result_array->Equals(expected_array))
+        << "expected: " << expected_array->ToString() << "\nactual: " << result_array->ToString();
+}
+
 TEST_F(ParquetFileBatchReaderTest, TestNextBatchSimple) {
     std::string file_name = paimon::test::GetDataDir() +
                             "parquet/parquet_append_table.db/parquet_append_table/bucket-0/"
@@ -240,20 +472,17 @@ TEST_F(ParquetFileBatchReaderTest, TestNextBatchSimple) {
         auto parquet_batch_reader =
             PrepareParquetFileBatchReader(file_name, schema_, /*predicate=*/nullptr,
                                           /*selection_bitmap=*/std::nullopt, batch_size);
-        ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(),
-                  std::numeric_limits<uint64_t>::max());
         ASSERT_OK_AND_ASSIGN(auto result_array, paimon::test::ReadResultCollector::CollectResult(
                                                     parquet_batch_reader.get()));
-        ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(), 6);
         parquet_batch_reader->Close();
         auto expected_array = std::make_shared<arrow::ChunkedArray>(struct_array_);
         ASSERT_TRUE(result_array->Equals(expected_array));
         // test metrics
         auto read_metrics = parquet_batch_reader->GetReaderMetrics();
         ASSERT_TRUE(read_metrics);
-        // TODO(jinli.zjw): test metrics
-        // ASSERT_TRUE(read_metrics->GetCounter(ParquetMetrics::READ_BYTES) > 0);
-        // ASSERT_TRUE(read_metrics->GetCounter(ParquetMetrics::READ_RAW_BYTES) > 0);
+        ASSERT_OK_AND_ASSIGN(uint64_t storage_read_bytes,
+                             read_metrics->GetCounter(ParquetMetrics::READ_STORAGE_BYTES));
+        ASSERT_GT(storage_read_bytes, 0u);
     }
 }
 
@@ -338,6 +567,85 @@ TEST_F(ParquetFileBatchReaderTest, TestNextBatchWithDictionary) {
     check_result(false);
 }
 
+TEST_F(ParquetFileBatchReaderTest, TestNestedStructChildProjectionRecall) {
+    auto f0 = arrow::field("f0", arrow::int32());
+    auto f1 = arrow::field(
+        "f1", arrow::struct_({arrow::field("c0", arrow::int64()), arrow::field("c1", arrow::utf8()),
+                              arrow::field("c2", arrow::float64())}));
+    auto f2 = arrow::field("f2", arrow::utf8());
+
+    auto write_schema = arrow::schema({f0, f1, f2});
+    auto write_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(write_schema->fields()), R"([
+        [1, [100, "a", 1.1], "x"],
+        [2, [200, "b", 2.2], "y"],
+        [3, [300, null, 3.3], "z"]
+    ])")
+            .ValueOrDie());
+
+    WriteArray(file_path_, write_array, write_schema,
+               /*write_batch_size=*/write_array->length(),
+               /*enable_dictionary=*/false, /*max_row_group_length=*/write_array->length());
+
+    auto read_schema = MakeReadSchema({
+        f0,
+        arrow::field("f1", arrow::struct_({arrow::field("c1", arrow::utf8())})),
+    });
+
+    auto parquet_batch_reader =
+        PrepareParquetFileBatchReader(file_path_, read_schema, /*predicate=*/nullptr,
+                                      /*selection_bitmap=*/std::nullopt, /*batch_size=*/2);
+
+    ASSERT_OK_AND_ASSIGN(auto result_array, paimon::test::ReadResultCollector::CollectResult(
+                                                parquet_batch_reader.get()));
+
+    std::shared_ptr<arrow::ChunkedArray> expected_array;
+    ASSERT_TRUE(arrow::ipc::internal::json::ChunkedArrayFromJSON(
+                    arrow::struct_(read_schema->fields()), {R"([
+        [1, ["a"]],
+        [2, ["b"]],
+        [3, [null]]
+    ])"},
+                    &expected_array)
+                    .ok());
+
+    ASSERT_TRUE(result_array->Equals(expected_array))
+        << "expected: " << expected_array->ToString() << "\nactual: " << result_array->ToString();
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestReadSchemaWithMapSelectedKeysMetadata) {
+    auto id_field = arrow::field("id", arrow::int32());
+    auto map_field = arrow::field("m", arrow::map(arrow::utf8(), arrow::int32()));
+
+    auto write_schema = arrow::schema({id_field, map_field});
+    auto write_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(write_schema->fields()), R"([
+        [1, [["k1", 10], ["k2", 20], ["k3", 30]]],
+        [2, [["k2", 200]]],
+        [3, null]
+    ])")
+            .ValueOrDie());
+
+    WriteArray(file_path_, write_array, write_schema,
+               /*write_batch_size=*/write_array->length(),
+               /*enable_dictionary=*/false, /*max_row_group_length=*/write_array->length());
+
+    // selected-keys metadata is consumed by upper-level field mapping; format reader should
+    // still accept the schema and read data correctly.
+    auto read_schema = MakeReadSchema(
+        {id_field, WithMapSelectedKeys(map_field, "k1,k3")});  // NOLINT(whitespace/comma)
+
+    auto parquet_batch_reader =
+        PrepareParquetFileBatchReader(file_path_, read_schema, /*predicate=*/nullptr,
+                                      /*selection_bitmap=*/std::nullopt, /*batch_size=*/2);
+
+    ASSERT_OK_AND_ASSIGN(auto result_array, paimon::test::ReadResultCollector::CollectResult(
+                                                parquet_batch_reader.get()));
+    auto expected_array = arrow::ChunkedArray::Make({write_array}).ValueOrDie();
+    ASSERT_TRUE(result_array->Equals(expected_array))
+        << "expected: " << expected_array->ToString() << "\nactual: " << result_array->ToString();
+}
+
 TEST_F(ParquetFileBatchReaderTest, TestGetFileSchemaWithFieldId) {
     std::string file_name = paimon::test::GetDataDir() +
                             "parquet/parquet_append_table.db/parquet_append_table/bucket-0/"
@@ -397,7 +705,9 @@ TEST_F(ParquetFileBatchReaderTest, TestCreateArrowReaderProperties) {
         ASSERT_EQ(arrow_reader_properties.batch_size(), 1024);
         ASSERT_EQ(arrow_reader_properties.use_threads(), true);
         ASSERT_EQ(arrow::GetCpuThreadPoolCapacity(), 3);
-        ASSERT_EQ(arrow_reader_properties.cache_options(), arrow::io::CacheOptions::Defaults());
+        auto expected_cache_options = arrow::io::CacheOptions::Defaults();
+        expected_cache_options.hole_size_limit = DEFAULT_PARQUET_READ_CACHE_OPTION_HOLE_SIZE_LIMIT;
+        ASSERT_EQ(arrow_reader_properties.cache_options(), expected_cache_options);
     }
     {
         std::map<std::string, std::string> options = {{PARQUET_READ_EXECUTOR_THREAD_COUNT, "0"}};
@@ -416,9 +726,43 @@ TEST_F(ParquetFileBatchReaderTest, TestCreateArrowReaderProperties) {
         ASSERT_EQ(arrow_reader_properties.use_threads(), true);
         ASSERT_EQ(arrow::GetCpuThreadPoolCapacity(), 6);
     }
+    {
+        std::map<std::string, std::string> options = {
+            {PARQUET_READ_CACHE_OPTION_LAZY, "true"},
+            {PARQUET_READ_CACHE_OPTION_PREFETCH_LIMIT, "2"},
+            {PARQUET_READ_CACHE_OPTION_HOLE_SIZE_LIMIT, "1048576"},
+            {PARQUET_READ_CACHE_OPTION_RANGE_SIZE_LIMIT, "8388608"},
+        };
+        ASSERT_OK_AND_ASSIGN(
+            auto arrow_reader_properties,
+            ParquetFileBatchReader::CreateArrowReaderProperties(pool_, options, 1024));
+        const auto& cache_options = arrow_reader_properties.cache_options();
+        ASSERT_TRUE(cache_options.lazy);
+        ASSERT_EQ(cache_options.prefetch_limit, 2);
+        ASSERT_EQ(cache_options.hole_size_limit, 1024 * 1024);
+        ASSERT_EQ(cache_options.range_size_limit, 8 * 1024 * 1024);
+    }
+    {
+        std::map<std::string, std::string> options = {
+            {PARQUET_READ_CACHE_OPTION_HOLE_SIZE_LIMIT, "-1"},
+        };
+        ASSERT_NOK_WITH_MSG(
+            ParquetFileBatchReader::CreateArrowReaderProperties(pool_, options, 1024),
+            "parquet.read.cache-option.hole-size-limit must be non-negative");
+    }
+    {
+        std::map<std::string, std::string> options = {
+            {PARQUET_READ_CACHE_OPTION_HOLE_SIZE_LIMIT, "1048576"},
+            {PARQUET_READ_CACHE_OPTION_RANGE_SIZE_LIMIT, "1048576"},
+        };
+        ASSERT_NOK_WITH_MSG(
+            ParquetFileBatchReader::CreateArrowReaderProperties(pool_, options, 1024),
+            "parquet.read.cache-option.range-size-limit must be greater than "
+            "parquet.read.cache-option.hole-size-limit");
+    }
 }
 
-TEST_F(ParquetFileBatchReaderTest, TestBitmapPushDownWithMultiRowGroups) {
+TEST_F(ParquetFileBatchReaderTest, TestBitmapRowGroupPushDownWithMultiRowGroups) {
     arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
     auto arrow_type = arrow::struct_(fields);
     auto src_array = std::dynamic_pointer_cast<arrow::StructArray>(
@@ -456,8 +800,47 @@ TEST_F(ParquetFileBatchReaderTest, TestBitmapPushDownWithMultiRowGroups) {
     auto expected_array = arrow::ChunkedArray::Make({src_array->Slice(0, 6)}).ValueOrDie();
     ASSERT_TRUE(result_array->Equals(expected_array)) << result_array->ToString();
 }
+TEST_F(ParquetFileBatchReaderTest, TestBitmapPagePushDownWithMultiRowGroups) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
+    auto arrow_type = arrow::struct_(fields);
+    auto src_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow_type, R"([
+        [0],
+        [1],
+        [2],
+        [3],
+        [4],
+        [5],
+        [6],
+        [7],
+        [8],
+        [9],
+        [10],
+        [11]
+    ])")
+            .ValueOrDie());
+    auto src_schema = arrow::schema(fields);
+    std::optional<RoaringBitmap32> bitmap = RoaringBitmap32::From({3, 5});
+    // data in file rowGroup0:[0, 1, 2, 3, 4, 5] | rowGroup1:[6, 7, 8, 9, 10, 11]
 
-TEST_F(ParquetFileBatchReaderTest, TestPredicateAndBitmapPushDown) {
+    auto arrow_schema = arrow::schema(fields);
+    WriteArray(file_path_, src_array, arrow_schema, /*write_batch_size=*/12,
+               /*enable_dictionary=*/true,
+               /*max_row_group_length=*/6);
+
+    auto parquet_batch_reader =
+        PrepareParquetFileBatchReader(file_path_, arrow_schema, /*predicate=*/nullptr, bitmap,
+                                      /*batch_size=*/12, /*enable_page_level_filter=*/true);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> result_array,
+        paimon::test::ReadResultCollector::CollectResult(parquet_batch_reader.get()));
+
+    auto expected_array = arrow::ChunkedArray(src_array->Slice(3, 3));
+    ASSERT_TRUE(result_array->Equals(expected_array)) << result_array->ToString();
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestPredicateAndBitmapRowGroupPushDown) {
     arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
     auto arrow_type = arrow::struct_(fields);
     arrow::StructBuilder struct_builder(arrow_type, arrow::default_memory_pool(),
@@ -514,6 +897,65 @@ TEST_F(ParquetFileBatchReaderTest, TestPredicateAndBitmapPushDown) {
         ASSERT_FALSE(result_array);
     }
 }
+TEST_F(ParquetFileBatchReaderTest, TestPredicateAndBitmapPagePushDown) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
+    auto arrow_type = arrow::struct_(fields);
+    arrow::StructBuilder struct_builder(arrow_type, arrow::default_memory_pool(),
+                                        {std::make_shared<arrow::Int32Builder>()});
+    auto int_builder = static_cast<arrow::Int32Builder*>(struct_builder.field_builder(0));
+    int32_t length = 1024;
+    for (int32_t i = 0; i < length; ++i) {
+        ASSERT_TRUE(struct_builder.Append().ok());
+        ASSERT_TRUE(int_builder->Append(i).ok());
+    }
+    // data file:
+    // rowGroup0: [0, 256)
+    // rowGroup1: [256, 512)
+    // rowGroup2: [512, 768)
+    // rowGroup3: [768, 1024)
+    std::shared_ptr<arrow::Array> src_array;
+    ASSERT_TRUE(struct_builder.Finish(&src_array).ok());
+    auto src_schema = arrow::schema(fields);
+    auto arrow_schema = arrow::schema(fields);
+    WriteArray(file_path_, src_array, arrow_schema, /*write_batch_size=*/1024,
+               /*enable_dictionary=*/true,
+               /*max_row_group_length=*/256);
+    {
+        // simple case
+        std::optional<RoaringBitmap32> bitmap = RoaringBitmap32::From({100, 400, 600});
+        ASSERT_OK_AND_ASSIGN(
+            auto predicate,
+            PredicateBuilder::Or(
+                {PredicateBuilder::LessThan(/*field_index=*/0, /*field_name=*/"f0", FieldType::INT,
+                                            Literal(255)),
+                 PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"f0",
+                                               FieldType::INT, Literal(600))}));
+        auto parquet_batch_reader =
+            PrepareParquetFileBatchReader(file_path_, arrow_schema, predicate, bitmap,
+                                          /*batch_size=*/length, /*enable_page_level_filter=*/true);
+        ASSERT_OK_AND_ASSIGN(
+            std::shared_ptr<arrow::ChunkedArray> result_array,
+            paimon::test::ReadResultCollector::CollectResult(parquet_batch_reader.get()));
+
+        auto expected_array =
+            arrow::ChunkedArray::Make({src_array->Slice(100, 1), src_array->Slice(600, 1)})
+                .ValueOrDie();
+        ASSERT_TRUE(result_array->Equals(expected_array)) << result_array->ToString();
+    }
+    {
+        // test all data has been filtered out with predicate and bitmap pushdown
+        std::optional<RoaringBitmap32> bitmap = RoaringBitmap32::From({100, 400, 600});
+        auto predicate = PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"f0",
+                                                       FieldType::INT, Literal(800));
+        auto parquet_batch_reader =
+            PrepareParquetFileBatchReader(file_path_, arrow_schema, predicate, bitmap,
+                                          /*batch_size=*/length, /*enable_page_level_filter=*/true);
+        ASSERT_OK_AND_ASSIGN(
+            std::shared_ptr<arrow::ChunkedArray> result_array,
+            paimon::test::ReadResultCollector::CollectResult(parquet_batch_reader.get()));
+        ASSERT_FALSE(result_array);
+    }
+}
 
 TEST_F(ParquetFileBatchReaderTest, TestReadNoField) {
     // if only read partition fields, format reader will set empty read schema
@@ -526,20 +968,19 @@ TEST_F(ParquetFileBatchReaderTest, TestReadNoField) {
         PrepareParquetFileBatchReader(file_name, read_schema, /*predicate=*/nullptr,
                                       /*selection_bitmap=*/std::nullopt, /*batch_size=*/2);
     // read 2 rows
-    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(),
-              std::numeric_limits<uint64_t>::max());
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
     ASSERT_OK_AND_ASSIGN(auto batch1, parquet_batch_reader->NextBatch());
-    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(), 0);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 0);
     //  read 2 rows
     ASSERT_OK_AND_ASSIGN(auto batch2, parquet_batch_reader->NextBatch());
-    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(), 2);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 2);
     // read 2 rows
     ASSERT_OK_AND_ASSIGN(auto batch3, parquet_batch_reader->NextBatch());
-    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(), 4);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 4);
     // read rows with eof
     ASSERT_OK_AND_ASSIGN(auto batch4, parquet_batch_reader->NextBatch());
-    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFirstRowNumber().value(), 6);
     ASSERT_TRUE(BatchReader::IsEofBatch(batch4));
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
     parquet_batch_reader->Close();
 
     arrow::FieldVector fields;
@@ -642,5 +1083,242 @@ TEST_P(ParquetFileBatchReaderTest, TestTimestampType) {
 }
 
 INSTANTIATE_TEST_SUITE_P(TestParam, ParquetFileBatchReaderTest, ::testing::Values(false, true));
+
+TEST_F(ParquetFileBatchReaderTest, TestAddMetadataPerFieldMetadata) {
+    // Write a simple parquet file, call AddMetadata to inject per-field metadata
+    // before Finish, then read back and verify the file schema carries the metadata.
+    auto write_schema = arrow::schema({
+        arrow::field("id", arrow::int32()),
+        arrow::field("name", arrow::utf8()),
+        arrow::field("score", arrow::float64()),
+    });
+
+    std::string file_path = PathUtil::JoinPath(dir_->Str(), "update_schema_test.parquet");
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> out,
+                         fs_->Create(file_path, /*overwrite=*/true));
+
+    ::parquet::WriterProperties::Builder builder;
+    builder.write_batch_size(10);
+    auto writer_properties = builder.build();
+    ASSERT_OK_AND_ASSIGN(auto format_writer,
+                         ParquetFormatWriter::Create(out, write_schema, writer_properties,
+                                                     DEFAULT_PARQUET_WRITER_MAX_MEMORY_USE, pool_));
+
+    // Write one batch of data.
+    auto data = arrow::ipc::internal::json::ArrayFromJSON(
+                    arrow::struct_(write_schema->fields()),
+                    R"([[1, "alice", 95.5], [2, "bob", 88.0], [3, "charlie", 72.3]])")
+                    .ValueOrDie();
+    ArrowArray c_array;
+    ASSERT_TRUE(arrow::ExportArray(*data, &c_array).ok());
+    ASSERT_OK(format_writer->AddBatch(&c_array));
+    ASSERT_OK(format_writer->Flush());
+
+    // Build an updated schema with per-field metadata on "name" and "score".
+    auto name_meta = std::make_shared<arrow::KeyValueMetadata>();
+    name_meta->Append("shredding.field_mapping", "0:alice,1:bob,2:charlie");
+    name_meta->Append("shredding.num_columns", "3");
+    auto score_meta = std::make_shared<arrow::KeyValueMetadata>();
+    score_meta->Append("custom.unit", "percent");
+
+    auto updated_schema = arrow::schema({
+        write_schema->field(0),                            // id — no metadata
+        write_schema->field(1)->WithMetadata(name_meta),   // name — shredding metadata
+        write_schema->field(2)->WithMetadata(score_meta),  // score — custom metadata
+    });
+
+    // AddMetadata must be called before Finish.
+    ASSERT_OK(format_writer->AddMetadata(
+        {{ArrowUtils::kArrowSchemaMetadataKey, SerializeSchemaToString(updated_schema)}}));
+    ASSERT_OK(format_writer->Finish());
+    ASSERT_OK(out->Flush());
+    ASSERT_OK(out->Close());
+
+    // Read back: GetFileSchema should reflect the updated per-field metadata.
+    auto parquet_batch_reader =
+        PrepareParquetFileBatchReader(file_path, write_schema, /*predicate=*/nullptr,
+                                      /*selection_bitmap=*/std::nullopt, batch_size_);
+
+    ASSERT_OK_AND_ASSIGN(auto c_file_schema, parquet_batch_reader->GetFileSchema());
+    auto file_schema = arrow::ImportSchema(c_file_schema.get()).ValueOrDie();
+
+    // Field 0 "id": no metadata.
+    ASSERT_EQ("id", file_schema->field(0)->name());
+
+    // Field 1 "name": should have the shredding metadata we set.
+    ASSERT_EQ("name", file_schema->field(1)->name());
+    auto read_name_meta = file_schema->field(1)->metadata();
+    ASSERT_NE(nullptr, read_name_meta);
+    auto field_mapping_val = read_name_meta->Get("shredding.field_mapping").ValueOrDie();
+    ASSERT_EQ("0:alice,1:bob,2:charlie", field_mapping_val);
+    auto num_columns_val = read_name_meta->Get("shredding.num_columns").ValueOrDie();
+    ASSERT_EQ("3", num_columns_val);
+
+    // Field 2 "score": should have the custom metadata.
+    ASSERT_EQ("score", file_schema->field(2)->name());
+    auto read_score_meta = file_schema->field(2)->metadata();
+    ASSERT_NE(nullptr, read_score_meta);
+    auto unit_val = read_score_meta->Get("custom.unit").ValueOrDie();
+    ASSERT_EQ("percent", unit_val);
+
+    // Also verify data integrity — read it back and compare content.
+    ASSERT_OK_AND_ASSIGN(auto result_array, paimon::test::ReadResultCollector::CollectResult(
+                                                parquet_batch_reader.get()));
+    ASSERT_EQ(result_array->num_chunks(), 1);
+    ASSERT_TRUE(data->Equals(*result_array->chunk(0))) << result_array->ToString();
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestRowMappingSimple) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
+    auto src_array = MakeSequentialIntData(12);
+    // data in file rowGroup0:[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+    // one row per page
+    auto arrow_schema = arrow::schema(fields);
+    WriteArray(file_path_, src_array, arrow_schema, /*write_batch_size=*/1,
+               /*enable_dictionary=*/true, /*max_row_group_length=*/12, /*max_page_size=*/1);
+
+    // 1<=f0<=3 || 5<=f0<=6
+    ASSERT_OK_AND_ASSIGN(
+        auto predicate,
+        PredicateBuilder::Or({PredicateBuilder::Between(/*field_index=*/0, /*field_name=*/"f0",
+                                                        FieldType::INT, Literal(1), Literal(3)),
+                              PredicateBuilder::Between(/*field_index=*/0, /*field_name=*/"f0",
+                                                        FieldType::INT, Literal(5), Literal(6))}));
+
+    auto parquet_batch_reader = PrepareParquetFileBatchReader(
+        file_path_, arrow_schema, /*predicate=*/predicate, std::nullopt, /*batch_size=*/2,
+        /*enable_page_level_filter=*/true);
+
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch1,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    auto expected_batch1 = src_array->Slice(1, 2);
+    ASSERT_TRUE(batch1->chunk(0)->Equals(expected_batch1)) << batch1->ToString();
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 1);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(1).value(), 2);
+    // out of bound return invalid
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(2));
+
+    // Not adjacent pages
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch2,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    auto expected_batch2 = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+[3],
+[5]
+    ])")
+            .ValueOrDie());
+    ASSERT_TRUE(batch2->chunk(0)->Equals(expected_batch2)) << batch2->ToString();
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 3);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(1).value(), 5);
+
+    // Only one record read
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch3,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    auto expected_batch3 = src_array->Slice(6, 1);
+    ASSERT_TRUE(batch3->chunk(0)->Equals(expected_batch3)) << batch3->ToString();
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 6);
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(1));
+
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> eof_batch,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    ASSERT_EQ(nullptr, eof_batch);
+    // previous batch is eof, return invalid.
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestRowMappingFullyAndPartially) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
+    auto src_array = MakeSequentialIntData(12);
+    // data in file RowGroup0:[0, 1, 2] | RowGroup1:[3, 4, 5] | RowGroup2:[6, 7, 8] | RowGroup3:[9,
+    // 10, 11] one row per page
+    auto arrow_schema = arrow::schema(fields);
+    WriteArray(file_path_, src_array, arrow_schema, /*write_batch_size=*/1,
+               /*enable_dictionary=*/true, /*max_row_group_length=*/3, /*max_page_size=*/1);
+
+    // 3<=f0<=5 || f0==6 || f0==8
+    // RowGroup 1 is fully matched, RowGroup 2 is partially matched, RowGroup 0 and RowGroup 3 are
+    // not matched.
+    ASSERT_OK_AND_ASSIGN(
+        auto predicate,
+        PredicateBuilder::Or({PredicateBuilder::Between(/*field_index=*/0, /*field_name=*/"f0",
+                                                        FieldType::INT, Literal(3), Literal(5)),
+                              PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f0",
+                                                      FieldType::INT, Literal(6)),
+                              PredicateBuilder::Equal(/*field_index=*/0, /*field_name=*/"f0",
+                                                      FieldType::INT, Literal(8))}));
+
+    auto parquet_batch_reader = PrepareParquetFileBatchReader(
+        file_path_, arrow_schema, /*predicate=*/predicate, std::nullopt, /*batch_size=*/3,
+        /*enable_page_level_filter=*/true);
+
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch1,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 3);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(2).value(), 5);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch2,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 6);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(1).value(), 8);
+}
+
+TEST_F(ParquetFileBatchReaderTest, TestRowMappingSetReadSchemaTwice) {
+    arrow::FieldVector fields = {arrow::field("f0", arrow::int32())};
+    auto src_array = MakeSequentialIntData(12);
+    // data in file RowGroup0:[0, 1, 2] | RowGroup1:[3, 4, 5] | RowGroup2:[6, 7, 8] | RowGroup3:[9,
+    // 10, 11] one row per page
+    auto arrow_schema = arrow::schema(fields);
+    WriteArray(file_path_, src_array, arrow_schema, /*write_batch_size=*/1,
+               /*enable_dictionary=*/true, /*max_row_group_length=*/3, /*max_page_size=*/1);
+
+    // 1<=f0<=3 || 6<=f0<=7
+    ASSERT_OK_AND_ASSIGN(
+        auto predicate,
+        PredicateBuilder::Or({PredicateBuilder::Between(/*field_index=*/0, /*field_name=*/"f0",
+                                                        FieldType::INT, Literal(1), Literal(3)),
+                              PredicateBuilder::Between(/*field_index=*/0, /*field_name=*/"f0",
+                                                        FieldType::INT, Literal(6), Literal(7))}));
+
+    auto parquet_batch_reader = PrepareParquetFileBatchReader(
+        file_path_, arrow_schema, /*predicate=*/predicate, std::nullopt, /*batch_size=*/3,
+        /*enable_page_level_filter=*/true);
+
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch1,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 1);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(1).value(), 2);
+
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch2,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 3);
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(1));
+
+    ASSERT_OK_AND_ASSIGN(
+        predicate,
+        PredicateBuilder::Or({PredicateBuilder::Between(/*field_index=*/0, /*field_name=*/"f0",
+                                                        FieldType::INT, Literal(3), Literal(5))}));
+
+    std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*arrow_schema, c_schema.get()).ok());
+    ASSERT_OK(
+        parquet_batch_reader->SetReadSchema(c_schema.get(), /*predicate=*/predicate, std::nullopt));
+    ASSERT_NOK(parquet_batch_reader->GetPreviousBatchFileRowId(0));
+    ASSERT_OK_AND_ASSIGN(
+        std::shared_ptr<arrow::ChunkedArray> batch3,
+        paimon::test::ReadResultCollector::CollectResultOneBatch(parquet_batch_reader.get()));
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(0).value(), 3);
+    ASSERT_EQ(parquet_batch_reader->GetPreviousBatchFileRowId(2).value(), 5);
+}
 
 }  // namespace paimon::parquet::test

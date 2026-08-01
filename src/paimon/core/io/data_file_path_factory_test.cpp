@@ -24,6 +24,7 @@
 #include "gtest/gtest.h"
 #include "paimon/common/data/binary_row.h"
 #include "paimon/common/fs/external_path_provider.h"
+#include "paimon/common/utils/string_utils.h"
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/manifest/file_source.h"
 #include "paimon/core/stats/simple_stats.h"

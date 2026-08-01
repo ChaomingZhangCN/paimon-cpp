@@ -19,6 +19,8 @@
 
 #include "paimon/common/reader/data_evolution_file_reader.h"
 
+#include "arrow/array/array_nested.h"
+#include "arrow/array/util.h"
 #include "arrow/c/abi.h"
 #include "arrow/c/bridge.h"
 #include "fmt/format.h"
@@ -26,7 +28,9 @@
 #include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+
 namespace paimon {
+
 Result<std::unique_ptr<DataEvolutionFileReader>> DataEvolutionFileReader::Create(
     std::vector<std::unique_ptr<BatchReader>>&& readers,
     const std::shared_ptr<arrow::Schema>& read_schema, int32_t read_batch_size,
@@ -40,8 +44,13 @@ Result<std::unique_ptr<DataEvolutionFileReader>> DataEvolutionFileReader::Create
         return Status::Invalid(
             "read schema, row offsets and field offsets must have the same size");
     }
-    if (readers.size() <= 1) {
-        return Status::Invalid("readers size is supposed to be more than 1");
+    if (readers.empty()) {
+        return Status::Invalid("readers must not be empty");
+    }
+    for (int32_t reader_offset : reader_offsets) {
+        if (reader_offset >= static_cast<int32_t>(readers.size())) {
+            return Status::Invalid("reader offset is out of range of readers");
+        }
     }
     return std::unique_ptr<DataEvolutionFileReader>(
         new DataEvolutionFileReader(std::move(readers), read_schema, read_batch_size,
@@ -84,6 +93,7 @@ Result<BatchReader::ReadBatchWithBitmap> DataEvolutionFileReader::NextBatchWithB
         }
         const auto& sub_array = array_for_each_reader[reader_offsets_[i]];
         assert(sub_array->num_fields() > field_offsets_[i]);
+        // Each file is already aligned to its read schema by its FieldMappingReader.
         target_sub_array_vec.push_back(sub_array->field(field_offsets_[i]));
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
@@ -168,11 +178,10 @@ Result<std::shared_ptr<arrow::Array>> DataEvolutionFileReader::NextBatchForSingl
     if (concat_array_vec.empty()) {
         return std::shared_ptr<arrow::Array>();
     }
-    if (concat_array_vec.size() == 1) {
-        // avoid data copy
+    if (concat_array_vec.size() == 1 && concat_array_vec[0]->offset() == 0) {
+        // Avoid data copy when the array is already normalized.
         return concat_array_vec[0];
     }
-    // TODO(xinyu.lxy) remove data copy for efficiency
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Array> concat_array,
                                       arrow::Concatenate(concat_array_vec, arrow_pool_.get()));
     assert(concat_array->length() == total_array_length);

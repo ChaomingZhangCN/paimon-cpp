@@ -18,7 +18,9 @@
 
 #include "paimon/fs/jindo/jindo_file_system.h"
 
+#include <atomic>
 #include <cassert>
+#include <string_view>
 #include <utility>
 
 #include "JdoFileInfo.hpp"    // NOLINT(build/include_subdir)
@@ -27,6 +29,8 @@
 #include "JdoStatus.hpp"      // NOLINT(build/include_subdir)
 #include "fmt/format.h"
 #include "jdo_error.h"  // NOLINT(build/include_subdir)
+#include "paimon/common/utils/math.h"
+#include "paimon/common/utils/path_util.h"
 #include "paimon/fs/jindo/jindo_file_status.h"
 #include "paimon/fs/jindo/jindo_utils.h"
 
@@ -53,6 +57,29 @@ class JindoFileSystemImpl {
     std::unique_ptr<JdoFileSystem> fs_;
 };
 
+namespace {
+
+class AsyncReadState {
+ public:
+    explicit AsyncReadState(std::function<void(Status)>&& callback)
+        : callback_(std::move(callback)) {}
+
+    void Complete(JdoStatus status) {
+        if (completed_.exchange(true)) {
+            return;
+        }
+        callback_(status.ok() ? Status::OK() : Status::IOError(status.errMsg()));
+    }
+
+    std::string_view result;
+
+ private:
+    std::atomic<bool> completed_{false};
+    std::function<void(Status)> callback_;
+};
+
+}  // namespace
+
 JindoFileSystem::JindoFileSystem(std::unique_ptr<JdoFileSystem>&& fs)
     : impl_(std::make_shared<JindoFileSystemImpl>(std::move(fs))) {}
 
@@ -69,6 +96,18 @@ Result<std::unique_ptr<OutputStream>> JindoFileSystem::Create(const std::string&
         return Status::Invalid(
             fmt::format("do not allow overwrite, but the file {} already exists", path));
     }
+    const std::string parent_path = PathUtil::GetParentDirPath(path);
+    if (!parent_path.empty()) {
+        PAIMON_ASSIGN_OR_RAISE(Path parent, PathUtil::ToPath(parent_path));
+        // Do not issue mkdir for scheme-only or authority-only URI parents.
+        if (!parent.path.empty()) {
+            PAIMON_RETURN_NOT_OK(Mkdirs(parent_path));
+        }
+    }
+    return OpenWriter(path);
+}
+
+Result<std::unique_ptr<OutputStream>> JindoFileSystem::OpenWriter(const std::string& path) const {
     std::unique_ptr<JdoWriter> writer;
     PAIMON_RETURN_NOT_OK_FROM_JINDO(impl_->GetFileSystem()->openWriter(path, &writer));
     return std::make_unique<JindoOutputStream>(impl_, std::move(writer));
@@ -192,7 +231,7 @@ Status JindoInputStream::Seek(int64_t offset, SeekOrigin origin) {
         PAIMON_ASSIGN_OR_RAISE(int64_t pos, GetPos());
         PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->seek(offset + pos));
     } else if (origin == FS_SEEK_END) {
-        PAIMON_ASSIGN_OR_RAISE(uint64_t len, Length());
+        PAIMON_ASSIGN_OR_RAISE(int64_t len, Length());
         PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->seek(len + offset));
     } else {
         return Status::Invalid("unsupported seek origin");
@@ -203,33 +242,55 @@ Status JindoInputStream::Seek(int64_t offset, SeekOrigin origin) {
 Result<int64_t> JindoInputStream::GetPos() const {
     int64_t pos = -1;
     PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->tell(pos));
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(pos, "jindo input position"));
     return pos;
 }
 
-Result<uint64_t> JindoInputStream::Length() const {
+Result<int64_t> JindoInputStream::Length() const {
     int64_t len = -1;
     PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->getFileLength(len));
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(len, "jindo input length"));
     return len;
 }
 
-Result<int32_t> JindoInputStream::Read(char* buffer, uint32_t size) {
-    PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->read(size, &result_, buffer));
-    return result_.length();
+Result<int64_t> JindoInputStream::Read(char* buffer, int64_t size) {
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(size, "read length"));
+    std::string_view result;
+    PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->read(size, &result, buffer));
+    return result.length();
 }
 
-Result<int32_t> JindoInputStream::Read(char* buffer, uint32_t size, uint64_t offset) {
-    PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->pread(offset, size, &result_, buffer));
-    return result_.length();
+Result<int64_t> JindoInputStream::Read(char* buffer, int64_t size, int64_t offset) {
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(size, "read length"));
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(offset, "read offset"));
+    std::string_view result;
+    PAIMON_RETURN_NOT_OK_FROM_JINDO(reader_->pread(offset, size, &result, buffer));
+    return result.length();
 }
 
-void JindoInputStream::ReadAsync(char* buffer, uint32_t size, uint64_t offset,
+void JindoInputStream::ReadAsync(char* buffer, int64_t size, int64_t offset,
                                  std::function<void(Status)>&& callback) {
-    auto outer_callback = [=](JdoStatus status) {
-        callback(status.ok() ? Status::OK() : Status::IOError(status.errMsg()));
-    };
-    auto task = reader_->preadAsync(offset, size, &result_, buffer, outer_callback);
+    Status validate_status = ValidateValueNonNegative(size, "read length");
+    if (!validate_status.ok()) {
+        callback(validate_status);
+        return;
+    }
+    validate_status = ValidateValueNonNegative(offset, "read offset");
+    if (!validate_status.ok()) {
+        callback(validate_status);
+        return;
+    }
+    std::shared_ptr<AsyncReadState> state = std::make_shared<AsyncReadState>(std::move(callback));
+    auto task = reader_->preadAsync(offset, size, &state->result, buffer,
+                                    [state](JdoStatus status) { state->Complete(status); });
     assert(task);
-    auto status = task->perform();
+
+    auto perform_status = task->perform();
+    if (!perform_status.ok()) {
+        state->Complete(perform_status);
+        [[maybe_unused]] auto status = task->cancel();
+        return;
+    }
 }
 
 Status JindoInputStream::Close() {
@@ -250,10 +311,12 @@ JindoOutputStream::JindoOutputStream(const std::shared_ptr<JindoFileSystemImpl>&
 Result<int64_t> JindoOutputStream::GetPos() const {
     int64_t pos = -1;
     PAIMON_RETURN_NOT_OK_FROM_JINDO(writer_->tell(pos));
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(pos, "jindo output position"));
     return pos;
 }
 
-Result<int32_t> JindoOutputStream::Write(const char* buffer, uint32_t size) {
+Result<int64_t> JindoOutputStream::Write(const char* buffer, int64_t size) {
+    PAIMON_RETURN_NOT_OK(ValidateValueNonNegative(size, "write length"));
     std::string_view data(buffer, size);
     PAIMON_RETURN_NOT_OK_FROM_JINDO(writer_->write(data));
     return size;

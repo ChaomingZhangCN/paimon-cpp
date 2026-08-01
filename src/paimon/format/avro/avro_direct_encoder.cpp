@@ -224,7 +224,14 @@ Status AvroDirectEncoder::EncodeArrowToAvro(const ::avro::NodePtr& avro_node,
                 return Status::OK();
             }
 
-            // Handle regular BYTES
+            // Handle regular BYTES (binary or large_binary)
+            if (array.type()->id() == arrow::Type::LARGE_BINARY) {
+                const auto& large_binary_array =
+                    arrow::internal::checked_cast<const arrow::LargeBinaryArray&>(array);
+                std::string_view value = large_binary_array.GetView(row_index);
+                encoder->encodeBytes(reinterpret_cast<const uint8_t*>(value.data()), value.size());
+                return Status::OK();
+            }
             const auto& binary_array =
                 arrow::internal::checked_cast<const arrow::BinaryArray&>(array);
             std::string_view value = binary_array.GetView(row_index);
@@ -347,11 +354,11 @@ Status AvroDirectEncoder::EncodeArrowToAvro(const ::avro::NodePtr& avro_node,
                     return Status::Invalid(fmt::format("AVRO_MAP keys must be StringArray, got {}",
                                                        keys->type()->ToString()));
                 }
+                const auto& string_array =
+                    arrow::internal::checked_cast<const arrow::StringArray&>(*keys);
 
                 for (int64_t i = start; i < end; ++i) {
                     encoder->startItem();
-                    const auto& string_array =
-                        arrow::internal::checked_cast<const arrow::StringArray&>(*keys);
                     std::string_view key_value = string_array.GetView(i);
                     encoder->encodeString(std::string(key_value));
 

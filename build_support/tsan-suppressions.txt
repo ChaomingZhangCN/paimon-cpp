@@ -14,3 +14,7 @@
 # KIND, either express or implied.  See the License for the
 # specific language governing permissions and limitations
 # under the License.
+
+# Prebuilt shared libraries are not TSAN-instrumented. Suppress reports from the whole library.
+race:liblumina.so
+race:libjindosdk_c.so.6

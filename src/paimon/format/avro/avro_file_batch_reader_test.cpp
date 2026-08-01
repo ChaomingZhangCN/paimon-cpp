@@ -297,7 +297,39 @@ TEST_F(AvroFileBatchReaderTest, TestReadMapTypes) {
     ASSERT_TRUE(expected_array->Equals(result_array));
 }
 
-TEST_F(AvroFileBatchReaderTest, TestGetPreviousBatchFirstRowNumber) {
+TEST_F(AvroFileBatchReaderTest, TestSetReadSchemaRejectNestedSubFieldProjection) {
+    std::string path = PathUtil::JoinPath(dir_->Str(), "nested_projection_unsupported.avro");
+
+    arrow::FieldVector write_fields = {
+        arrow::field("f0", arrow::int32()),
+        arrow::field("f1", arrow::struct_({arrow::field("a", arrow::int32()),
+                                           arrow::field("b", arrow::utf8())}))};
+    auto write_type = arrow::struct_(write_fields);
+    auto write_array = arrow::ipc::internal::json::ArrayFromJSON(write_type, R"([
+            [1, [10, "x"]],
+            [2, [20, "y"]]
+        ])")
+                           .ValueOrDie();
+    WriteData(write_array, path, /*compression=*/"null");
+
+    ASSERT_OK_AND_ASSIGN(auto reader_builder,
+                         file_format_->CreateReaderBuilder(/*batch_size=*/1024));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(path));
+    ASSERT_OK_AND_ASSIGN(auto batch_reader, reader_builder->Build(in));
+
+    arrow::FieldVector read_fields = {
+        arrow::field("f0", arrow::int32()),
+        arrow::field("f1", arrow::struct_({arrow::field("a", arrow::int32())}))};
+    auto read_schema = arrow::schema(read_fields);
+    std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*read_schema, c_schema.get()).ok());
+
+    ASSERT_NOK_WITH_MSG(batch_reader->SetReadSchema(c_schema.get(), /*predicate=*/nullptr,
+                                                    /*selection_bitmap=*/std::nullopt),
+                        "does not support nested sub-field projection");
+}
+
+TEST_F(AvroFileBatchReaderTest, TestGetPreviousBatchFileRowId) {
     std::string path = paimon::test::GetDataDir() +
                        "/avro/append_simple.db/"
                        "append_simple/bucket-0/"
@@ -322,27 +354,74 @@ TEST_F(AvroFileBatchReaderTest, TestGetPreviousBatchFirstRowNumber) {
 
     ASSERT_OK_AND_ASSIGN(auto num_rows, reader->GetNumberOfRows());
     ASSERT_EQ(4, num_rows);
-    ASSERT_EQ(std::numeric_limits<uint64_t>::max(),
-              reader->GetPreviousBatchFirstRowNumber().value());
+    ASSERT_NOK(reader->GetPreviousBatchFileRowId(0));
     ASSERT_OK_AND_ASSIGN(auto batch1, reader->NextBatch());
     ArrowArrayRelease(batch1.first.get());
     ArrowSchemaRelease(batch1.second.get());
-    ASSERT_EQ(0, reader->GetPreviousBatchFirstRowNumber().value());
+    ASSERT_EQ(0, reader->GetPreviousBatchFileRowId(0).value());
     ASSERT_OK_AND_ASSIGN(auto batch2, reader->NextBatch());
-    ASSERT_EQ(1, reader->GetPreviousBatchFirstRowNumber().value());
+    ASSERT_EQ(1, reader->GetPreviousBatchFileRowId(0).value());
     ArrowArrayRelease(batch2.first.get());
     ArrowSchemaRelease(batch2.second.get());
     ASSERT_OK_AND_ASSIGN(auto batch3, reader->NextBatch());
-    ASSERT_EQ(2, reader->GetPreviousBatchFirstRowNumber().value());
+    ASSERT_EQ(2, reader->GetPreviousBatchFileRowId(0).value());
     ArrowArrayRelease(batch3.first.get());
     ArrowSchemaRelease(batch3.second.get());
     ASSERT_OK_AND_ASSIGN(auto batch4, reader->NextBatch());
-    ASSERT_EQ(3, reader->GetPreviousBatchFirstRowNumber().value());
+    ASSERT_EQ(3, reader->GetPreviousBatchFileRowId(0).value());
     ArrowArrayRelease(batch4.first.get());
     ArrowSchemaRelease(batch4.second.get());
     ASSERT_OK_AND_ASSIGN(auto batch5, reader->NextBatch());
-    ASSERT_EQ(4, reader->GetPreviousBatchFirstRowNumber().value());
+    ASSERT_NOK(reader->GetPreviousBatchFileRowId(0));
     ASSERT_TRUE(BatchReader::IsEofBatch(batch5));
+}
+
+TEST_F(AvroFileBatchReaderTest, TestSetReadSchemaResetsReaderToFirstRow) {
+    std::string file_path = PathUtil::JoinPath(dir_->Str(), "file.avro");
+
+    arrow::FieldVector fields = {
+        arrow::field("f0", arrow::int32()),
+        arrow::field("f1", arrow::int32()),
+    };
+    auto file_data_type = arrow::struct_(fields);
+    auto src_array = arrow::ipc::internal::json::ArrayFromJSON(file_data_type, R"([
+            [1, 10],
+            [2, 20],
+            [3, 30],
+            [4, 40]
+        ])")
+                         .ValueOrDie();
+    WriteData(src_array, file_path, /*compression=*/"null");
+
+    ASSERT_OK_AND_ASSIGN(auto reader_builder, file_format_->CreateReaderBuilder(/*batch_size=*/2));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(file_path));
+    ASSERT_OK_AND_ASSIGN(auto reader, reader_builder->Build(in));
+
+    ASSERT_OK_AND_ASSIGN(auto first_batch, reader->NextBatch());
+    ASSERT_EQ(0, reader->GetPreviousBatchFileRowId(0).value());
+    auto first_array =
+        arrow::ImportArray(first_batch.first.get(), first_batch.second.get()).ValueOrDie();
+    ASSERT_TRUE(first_array->Equals(src_array->Slice(0, 2))) << first_array->ToString();
+
+    auto read_schema = arrow::schema({arrow::field("f1", arrow::int32())});
+    std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
+    ASSERT_TRUE(arrow::ExportSchema(*read_schema, c_schema.get()).ok());
+    ASSERT_OK(reader->SetReadSchema(c_schema.get(), /*predicate=*/nullptr,
+                                    /*selection_bitmap=*/std::nullopt));
+    ASSERT_NOK(reader->GetPreviousBatchFileRowId(0));
+
+    ASSERT_OK_AND_ASSIGN(auto projected_batch, reader->NextBatch());
+    ASSERT_EQ(0, reader->GetPreviousBatchFileRowId(0).value());
+    auto projected_array =
+        arrow::ImportArray(projected_batch.first.get(), projected_batch.second.get()).ValueOrDie();
+    auto expected_projected_array = arrow::ipc::internal::json::ArrayFromJSON(
+                                        arrow::struct_({arrow::field("f1", arrow::int32())}),
+                                        R"([
+            [10],
+            [20]
+        ])")
+                                        .ValueOrDie();
+    ASSERT_TRUE(projected_array->Equals(expected_projected_array)) << projected_array->ToString();
 }
 
 TEST_F(AvroFileBatchReaderTest, TestGetNumberOfRows) {
@@ -403,6 +482,56 @@ TEST_F(AvroFileBatchReaderTest, TestGetNumberOfRows) {
         auto result_array = arrow::ChunkedArray(result_array_vector);
         ASSERT_TRUE(result_array.Equals(arrow::ChunkedArray(src_array)));
     }
+}
+
+TEST_F(AvroFileBatchReaderTest, TestReadBinaryWrittenFromBinaryAndLargeBinary) {
+    auto check_binary_read_result = [&](const std::shared_ptr<arrow::DataType>& write_type,
+                                        const std::string& file_name) {
+        std::string data_json = R"([
+            ["descriptor-1"],
+            [""],
+            [null],
+            ["descriptor-2"]
+        ])";
+        auto write_field = arrow::field("f0", write_type);
+        auto write_data_type = arrow::struct_({write_field});
+        auto write_array =
+            arrow::ipc::internal::json::ArrayFromJSON(write_data_type, data_json).ValueOrDie();
+
+        std::string file_path = PathUtil::JoinPath(dir_->Str(), file_name);
+        WriteData(write_array, file_path, /*compression=*/"null");
+
+        // Read back with binary schema
+        auto read_field = arrow::field("f0", arrow::binary());
+        auto read_data_type = arrow::struct_({read_field});
+
+        ASSERT_OK_AND_ASSIGN(auto reader_builder,
+                             file_format_->CreateReaderBuilder(/*batch_size=*/1024));
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(file_path));
+        ASSERT_OK_AND_ASSIGN(auto batch_reader, reader_builder->Build(in));
+
+        // Check GetFileSchema: regardless of write type, avro file schema is always binary
+        ASSERT_OK_AND_ASSIGN(auto c_file_schema, batch_reader->GetFileSchema());
+        auto file_schema = arrow::ImportSchema(c_file_schema.get()).ValueOrDie();
+        arrow::Schema expected_file_schema({read_field});
+        ASSERT_TRUE(file_schema->Equals(expected_file_schema));
+
+        auto read_schema = arrow::schema({read_field});
+        std::unique_ptr<ArrowSchema> c_schema = std::make_unique<ArrowSchema>();
+        ASSERT_TRUE(arrow::ExportSchema(*read_schema, c_schema.get()).ok());
+        EXPECT_OK(batch_reader->SetReadSchema(c_schema.get(), /*predicate=*/nullptr,
+                                              /*selection_bitmap=*/std::nullopt));
+
+        ASSERT_OK_AND_ASSIGN(auto result_array, ::paimon::test::ReadResultCollector::CollectResult(
+                                                    batch_reader.get()));
+        auto expected_array =
+            arrow::ipc::internal::json::ArrayFromJSON(read_data_type, data_json).ValueOrDie();
+        auto expected_chunked_array = std::make_shared<arrow::ChunkedArray>(expected_array);
+        ASSERT_TRUE(result_array->Equals(expected_chunked_array));
+    };
+
+    check_binary_read_result(arrow::binary(), "binary.avro");
+    check_binary_read_result(arrow::large_binary(), "large-binary.avro");
 }
 
 INSTANTIATE_TEST_SUITE_P(TestParam, AvroFileBatchReaderTest, ::testing::Values(false, true));

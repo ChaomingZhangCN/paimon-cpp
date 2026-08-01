@@ -51,10 +51,11 @@ class Metrics;
 
 class PostponeBucketWriter : public BatchWriter {
  public:
-    PostponeBucketWriter(const std::vector<std::string>& trimmed_primary_keys,
-                         const std::shared_ptr<DataFilePathFactory>& path_factory,
-                         int64_t schema_id, const std::shared_ptr<arrow::Schema>& value_schema,
-                         const CoreOptions& options, const std::shared_ptr<MemoryPool>& pool);
+    static Result<std::unique_ptr<PostponeBucketWriter>> Create(
+        const std::vector<std::string>& trimmed_primary_keys,
+        const std::shared_ptr<DataFilePathFactory>& path_factory, int64_t schema_id,
+        const std::shared_ptr<arrow::Schema>& value_schema, const CoreOptions& options,
+        const std::shared_ptr<MemoryPool>& pool);
 
     ~PostponeBucketWriter() override {
         [[maybe_unused]] auto status = DoClose();
@@ -121,8 +122,14 @@ class PostponeBucketWriter : public BatchWriter {
     Status Flush();
     Result<CommitIncrement> DrainIncrement();
 
-    std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>
+    Result<std::unique_ptr<RollingFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>>
     CreateRollingRowWriter() const;
+
+    PostponeBucketWriter(const std::vector<std::string>& trimmed_primary_keys,
+                         const std::shared_ptr<DataFilePathFactory>& path_factory,
+                         int64_t schema_id, const std::shared_ptr<arrow::Schema>& value_schema,
+                         const std::shared_ptr<arrow::Schema>& write_schema,
+                         const CoreOptions& options, const std::shared_ptr<MemoryPool>& pool);
 
  private:
     std::shared_ptr<MemoryPool> pool_;

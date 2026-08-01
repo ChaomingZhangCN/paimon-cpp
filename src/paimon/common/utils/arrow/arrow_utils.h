@@ -23,7 +23,6 @@
 
 #include "arrow/api.h"
 #include "arrow/util/type_fwd.h"
-#include "fmt/format.h"
 #include "paimon/result.h"
 
 namespace paimon {
@@ -32,6 +31,8 @@ class PAIMON_EXPORT ArrowUtils {
  public:
     ArrowUtils() = delete;
     ~ArrowUtils() = delete;
+
+    static const char* kArrowSchemaMetadataKey;
 
     static Result<std::shared_ptr<arrow::Schema>> DataTypeToSchema(
         const std::shared_ptr<arrow::DataType>& data_type);
@@ -49,6 +50,9 @@ class PAIMON_EXPORT ArrowUtils {
 
     static Result<std::shared_ptr<arrow::StructArray>> RemoveFieldFromStructArray(
         const std::shared_ptr<arrow::StructArray>& struct_array, const std::string& field_name);
+
+    static Result<std::shared_ptr<arrow::RecordBatch>> NormalizeRecordBatchOffsets(
+        const std::shared_ptr<arrow::RecordBatch>& record_batch, arrow::MemoryPool* pool);
 
     static bool EqualsIgnoreNullable(const std::shared_ptr<arrow::DataType>& type,
                                      const std::shared_ptr<arrow::DataType>& other_type);
