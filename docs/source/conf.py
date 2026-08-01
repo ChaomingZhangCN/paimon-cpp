@@ -32,8 +32,8 @@
 import os
 import datetime
 
-project = u'C++ Paimon'
-copyright = f'2024-{datetime.datetime.now().year} Apache Software Foundation'
+project = u'Apache Paimon C++'
+copyright = f'2026-{datetime.datetime.now().year} Apache Software Foundation'
 author = u'Apache Software Foundation'
 
 # -- General configuration ---------------------------------------------------
@@ -131,7 +131,7 @@ html_theme_options = {
         },
     ],
     "logo": {
-        "text": "Paimon C++",
+        "text": "Apache Paimon C++",
     },
     "show_version_warning_banner": True,
 }
@@ -143,6 +143,6 @@ html_context = {
     "doc_path": "docs/source",
 }
 
-html_title = f"C++ Paimon"
+html_title = "Apache Paimon C++"
 
 html_show_sourcelink = False
