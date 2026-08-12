@@ -50,6 +50,8 @@ enum class FieldType {
     STRUCT = 15,
     BLOB = 16,
     VARIANT = 17,
+    /// Fixed-length dense vector represented by Arrow FixedSizeList.
+    VECTOR = 18,
     UNKNOWN = 128,
 };
 

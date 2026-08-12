@@ -214,6 +214,23 @@ TEST(ArrowUtilsTest, TestCheckNullableMatchWithList) {
     }
 }
 
+TEST(ArrowUtilsTest, TestCheckNullableMatchRejectsNullVectorElement) {
+    auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
+    auto vector_field = arrow::field("embedding", vector_type);
+    arrow::FloatBuilder values_builder;
+    ASSERT_TRUE(values_builder.Append(1.0f).ok());
+    ASSERT_TRUE(values_builder.AppendNull().ok());
+    ASSERT_TRUE(values_builder.Append(3.0f).ok());
+    std::shared_ptr<arrow::Array> values = values_builder.Finish().ValueOrDie();
+    auto vector_data = arrow::ArrayData::Make(vector_type, 1, {nullptr}, {values->data()}, 0);
+    auto vector_array = arrow::MakeArray(vector_data);
+    auto struct_array = arrow::StructArray::Make({vector_array}, {vector_field}).ValueOrDie();
+
+    ASSERT_NOK_WITH_MSG(
+        ArrowUtils::CheckNullabilityMatch(arrow::schema({vector_field}), struct_array),
+        "VECTOR field embedding cannot contain null elements");
+}
+
 TEST(ArrowUtilsTest, TestCheckNullableMatchWithMap) {
     auto key_field = arrow::field("key", arrow::int32(), /*nullable=*/false);
     auto value_field = arrow::field("value", arrow::int32(), /*nullable=*/true);
@@ -448,6 +465,14 @@ TEST(ArrowUtilsTest, TestEqualsIgnoreNullable) {
         ASSERT_FALSE(ArrowUtils::EqualsIgnoreNullable(struct_type1, struct_type2));
         ASSERT_TRUE(ArrowUtils::EqualsIgnoreNullable(struct_type1, struct_type3));
         ASSERT_FALSE(ArrowUtils::EqualsIgnoreNullable(struct_type1, struct_type4));
+    }
+    {
+        auto vector3 = arrow::fixed_size_list(arrow::float32(), 3);
+        auto vector3_non_null =
+            arrow::fixed_size_list(arrow::field("item", arrow::float32(), false), 3);
+        auto vector5 = arrow::fixed_size_list(arrow::float32(), 5);
+        ASSERT_TRUE(ArrowUtils::EqualsIgnoreNullable(vector3, vector3_non_null));
+        ASSERT_FALSE(ArrowUtils::EqualsIgnoreNullable(vector3, vector5));
     }
     {
         // test complex

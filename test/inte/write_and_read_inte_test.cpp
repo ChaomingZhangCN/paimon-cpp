@@ -303,6 +303,66 @@ TEST_P(WriteAndReadInteTest, TestAppendSimple) {
     ASSERT_TRUE(success);
 }
 
+TEST_P(WriteAndReadInteTest, TestAppendVector) {
+    auto [file_format, file_system] = GetParam();
+    if (file_format != "parquet") {
+        return;
+    }
+
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
+                                 arrow::field("embedding", vector_type)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "avro"},  {Options::FILE_FORMAT, file_format},
+        {Options::TARGET_FILE_SIZE, "1024"}, {Options::BUCKET, "-1"},
+        {Options::FILE_SYSTEM, file_system},
+    };
+    if (file_system == "jindo") {
+        options = AddOptionsForJindo(options);
+    }
+    ASSERT_OK_AND_ASSIGN(auto helper,
+                         TestHelper::Create(test_dir_, arrow::schema(fields), /*partition_keys=*/{},
+                                            /*primary_keys=*/{}, options,
+                                            /*is_streaming_mode=*/false));
+    arrow::Int32Builder ids_builder;
+    ASSERT_TRUE(ids_builder.AppendValues({1, 2, 3}).ok());
+    std::shared_ptr<arrow::Array> ids;
+    ASSERT_TRUE(ids_builder.Finish(&ids).ok());
+    arrow::FloatBuilder values_builder;
+    ASSERT_TRUE(values_builder.AppendValues({1.0f, 2.0f, 3.0f}).ok());
+    ASSERT_TRUE(values_builder.AppendNulls(3).ok());
+    ASSERT_TRUE(values_builder.AppendValues({4.0f, 5.0f, 6.0f}).ok());
+    std::shared_ptr<arrow::Array> values;
+    ASSERT_TRUE(values_builder.Finish(&values).ok());
+    std::shared_ptr<arrow::Buffer> validity = arrow::Buffer::FromString(std::string("\x05", 1));
+    auto vectors =
+        arrow::MakeArray(arrow::ArrayData::Make(vector_type, 3, {validity}, {values->data()}, 1));
+    auto data = arrow::StructArray::Make({ids, vectors}, fields).ValueOrDie();
+    auto c_array = std::make_unique<ArrowArray>();
+    ASSERT_TRUE(arrow::ExportArray(*data, c_array.get()).ok());
+    RecordBatchBuilder batch_builder(c_array.get());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch, batch_builder.SetBucket(0).Finish());
+    ASSERT_OK_AND_ASSIGN(auto commit_messages,
+                         helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                                /*expected_commit_messages=*/std::nullopt));
+    (void)commit_messages;
+
+    arrow::FieldVector result_fields = fields;
+    result_fields.insert(result_fields.begin(), arrow::field("_VALUE_KIND", arrow::int8()));
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
+                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                         helper->ReadResult(data_splits));
+    auto row_kinds =
+        std::make_shared<arrow::Int8Array>(3, arrow::Buffer::FromString(std::string("\0\0\0", 3)));
+    arrow::Result<std::shared_ptr<arrow::StructArray>> expected_result =
+        arrow::StructArray::Make({row_kinds, ids, vectors}, result_fields);
+    ASSERT_TRUE(expected_result.ok()) << expected_result.status().ToString();
+    std::shared_ptr<arrow::StructArray> expected = std::move(expected_result).ValueOrDie();
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(actual));
+}
+
 TEST_P(WriteAndReadInteTest, TestPKSimple) {
     arrow::FieldVector fields = {
         arrow::field("pk", arrow::utf8()),

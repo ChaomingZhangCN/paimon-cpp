@@ -167,7 +167,7 @@ class ParquetFileBatchReader : public PrefetchFileBatchReader {
     static void FlattenSchema(const std::shared_ptr<arrow::DataType>& type, int32_t* index,
                               std::vector<int32_t>* index_vector) {
         if (type->id() == arrow::Type::STRUCT || type->id() == arrow::Type::LIST ||
-            type->id() == arrow::Type::MAP) {
+            type->id() == arrow::Type::FIXED_SIZE_LIST || type->id() == arrow::Type::MAP) {
             for (int32_t i = 0; i < type->num_fields(); i++) {
                 auto field = type->field(i);
                 auto inner_type = field->type();

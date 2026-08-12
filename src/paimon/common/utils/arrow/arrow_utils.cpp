@@ -112,6 +112,11 @@ void ArrowUtils::TraverseArray(const std::shared_ptr<arrow::Array>& array) {
             TraverseArray(list_array->values());
             return;
         }
+        case arrow::Type::type::FIXED_SIZE_LIST: {
+            auto* vector_array = static_cast<arrow::FixedSizeListArray*>(array.get());
+            TraverseArray(vector_array->values());
+            return;
+        }
         default:
             return;
     }
@@ -121,6 +126,13 @@ bool ArrowUtils::EqualsIgnoreNullable(const std::shared_ptr<arrow::DataType>& ty
                                       const std::shared_ptr<arrow::DataType>& other_type) {
     if (type->id() != other_type->id() || type->num_fields() != other_type->num_fields()) {
         return false;
+    }
+    if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
+        const auto& vector_type = static_cast<const arrow::FixedSizeListType&>(*type);
+        const auto& other_vector_type = static_cast<const arrow::FixedSizeListType&>(*other_type);
+        if (vector_type.list_size() != other_vector_type.list_size()) {
+            return false;
+        }
     }
     for (int32_t i = 0; i < type->num_fields(); ++i) {
         const auto& field = type->field(i);
@@ -155,6 +167,25 @@ Status ArrowUtils::InnerCheckNullabilityMatch(const std::shared_ptr<arrow::Field
         auto list_array = arrow::internal::checked_pointer_cast<arrow::ListArray>(data);
         PAIMON_RETURN_NOT_OK(
             InnerCheckNullabilityMatch(list_type->value_field(), list_array->values()));
+    } else if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
+        auto vector_type = std::static_pointer_cast<arrow::FixedSizeListType>(field->type());
+        auto vector_array = std::static_pointer_cast<arrow::FixedSizeListArray>(data);
+        const std::shared_ptr<arrow::Array>& values = vector_array->values();
+        if (values->null_count() != 0) {
+            int32_t vector_length = vector_type->list_size();
+            for (int64_t i = 0; i < vector_array->length(); ++i) {
+                if (vector_array->IsNull(i)) {
+                    continue;
+                }
+                int64_t value_offset = (vector_array->offset() + i) * vector_length;
+                for (int32_t j = 0; j < vector_length; ++j) {
+                    if (values->IsNull(value_offset + j)) {
+                        return Status::Invalid(fmt::format(
+                            "VECTOR field {} cannot contain null elements", field->name()));
+                    }
+                }
+            }
+        }
     } else if (type->id() == arrow::Type::MAP) {
         auto map_type = arrow::internal::checked_pointer_cast<arrow::MapType>(field->type());
         auto map_array = arrow::internal::checked_pointer_cast<arrow::MapArray>(data);

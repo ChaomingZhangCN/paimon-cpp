@@ -76,6 +76,18 @@ bool ContainsBlobField(const std::shared_ptr<arrow::Field>& field) {
     return false;
 }
 
+bool ContainsVectorField(const std::shared_ptr<arrow::Field>& field) {
+    if (field->type()->id() == arrow::Type::FIXED_SIZE_LIST) {
+        return true;
+    }
+    for (const auto& child : field->type()->fields()) {
+        if (ContainsVectorField(child)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 Status ValidateSharedShreddingCompression(const std::string& option_key,
                                           const std::string& compression) {
     std::string normalized = StringUtils::ToLowerCase(compression);
@@ -94,6 +106,15 @@ Status ValidateSharedShreddingFileFormat(const std::string& option_key,
         return Status::Invalid(fmt::format(
             "MAP shared-shredding only supports parquet/orc file formats, but {} is {}.",
             option_key, file_format));
+    }
+    return Status::OK();
+}
+
+Status ValidateVectorFileFormat(const std::string& option_key, const std::string& file_format) {
+    if (StringUtils::ToLowerCase(file_format) != "parquet") {
+        return Status::Invalid(
+            fmt::format("VECTOR currently only supports parquet data files, but {} is {}.",
+                        option_key, file_format));
     }
     return Status::OK();
 }
@@ -188,6 +209,7 @@ Status SchemaValidation::ValidateTableSchema(const TableSchema& schema) {
     PAIMON_RETURN_NOT_OK(ValidateRowTracking(schema, options));
     PAIMON_RETURN_NOT_OK(ValidateBlobFields(schema, options));
     PAIMON_RETURN_NOT_OK(ValidateMapStorageLayout(schema, options));
+    PAIMON_RETURN_NOT_OK(ValidateVectorFields(schema, options));
     return Status::OK();
 }
 
@@ -625,6 +647,9 @@ Status SchemaValidation::ValidateMapStorageLayout(const TableSchema& schema,
         if (ContainsBlobField(map_type->item_field())) {
             return Status::Invalid("MAP shared-shredding currently cannot contain BLOB fields.");
         }
+        if (ContainsVectorField(map_type->item_field())) {
+            return Status::Invalid("MAP shared-shredding currently cannot contain VECTOR fields.");
+        }
         // Validate max-columns config
         PAIMON_RETURN_NOT_OK(options.GetMapSharedShreddingMaxColumns(field_name));
         // Validate placement policy config
@@ -649,6 +674,24 @@ Status SchemaValidation::ValidateMapStorageLayout(const TableSchema& schema,
                                                 ValidateSharedShreddingCompression));
 
     return Status::OK();
+}
+
+Status SchemaValidation::ValidateVectorFields(const TableSchema& schema,
+                                              const CoreOptions& options) {
+    bool has_vector = false;
+    for (const auto& field : schema.Fields()) {
+        if (ContainsVectorField(field.ArrowField())) {
+            has_vector = true;
+            break;
+        }
+    }
+    if (!has_vector) {
+        return Status::OK();
+    }
+    PAIMON_RETURN_NOT_OK(
+        ValidateVectorFileFormat(Options::FILE_FORMAT, options.GetFileFormat()->Identifier()));
+    return ValidatePerLevelOption(options.ToMap(), Options::FILE_FORMAT_PER_LEVEL,
+                                  ValidateVectorFileFormat);
 }
 
 }  // namespace paimon
