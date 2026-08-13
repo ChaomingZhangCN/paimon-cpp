@@ -20,12 +20,12 @@
 
 #include <memory>
 
+#include "arrow/memory_pool.h"
 #include "paimon/result.h"
 
 namespace arrow {
 class Array;
 class DataType;
-class MemoryPool;
 }  // namespace arrow
 
 namespace paimon::parquet {
