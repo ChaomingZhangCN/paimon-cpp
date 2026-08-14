@@ -26,6 +26,7 @@
 #include "fmt/format.h"
 #include "paimon/common/predicate/compound_predicate_impl.h"
 #include "paimon/common/predicate/leaf_predicate_impl.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/field_type_utils.h"
 #include "paimon/common/utils/object_utils.h"
 #include "paimon/core/casting/cast_executor_factory.h"
@@ -108,9 +109,16 @@ Result<ExistFieldInfo> FieldMappingBuilder::CreateExistFieldInfo(
 
             // Recursively prune nested types in data_field to match read_field's
             // projection. For atomic types this is a no-op.
-            PAIMON_ASSIGN_OR_RAISE(
-                std::optional<std::shared_ptr<arrow::DataType>> pruned_type,
-                NestedProjectionUtils::PruneDataType(read_field.Type(), data_field.Type()));
+            std::optional<std::shared_ptr<arrow::DataType>> pruned_type;
+            if (NestedProjectionUtils::IsMapSharedShreddingAccessField(read_field.ArrowField())) {
+                PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::DataType> map_access_data_type,
+                                       NestedProjectionUtils::BuildMapSharedShreddingAccessDataType(
+                                           read_field.ArrowField(), data_field.Type()));
+                pruned_type = std::move(map_access_data_type);
+            } else {
+                PAIMON_ASSIGN_OR_RAISE(pruned_type, NestedProjectionUtils::PruneDataType(
+                                                        read_field.Type(), data_field.Type()));
+            }
             if (!pruned_type.has_value()) {
                 // All sub-fields pruned away — treat as non-existent.
                 continue;
@@ -149,8 +157,8 @@ std::optional<NonExistFieldInfo> FieldMappingBuilder::CreateNonExistFieldInfo(
         // cannot be read from data files directly. Materialize it as nulls.
         if (read_field.Type()->id() == arrow::Type::STRUCT &&
             iter->second.Type()->id() == arrow::Type::STRUCT) {
-            auto read_struct = std::static_pointer_cast<arrow::StructType>(read_field.Type());
-            auto data_struct = std::static_pointer_cast<arrow::StructType>(iter->second.Type());
+            auto read_struct = checked_pointer_cast<arrow::StructType>(read_field.Type());
+            auto data_struct = checked_pointer_cast<arrow::StructType>(iter->second.Type());
             if (read_struct->num_fields() == 0 && data_struct->num_fields() > 0) {
                 non_exist_field_info.non_exist_read_schema.push_back(read_field);
                 non_exist_field_info.idx_in_target_read_schema.push_back(i);

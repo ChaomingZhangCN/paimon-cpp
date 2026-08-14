@@ -35,6 +35,7 @@
 #include "fmt/format.h"
 #include "paimon/common/data/variant/variant_access_utils.h"
 #include "paimon/common/data/variant/variant_type_utils.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/string_utils.h"
 #include "paimon/core/casting/casting_utils.h"
 #include "paimon/status.h"
@@ -100,8 +101,8 @@ Result<bool> NestedProjectionUtils::HasNestedSubfieldProjectionType(
                     "type is {} and read type is {}",
                     file_type->ToString(), read_type->ToString()));
             }
-            auto file_struct = std::static_pointer_cast<arrow::StructType>(file_type);
-            auto read_struct = std::static_pointer_cast<arrow::StructType>(read_type);
+            auto file_struct = checked_pointer_cast<arrow::StructType>(file_type);
+            auto read_struct = checked_pointer_cast<arrow::StructType>(read_type);
             bool field_count_diff = read_struct->num_fields() != file_struct->num_fields();
             for (const auto& read_child : read_struct->fields()) {
                 auto file_child = FindFieldByName(file_struct->fields(), read_child->name());
@@ -127,8 +128,8 @@ Result<bool> NestedProjectionUtils::HasNestedSubfieldProjectionType(
                     "type is {} and read type is {}",
                     file_type->ToString(), read_type->ToString()));
             }
-            auto file_list = std::static_pointer_cast<arrow::ListType>(file_type);
-            auto read_list = std::static_pointer_cast<arrow::ListType>(read_type);
+            auto file_list = checked_pointer_cast<arrow::ListType>(file_type);
+            auto read_list = checked_pointer_cast<arrow::ListType>(read_type);
             return HasNestedSubfieldProjectionType(file_list->value_type(),
                                                    read_list->value_type());
         }
@@ -139,8 +140,8 @@ Result<bool> NestedProjectionUtils::HasNestedSubfieldProjectionType(
                     "type is {} and read type is {}",
                     file_type->ToString(), read_type->ToString()));
             }
-            auto file_map = std::static_pointer_cast<arrow::MapType>(file_type);
-            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
+            auto file_map = checked_pointer_cast<arrow::MapType>(file_type);
+            auto read_map = checked_pointer_cast<arrow::MapType>(read_type);
             PAIMON_ASSIGN_OR_RAISE(
                 bool key_has_nested_projection,
                 HasNestedSubfieldProjectionType(file_map->key_type(), read_map->key_type()));
@@ -292,15 +293,15 @@ Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
             return arrow::list(data_type->field(0)->WithType(item));
         }
         case arrow::Type::MAP: {
-            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
-            auto data_map = std::static_pointer_cast<arrow::MapType>(data_type);
+            auto read_map = checked_pointer_cast<arrow::MapType>(read_type);
+            auto data_map = checked_pointer_cast<arrow::MapType>(data_type);
             PAIMON_ASSIGN_OR_RAISE(
                 std::shared_ptr<arrow::DataType> key,
                 PruneRepeatedItemType(read_map->key_type(), data_map->key_type(), container));
             PAIMON_ASSIGN_OR_RAISE(
                 std::shared_ptr<arrow::DataType> item,
                 PruneRepeatedItemType(read_map->item_type(), data_map->item_type(), container));
-            return std::static_pointer_cast<arrow::DataType>(std::make_shared<arrow::MapType>(
+            return checked_pointer_cast<arrow::DataType>(std::make_shared<arrow::MapType>(
                 data_map->key_field()->WithType(key), data_map->item_field()->WithType(item),
                 data_map->keys_sorted()));
         }
@@ -379,8 +380,8 @@ Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::P
             if (map_substitution) {
                 return std::optional<std::shared_ptr<arrow::DataType>>(read_type);
             }
-            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
-            auto data_map = std::static_pointer_cast<arrow::MapType>(data_type);
+            auto read_map = checked_pointer_cast<arrow::MapType>(read_type);
+            auto data_map = checked_pointer_cast<arrow::MapType>(data_type);
             PAIMON_ASSIGN_OR_RAISE(
                 std::shared_ptr<arrow::DataType> key,
                 PruneRepeatedItemType(read_map->key_type(), data_map->key_type(), "map"));
@@ -446,78 +447,99 @@ Result<std::vector<std::string>> NestedProjectionUtils::GetMapSelectedKeys(
     return result;
 }
 
-namespace {
+bool NestedProjectionUtils::IsMapSharedShreddingAccessField(
+    const std::shared_ptr<arrow::Field>& field) {
+    if (field->type()->id() != arrow::Type::STRUCT || !field->HasMetadata() || !field->metadata()) {
+        return false;
+    }
+    return field->metadata()->Contains(DataField::MAP_SELECTED_KEYS);
+}
 
-struct MapKeyAccessor {
-    std::shared_ptr<arrow::StringArray> string_keys;
-    std::shared_ptr<arrow::DictionaryArray> dict_keys;
-    std::shared_ptr<arrow::StringArray> dict_values;
-    std::shared_ptr<arrow::LargeStringArray> dict_large_values;
-};
+Result<std::vector<std::string>> NestedProjectionUtils::ValidateMapSharedShreddingAccessField(
+    const std::shared_ptr<arrow::Field>& field) {
+    if (field->type()->id() != arrow::Type::STRUCT) {
+        return Status::Invalid(
+            fmt::format("selected-key MAP field {} is not a STRUCT", field->name()));
+    }
+    auto struct_type = checked_pointer_cast<arrow::StructType>(field->type());
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::string> selected_keys, GetMapSelectedKeys(field));
+    if (struct_type->num_fields() == 0 ||
+        selected_keys.size() != static_cast<size_t>(struct_type->num_fields())) {
+        return Status::Invalid(
+            fmt::format("selected-key metadata size {} does not match STRUCT field count {} for {}",
+                        selected_keys.size(), struct_type->num_fields(), field->name()));
+    }
+    const auto& value_type = struct_type->field(0)->type();
+    for (int32_t i = 1; i < struct_type->num_fields(); ++i) {
+        if (!struct_type->field(i)->type()->Equals(value_type)) {
+            return Status::Invalid(fmt::format(
+                "selected-key MAP fields must have the same value type, but {} and {} differ",
+                value_type->ToString(), struct_type->field(i)->type()->ToString()));
+        }
+    }
+    return selected_keys;
+}
 
-Result<MapKeyAccessor> BuildMapKeyAccessor(const std::shared_ptr<arrow::Array>& key_array) {
-    MapKeyAccessor accessor;
+Result<std::shared_ptr<arrow::DataType>>
+NestedProjectionUtils::BuildMapSharedShreddingAccessDataType(
+    const std::shared_ptr<arrow::Field>& read_field,
+    const std::shared_ptr<arrow::DataType>& data_type) {
+    if (!IsMapSharedShreddingAccessField(read_field)) {
+        return Status::Invalid(
+            fmt::format("field {} is not a selected-key MAP projection", read_field->name()));
+    }
+    if (data_type->id() != arrow::Type::MAP) {
+        return Status::Invalid(
+            fmt::format("selected-key MAP projection {} requires MAP data type, got {}",
+                        read_field->name(), data_type->ToString()));
+    }
+    PAIMON_RETURN_NOT_OK(ValidateMapSharedShreddingAccessField(read_field).status());
+    auto read_struct = checked_pointer_cast<arrow::StructType>(read_field->type());
+    auto data_map = checked_pointer_cast<arrow::MapType>(data_type);
+    arrow::FieldVector data_children;
+    data_children.reserve(read_struct->num_fields());
+    for (const auto& read_child : read_struct->fields()) {
+        data_children.push_back(read_child->WithType(data_map->item_type()));
+    }
+    return arrow::struct_(std::move(data_children));
+}
+
+Result<std::string_view> NestedProjectionUtils::GetMapKeyViewAt(
+    const std::shared_ptr<arrow::Array>& key_array, int64_t entry_idx) {
+    if (key_array->IsNull(entry_idx)) {
+        return Status::Invalid("selected-key MAP read found null MAP key at entry " +
+                               std::to_string(entry_idx));
+    }
     if (key_array->type_id() == arrow::Type::STRING) {
-        accessor.string_keys = std::static_pointer_cast<arrow::StringArray>(key_array);
-        return accessor;
+        return checked_pointer_cast<arrow::StringArray>(key_array)->GetView(entry_idx);
     }
     if (key_array->type_id() == arrow::Type::DICTIONARY) {
-        auto dict_type = std::static_pointer_cast<arrow::DictionaryType>(key_array->type());
+        auto dict_type = checked_pointer_cast<arrow::DictionaryType>(key_array->type());
         if (dict_type->value_type()->id() != arrow::Type::STRING &&
             dict_type->value_type()->id() != arrow::Type::LARGE_STRING) {
             return Status::Invalid(
-                fmt::format("FilterMapArrayBySelectedKeys only supports string keys or "
+                fmt::format("selected-key MAP read only supports string keys or "
                             "dictionary<string|large_string> keys, got {}",
                             key_array->type()->ToString()));
         }
-        accessor.dict_keys = std::static_pointer_cast<arrow::DictionaryArray>(key_array);
-        if (dict_type->value_type()->id() == arrow::Type::STRING) {
-            accessor.dict_values =
-                std::static_pointer_cast<arrow::StringArray>(accessor.dict_keys->dictionary());
-        } else {
-            accessor.dict_large_values =
-                std::static_pointer_cast<arrow::LargeStringArray>(accessor.dict_keys->dictionary());
+        auto dict_keys = checked_pointer_cast<arrow::DictionaryArray>(key_array);
+        int64_t dict_idx = dict_keys->GetValueIndex(entry_idx);
+        const auto& dictionary = dict_keys->dictionary();
+        if (dictionary->IsNull(dict_idx)) {
+            return Status::Invalid(
+                "selected-key MAP read found null dictionary MAP key at dictionary index " +
+                std::to_string(dict_idx));
         }
-        return accessor;
+        if (dict_type->value_type()->id() == arrow::Type::STRING) {
+            return checked_pointer_cast<arrow::StringArray>(dictionary)->GetView(dict_idx);
+        }
+        return checked_pointer_cast<arrow::LargeStringArray>(dictionary)->GetView(dict_idx);
     }
     return Status::Invalid(
-        fmt::format("FilterMapArrayBySelectedKeys only supports string keys or "
+        fmt::format("selected-key MAP read only supports string keys or "
                     "dictionary<string|large_string> keys, got {}",
                     key_array->type()->ToString()));
 }
-
-Result<std::string_view> GetMapKeyViewAt(const MapKeyAccessor& accessor, int64_t entry_idx) {
-    if (accessor.string_keys) {
-        if (accessor.string_keys->IsNull(entry_idx)) {
-            return Status::Invalid("FilterMapArrayBySelectedKeys found null map key at entry " +
-                                   std::to_string(entry_idx));
-        }
-        return accessor.string_keys->GetView(entry_idx);
-    }
-
-    if (accessor.dict_keys->IsNull(entry_idx)) {
-        return Status::Invalid("FilterMapArrayBySelectedKeys found null map key at entry " +
-                               std::to_string(entry_idx));
-    }
-    int64_t dict_idx = accessor.dict_keys->GetValueIndex(entry_idx);
-    if (accessor.dict_values) {
-        if (accessor.dict_values->IsNull(dict_idx)) {
-            return Status::Invalid(
-                "FilterMapArrayBySelectedKeys found null dictionary map key at dictionary index " +
-                std::to_string(dict_idx));
-        }
-        return accessor.dict_values->GetView(dict_idx);
-    }
-
-    if (accessor.dict_large_values->IsNull(dict_idx)) {
-        return Status::Invalid(
-            "FilterMapArrayBySelectedKeys found null dictionary map key at dictionary index " +
-            std::to_string(dict_idx));
-    }
-    return accessor.dict_large_values->GetView(dict_idx);
-}
-
-}  // namespace
 
 Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySelectedKeys(
     const std::shared_ptr<arrow::Array>& array, const std::vector<std::string>& selected_keys,
@@ -534,12 +556,10 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
             "FilterMapArrayBySelectedKeys requires map array, got {}", array->type()->ToString()));
     }
 
-    auto map_array = std::static_pointer_cast<arrow::MapArray>(array);
-    auto map_type = std::static_pointer_cast<arrow::MapType>(array->type());
-    assert(map_array && map_type);
+    auto map_array = checked_pointer_cast<arrow::MapArray>(array);
+    auto map_type = checked_pointer_cast<arrow::MapType>(array->type());
 
     auto key_array = map_array->keys();
-    PAIMON_ASSIGN_OR_RAISE(MapKeyAccessor key_accessor, BuildMapKeyAccessor(key_array));
 
     auto values_array = map_array->items();
     int64_t num_maps = map_array->length();
@@ -558,7 +578,7 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::unique_ptr<arrow::ArrayBuilder> value_builder_u,
                                       arrow::MakeBuilder(values_array->type(), pool));
     arrow::MapBuilder map_builder(pool, std::move(key_builder_u), std::move(value_builder_u));
-    auto* key_builder = static_cast<arrow::StringBuilder*>(map_builder.key_builder());
+    auto* key_builder = checked_cast<arrow::StringBuilder*>(map_builder.key_builder());
     auto* value_builder = map_builder.item_builder();
     PAIMON_RETURN_NOT_OK_FROM_ARROW(map_builder.Reserve(num_maps));
 
@@ -575,7 +595,7 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::FilterMapArrayBySel
         for (const auto& selected_key : selected_keys) {
             for (int64_t entry_idx = start; entry_idx < end; ++entry_idx) {
                 PAIMON_ASSIGN_OR_RAISE(std::string_view key_view,
-                                       GetMapKeyViewAt(key_accessor, entry_idx));
+                                       GetMapKeyViewAt(key_array, entry_idx));
                 if (key_view == selected_key) {
                     PAIMON_RETURN_NOT_OK_FROM_ARROW(key_builder->Append(
                         key_view.data(), static_cast<int32_t>(key_view.size())));
@@ -601,7 +621,7 @@ std::shared_ptr<arrow::DataType> NormalizeLeafRepresentation(
     const std::shared_ptr<arrow::DataType>& type) {
     auto t = type;
     if (t->id() == arrow::Type::DICTIONARY) {
-        t = std::static_pointer_cast<arrow::DictionaryType>(t)->value_type();
+        t = checked_pointer_cast<arrow::DictionaryType>(t)->value_type();
     }
     if (t->id() == arrow::Type::LARGE_STRING) {
         return arrow::utf8();
@@ -671,7 +691,7 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
                                                    array->type()->ToString(),
                                                    read_type->ToString()));
             }
-            auto read_list = std::static_pointer_cast<arrow::ListType>(read_type);
+            auto read_list = checked_pointer_cast<arrow::ListType>(read_type);
             auto values = arrow::MakeArray(data->child_data[0]);
             PAIMON_ASSIGN_OR_RAISE(values,
                                    AlignArrayToReadType(values, read_list->value_type(), pool));
@@ -686,7 +706,7 @@ Result<std::shared_ptr<arrow::Array>> NestedProjectionUtils::AlignArrayToReadTyp
                                                    array->type()->ToString(),
                                                    read_type->ToString()));
             }
-            auto read_map = std::static_pointer_cast<arrow::MapType>(read_type);
+            auto read_map = checked_pointer_cast<arrow::MapType>(read_type);
             const auto& entries_data = data->child_data[0];
             auto key = arrow::MakeArray(entries_data->child_data[0]);
             auto value = arrow::MakeArray(entries_data->child_data[1]);

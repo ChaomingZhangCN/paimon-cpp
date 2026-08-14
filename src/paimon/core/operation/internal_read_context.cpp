@@ -31,6 +31,8 @@
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/checked_cast.h"
+#include "paimon/core/options/map_storage_layout.h"
 #include "paimon/core/schema/arrow_schema_validator.h"
 #include "paimon/core/utils/nested_projection_utils.h"
 #include "paimon/status.h"
@@ -50,6 +52,30 @@ Result<std::shared_ptr<arrow::Field>> InternalReadContext::AlignReadFieldWithTab
         return table_field->WithType(read_field->type());
     }
 
+    if (table_field->type()->id() == arrow::Type::MAP &&
+        NestedProjectionUtils::IsMapSharedShreddingAccessField(read_field)) {
+        auto table_map = checked_pointer_cast<arrow::MapType>(table_field->type());
+        if (table_map->key_type()->id() != arrow::Type::STRING) {
+            return Status::Invalid(fmt::format(
+                "Selected-key MAP pushdown only supports string MAP keys for field '{}'",
+                table_field->name()));
+        }
+        PAIMON_RETURN_NOT_OK(
+            NestedProjectionUtils::ValidateMapSharedShreddingAccessField(read_field).status());
+        auto read_struct = checked_pointer_cast<arrow::StructType>(read_field->type());
+        const auto& selected_value_type = read_struct->field(0)->type();
+        if (!selected_value_type->Equals(table_map->item_type())) {
+            return Status::Invalid(fmt::format(
+                "Selected-key MAP pushdown does not support pruning MAP value fields for "
+                "'{}': selected type {} vs MAP value type {}",
+                table_field->name(), selected_value_type->ToString(),
+                table_map->item_type()->ToString()));
+        }
+        auto aligned_field = table_field->WithType(read_field->type());
+        return DataField::MergeFieldMetadataByWhitelist(aligned_field, read_field,
+                                                        kReadMetadataWhitelist);
+    }
+
     if (read_field->type()->id() != table_field->type()->id()) {
         return Status::Invalid(fmt::format(
             "Read schema field '{}' type {} does not match table field type {}", read_field->name(),
@@ -58,8 +84,8 @@ Result<std::shared_ptr<arrow::Field>> InternalReadContext::AlignReadFieldWithTab
 
     auto type_id = read_field->type()->id();
     if (type_id == arrow::Type::STRUCT) {
-        auto read_struct = std::static_pointer_cast<arrow::StructType>(read_field->type());
-        auto table_struct = std::static_pointer_cast<arrow::StructType>(table_field->type());
+        auto read_struct = checked_pointer_cast<arrow::StructType>(read_field->type());
+        auto table_struct = checked_pointer_cast<arrow::StructType>(table_field->type());
         arrow::FieldVector rebased_children;
         rebased_children.reserve(read_struct->num_fields());
         for (const auto& read_child : read_struct->fields()) {
@@ -82,8 +108,8 @@ Result<std::shared_ptr<arrow::Field>> InternalReadContext::AlignReadFieldWithTab
     }
 
     if (type_id == arrow::Type::LIST) {
-        auto read_list = std::static_pointer_cast<arrow::ListType>(read_field->type());
-        auto table_list = std::static_pointer_cast<arrow::ListType>(table_field->type());
+        auto read_list = checked_pointer_cast<arrow::ListType>(read_field->type());
+        auto table_list = checked_pointer_cast<arrow::ListType>(table_field->type());
         PAIMON_ASSIGN_OR_RAISE(
             std::shared_ptr<arrow::Field> rebased_value_field,
             AlignReadFieldWithTableFieldIds(read_list->value_field(), table_list->value_field()));
@@ -94,8 +120,8 @@ Result<std::shared_ptr<arrow::Field>> InternalReadContext::AlignReadFieldWithTab
     }
 
     if (type_id == arrow::Type::MAP) {
-        auto read_map = std::static_pointer_cast<arrow::MapType>(read_field->type());
-        auto table_map = std::static_pointer_cast<arrow::MapType>(table_field->type());
+        auto read_map = checked_pointer_cast<arrow::MapType>(read_field->type());
+        auto table_map = checked_pointer_cast<arrow::MapType>(table_field->type());
         PAIMON_ASSIGN_OR_RAISE(
             std::shared_ptr<arrow::Field> rebased_key_field,
             AlignReadFieldWithTableFieldIds(read_map->key_field(), table_map->key_field()));
@@ -198,6 +224,16 @@ Result<std::unique_ptr<InternalReadContext>> InternalReadContext::Create(
             }
             PAIMON_ASSIGN_OR_RAISE(DataField table_field,
                                    table_schema->GetField(read_field->name()));
+            if (NestedProjectionUtils::IsMapSharedShreddingAccessField(read_field)) {
+                PAIMON_ASSIGN_OR_RAISE(MapStorageLayout layout,
+                                       core_options.GetMapStorageLayout(table_field.Name()));
+                if (layout != MapStorageLayout::SHARED_SHREDDING) {
+                    return Status::Invalid(fmt::format(
+                        "Selected-key MAP pushdown only supports top-level shared-shredding MAP "
+                        "field: {}",
+                        table_field.Name()));
+                }
+            }
             PAIMON_ASSIGN_OR_RAISE(
                 std::shared_ptr<arrow::Field> aligned_field,
                 AlignReadFieldWithTableFieldIds(read_field, table_field.ArrowField()));
