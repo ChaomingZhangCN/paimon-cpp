@@ -418,16 +418,16 @@ TEST_F(PredicatePushdownTest, TestPredicatePushdownWithAllDataNull) {
     // other predicate, always return IS_NULL (no data)
     {
         // f4 in [1,2], no data
-        auto predicate = PredicateBuilder::In(/*field_index=*/4, /*field_name=*/"f4",
-                                              FieldType::BIGINT,
-                                              {BigIntLiteral(1), BigIntLiteral(2)});
+        auto predicate =
+            PredicateBuilder::In(/*field_index=*/4, /*field_name=*/"f4", FieldType::BIGINT,
+                                 {BigIntLiteral(1), BigIntLiteral(2)});
         CheckResult(read_schema, predicate, /*expected_array=*/nullptr);
     }
     {
         // f4 not in [1,2], no data
-        auto predicate = PredicateBuilder::NotIn(/*field_index=*/4, /*field_name=*/"f4",
-                                                 FieldType::BIGINT,
-                                                 {BigIntLiteral(1), BigIntLiteral(2)});
+        auto predicate =
+            PredicateBuilder::NotIn(/*field_index=*/4, /*field_name=*/"f4", FieldType::BIGINT,
+                                    {BigIntLiteral(1), BigIntLiteral(2)});
         CheckResult(read_schema, predicate, /*expected_array=*/nullptr);
     }
     {
