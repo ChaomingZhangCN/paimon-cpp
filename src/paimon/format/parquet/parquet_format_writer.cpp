@@ -32,6 +32,7 @@
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/utils/arrow/arrow_output_stream_adapter.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/format/parquet/parquet_format_defs.h"
 #include "paimon/format/parquet/parquet_vector_converter.h"
 #include "parquet/arrow/writer.h"
@@ -58,8 +59,8 @@ Result<std::unique_ptr<ParquetFormatWriter>> ParquetFormatWriter::Create(
     auto arrow_writer_properties =
         arrow_properties_builder.enable_deprecated_int96_timestamps()->build();
     auto logical_type = arrow::struct_(schema->fields());
-    auto write_type = std::static_pointer_cast<arrow::StructType>(
-        ParquetVectorConverter::GetWriteType(logical_type));
+    auto write_type =
+        checked_pointer_cast<arrow::StructType>(ParquetVectorConverter::GetWriteType(logical_type));
     auto write_schema = arrow::schema(write_type->fields(), schema->metadata());
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
         std::unique_ptr<::parquet::arrow::FileWriter> file_writer,
@@ -74,6 +75,8 @@ Status ParquetFormatWriter::AddBatch(ArrowArray* batch) {
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<::arrow::RecordBatch> record_batch,
                                       arrow::ImportRecordBatch(batch, schema_));
     if (needs_vector_conversion_) {
+        // TODO(ChaomingZhangCN): Remove this conversion after upgrading Arrow. Arrow 17
+        // mishandles nullable FixedSizeList values when writing them as Parquet LIST.
         PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::StructArray> struct_array,
                                           record_batch->ToStructArray());
         std::shared_ptr<arrow::Array> array = struct_array;

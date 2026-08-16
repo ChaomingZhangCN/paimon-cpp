@@ -119,7 +119,7 @@ Result<std::shared_ptr<arrow::Field>> TableSchema::AssignFieldIdsRecursively(
         return arrow::field(field->name(), arrow::list(new_value_field), field->nullable(),
                             metadata);
     } else if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
-        auto vector_type = std::static_pointer_cast<arrow::FixedSizeListType>(field->type());
+        auto vector_type = checked_pointer_cast<arrow::FixedSizeListType>(field->type());
         PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Field> new_value_field,
                                AssignFieldIdsRecursively(vector_type->value_field(),
                                                          /*set_field_id=*/false, field_id));

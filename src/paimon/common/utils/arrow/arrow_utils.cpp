@@ -321,7 +321,7 @@ void ArrowUtils::TraverseArray(const std::shared_ptr<arrow::Array>& array) {
             return;
         }
         case arrow::Type::type::FIXED_SIZE_LIST: {
-            auto* vector_array = static_cast<arrow::FixedSizeListArray*>(array.get());
+            auto* vector_array = checked_cast<arrow::FixedSizeListArray*>(array.get());
             TraverseArray(vector_array->values());
             return;
         }
@@ -336,8 +336,8 @@ bool ArrowUtils::EqualsIgnoreNullable(const std::shared_ptr<arrow::DataType>& ty
         return false;
     }
     if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
-        const auto& vector_type = static_cast<const arrow::FixedSizeListType&>(*type);
-        const auto& other_vector_type = static_cast<const arrow::FixedSizeListType&>(*other_type);
+        const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*type);
+        const auto& other_vector_type = checked_cast<const arrow::FixedSizeListType&>(*other_type);
         if (vector_type.list_size() != other_vector_type.list_size()) {
             return false;
         }
@@ -376,8 +376,8 @@ Status ArrowUtils::InnerCheckNullabilityMatch(const std::shared_ptr<arrow::Field
         PAIMON_RETURN_NOT_OK(
             InnerCheckNullabilityMatch(list_type->value_field(), list_array->values()));
     } else if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
-        auto vector_type = std::static_pointer_cast<arrow::FixedSizeListType>(field->type());
-        auto vector_array = std::static_pointer_cast<arrow::FixedSizeListArray>(data);
+        auto vector_type = checked_pointer_cast<arrow::FixedSizeListType>(field->type());
+        auto vector_array = checked_pointer_cast<arrow::FixedSizeListArray>(data);
         const std::shared_ptr<arrow::Array>& values = vector_array->values();
         if (values->null_count() != 0) {
             int32_t vector_length = vector_type->list_size();

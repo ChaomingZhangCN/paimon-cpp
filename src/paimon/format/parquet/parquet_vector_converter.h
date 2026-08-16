@@ -30,15 +30,11 @@ class DataType;
 
 namespace paimon::parquet {
 
-/// Restores logical FixedSizeList VECTOR arrays from Parquet LIST arrays.
+/// Converts logical FixedSizeList VECTOR arrays to Parquet LIST arrays.
 class ParquetVectorConverter {
  public:
     ParquetVectorConverter() = delete;
     ~ParquetVectorConverter() = delete;
-
-    static Result<std::shared_ptr<arrow::Array>> ConvertToReadType(
-        const std::shared_ptr<arrow::Array>& array,
-        const std::shared_ptr<arrow::DataType>& read_type, arrow::MemoryPool* pool);
 
     static Result<std::shared_ptr<arrow::Array>> ConvertToWriteType(
         const std::shared_ptr<arrow::Array>& array, arrow::MemoryPool* pool);

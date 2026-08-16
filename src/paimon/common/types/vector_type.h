@@ -24,6 +24,7 @@
 
 #include "arrow/api.h"
 #include "paimon/common/types/data_type.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/rapidjson_util.h"
 
 namespace paimon {
@@ -59,7 +60,7 @@ class VectorType : public DataType {
             rapidjson::StringRef("type"),
             RapidJsonUtil::SerializeValue(WithNullable(std::string(TYPE)), allocator).Move(),
             *allocator);
-        auto* type = static_cast<arrow::FixedSizeListType*>(type_.get());
+        auto* type = checked_cast<arrow::FixedSizeListType*>(type_.get());
         auto value_field = type->value_field();
         std::shared_ptr<DataType> data_type =
             DataType::Create(value_field->type(), value_field->nullable(), value_field->metadata());

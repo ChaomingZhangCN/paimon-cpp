@@ -61,14 +61,14 @@ TEST(DataTypeJsonParserTest, ParseVectorTypeSuccess) {
                          DataTypeJsonParser::ParseType("embedding", doc));
     ASSERT_FALSE(field->nullable());
     ASSERT_EQ(field->type()->id(), arrow::Type::FIXED_SIZE_LIST);
-    auto vector_type = std::static_pointer_cast<arrow::FixedSizeListType>(field->type());
+    auto vector_type = checked_pointer_cast<arrow::FixedSizeListType>(field->type());
     ASSERT_EQ(vector_type->list_size(), 3);
     ASSERT_TRUE(vector_type->value_type()->Equals(arrow::float32()));
 
     rapidjson::Document sql_doc;
     rapidjson::Value sql_value("VECTOR<BIGINT NOT NULL, 5>", sql_doc.GetAllocator());
     ASSERT_OK_AND_ASSIGN(field, DataTypeJsonParser::ParseType("embedding", sql_value));
-    vector_type = std::static_pointer_cast<arrow::FixedSizeListType>(field->type());
+    vector_type = checked_pointer_cast<arrow::FixedSizeListType>(field->type());
     ASSERT_TRUE(field->nullable());
     ASSERT_EQ(vector_type->list_size(), 5);
     ASSERT_FALSE(vector_type->value_field()->nullable());

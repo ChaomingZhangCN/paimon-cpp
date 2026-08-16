@@ -29,6 +29,8 @@
 #include "gtest/gtest.h"
 #include "paimon/common/utils/arrow/arrow_input_stream_adapter.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
+#include "paimon/common/utils/checked_cast.h"
+#include "paimon/core/io/vector_file_batch_reader.h"
 #include "paimon/format/parquet/parquet_file_batch_reader.h"
 #include "paimon/format/parquet/parquet_format_defs.h"
 #include "paimon/format/parquet/parquet_format_writer.h"
@@ -87,19 +89,21 @@ class ParquetVectorIoTest : public ::testing::Test {
             arrow::ImportType(c_file_schema.get());
         ASSERT_TRUE(file_type_result.ok()) << file_type_result.status().ToString();
         auto file_type =
-            std::static_pointer_cast<arrow::StructType>(std::move(file_type_result).ValueOrDie());
+            checked_pointer_cast<arrow::StructType>(std::move(file_type_result).ValueOrDie());
         std::shared_ptr<arrow::DataType> physical_value_type = file_type->field(1)->type();
         if (physical_value_type->id() == arrow::Type::STRUCT) {
             physical_value_type = physical_value_type->field(0)->type();
         }
         ASSERT_EQ(physical_value_type->id(), arrow::Type::LIST);
 
+        std::unique_ptr<FileBatchReader> vector_reader =
+            std::make_unique<VectorFileBatchReader>(std::move(reader), pool_);
         auto c_schema = std::make_unique<ArrowSchema>();
         ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(read_type->fields()), c_schema.get()).ok());
-        ASSERT_OK(reader->SetReadSchema(c_schema.get(), /*predicate=*/nullptr,
-                                        /*selection_bitmap=*/std::nullopt));
+        ASSERT_OK(vector_reader->SetReadSchema(c_schema.get(), /*predicate=*/nullptr,
+                                               /*selection_bitmap=*/std::nullopt));
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
-                             paimon::test::ReadResultCollector::CollectResult(reader.get()));
+                             paimon::test::ReadResultCollector::CollectResult(vector_reader.get()));
 
         arrow::Result<std::shared_ptr<arrow::Array>> expected_result =
             arrow::ipc::internal::json::ArrayFromJSON(read_type, json);
@@ -119,17 +123,17 @@ class ParquetVectorIoTest : public ::testing::Test {
 TEST_F(ParquetVectorIoTest, WriteAndReadVector) {
     auto vector_type =
         arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
-    auto struct_type = std::static_pointer_cast<arrow::StructType>(arrow::struct_(
+    auto struct_type = checked_pointer_cast<arrow::StructType>(arrow::struct_(
         {arrow::field("id", arrow::int32()), arrow::field("embedding", vector_type)}));
     WriteAndCheck("vector.parquet", struct_type, struct_type,
                   R"([[1, [1.0, 2.0, 3.0]], [2, null], [3, [4.0, 5.0, 6.0]]])");
 }
 
 TEST_F(ParquetVectorIoTest, ReadOrdinaryParquetListAsVector) {
-    auto physical_type = std::static_pointer_cast<arrow::StructType>(
+    auto physical_type = checked_pointer_cast<arrow::StructType>(
         arrow::struct_({arrow::field("id", arrow::int32()),
                         arrow::field("embedding", arrow::list(arrow::float32()))}));
-    auto logical_type = std::static_pointer_cast<arrow::StructType>(arrow::struct_({
+    auto logical_type = checked_pointer_cast<arrow::StructType>(arrow::struct_({
         arrow::field("id", arrow::int32()),
         arrow::field("embedding", arrow::fixed_size_list(arrow::float32(), 3)),
     }));
@@ -140,7 +144,7 @@ TEST_F(ParquetVectorIoTest, ReadOrdinaryParquetListAsVector) {
 TEST_F(ParquetVectorIoTest, WriteAndReadNestedDoubleVector) {
     auto vector_type =
         arrow::fixed_size_list(arrow::field("item", arrow::float64(), /*nullable=*/false), 2);
-    auto struct_type = std::static_pointer_cast<arrow::StructType>(arrow::struct_({
+    auto struct_type = checked_pointer_cast<arrow::StructType>(arrow::struct_({
         arrow::field("id", arrow::int32()),
         arrow::field("payload", arrow::struct_({arrow::field("embedding", vector_type),
                                                 arrow::field("history", arrow::list(vector_type)),

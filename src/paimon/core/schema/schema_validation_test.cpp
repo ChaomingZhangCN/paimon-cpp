@@ -70,6 +70,24 @@ TEST(SchemaValidationTest, TestVectorType) {
                                              /*primary_keys=*/{"embedding"}, primary_key_options));
     ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
                         "in primary key field embedding is unsupported");
+
+    primary_key_options[Options::FILE_FORMAT] = "parquet";
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},
+                                             /*primary_keys=*/{"id"}, primary_key_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "VECTOR fields in primary-key tables are not implemented yet.");
+
+    auto nested_schema = arrow::schema({
+        arrow::field("id", arrow::int64()),
+        arrow::field("payload", arrow::struct_({arrow::field("embedding", vector_field->type())})),
+    });
+    ASSERT_OK_AND_ASSIGN(
+        table_schema,
+        TableSchema::Create(/*schema_id=*/0, nested_schema,
+                            /*partition_keys=*/{}, /*primary_keys=*/{"id"}, primary_key_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "VECTOR fields in primary-key tables are not implemented yet.");
 }
 
 TEST(SchemaValidationTest, TestRowTracking) {

@@ -214,8 +214,7 @@ Status ArrowSchemaValidator::ValidateField(const std::shared_ptr<arrow::Field>& 
             break;
         }
         case arrow::Type::type::FIXED_SIZE_LIST: {
-            const auto& vector_type =
-                checked_cast<const arrow::FixedSizeListType&>(*field->type());
+            const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*field->type());
             if (vector_type.list_size() < 1) {
                 return Status::Invalid("Vector length must be positive, but was ",
                                        vector_type.list_size());

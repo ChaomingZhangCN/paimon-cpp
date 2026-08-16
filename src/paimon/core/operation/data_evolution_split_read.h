@@ -65,7 +65,7 @@ struct DeletionFile;
 /// ->FieldMappingReader->(ApplyDeletionVectorBatchReader)->(ApplyBitmapIndexBatchReader)
 /// ->(CompleteRowTrackingFieldsBatchReader)->(ShreddingFileReader)
 /// ->(MapSharedShreddingFileReader)
-/// ->(DelegatingPrefetchReader)->(PrefetchFileBatchReader)->FormatReader
+/// ->(VectorFileBatchReader)->(DelegatingPrefetchReader)->(PrefetchFileBatchReader)->FormatReader
 ///
 ///
 /// A union `SplitRead` to read multiple inner files to merge columns, note that this class

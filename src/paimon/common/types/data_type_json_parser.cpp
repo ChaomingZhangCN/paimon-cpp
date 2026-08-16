@@ -21,13 +21,12 @@
 
 #include <algorithm>
 #include <cctype>
-#include <charconv>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
 #include <map>
+#include <optional>
 #include <sstream>
-#include <system_error>
 #include <utility>
 #include <vector>
 
@@ -629,18 +628,15 @@ Result<std::shared_ptr<arrow::DataType>> TokenParser::ParseVectorType() {
     PAIMON_RETURN_NOT_OK(NextToken(TokenType::LIST_SEPARATOR));
     PAIMON_RETURN_NOT_OK(NextToken(TokenType::LITERAL_INT));
     const std::string& length_token = GetToken().value;
-    int64_t length = 0;
-    const auto [end, error] =
-        std::from_chars(length_token.data(), length_token.data() + length_token.size(), length);
-    if (error != std::errc() || end != length_token.data() + length_token.size() || length < 1 ||
-        length > std::numeric_limits<int32_t>::max()) {
+    std::optional<int32_t> length = StringUtils::StringToValue<int32_t>(length_token);
+    if (!length || length.value() < 1) {
         return Status::Invalid(
             fmt::format("Vector length must be between 1 and {} (both inclusive), but was {}",
                         std::numeric_limits<int32_t>::max(), length_token));
     }
     PAIMON_RETURN_NOT_OK(NextToken(TokenType::END_SUBTYPE));
     return arrow::fixed_size_list(arrow::field("item", element_type, element_nullable),
-                                  static_cast<int32_t>(length));
+                                  length.value());
 }
 
 Result<int32_t> TokenParser::ParseOptionalPrecision(int32_t default_precision) {
