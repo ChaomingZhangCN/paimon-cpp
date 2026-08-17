@@ -120,8 +120,8 @@ Status VectorUtils::ValidateVectorElements(const arrow::Array& array) {
             return ValidateFixedSizeListVector(
                 checked_cast<const arrow::FixedSizeListArray&>(array));
         default:
-            return Status::Invalid(fmt::format("Cannot validate VECTOR values of type {}",
-                                               array.type()->ToString()));
+            return Status::Invalid(
+                fmt::format("Cannot validate VECTOR values of type {}", array.type()->ToString()));
     }
 }
 

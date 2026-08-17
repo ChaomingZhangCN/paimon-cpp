@@ -52,11 +52,9 @@ std::shared_ptr<arrow::DataType> ParquetVectorConverter::GetWriteType(
         case arrow::Type::MAP: {
             const auto& map_type = checked_cast<const arrow::MapType&>(*logical_type);
             return std::make_shared<arrow::MapType>(
-                map_type.value_field()->WithType(
-                    arrow::struct_({map_type.key_field()->WithType(
-                                        GetWriteType(map_type.key_type())),
-                                    map_type.item_field()->WithType(
-                                        GetWriteType(map_type.item_type()))})),
+                map_type.value_field()->WithType(arrow::struct_(
+                    {map_type.key_field()->WithType(GetWriteType(map_type.key_type())),
+                     map_type.item_field()->WithType(GetWriteType(map_type.item_type()))})),
                 map_type.keys_sorted());
         }
         default:

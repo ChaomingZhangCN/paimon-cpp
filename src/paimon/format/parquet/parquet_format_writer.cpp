@@ -66,10 +66,9 @@ Result<std::unique_ptr<ParquetFormatWriter>> ParquetFormatWriter::Create(
         std::unique_ptr<::parquet::arrow::FileWriter> file_writer,
         ::parquet::arrow::FileWriter::Open(*write_schema, pool.get(), out, writer_properties,
                                            arrow_writer_properties));
-    return std::unique_ptr<ParquetFormatWriter>(
-        new ParquetFormatWriter(std::move(file_writer), out, schema, max_memory_use,
-                                /*needs_vector_conversion=*/!logical_type->Equals(write_type),
-                                pool));
+    return std::unique_ptr<ParquetFormatWriter>(new ParquetFormatWriter(
+        std::move(file_writer), out, schema, max_memory_use,
+        /*needs_vector_conversion=*/!logical_type->Equals(write_type), pool));
 }
 
 Status ParquetFormatWriter::AddBatch(ArrowArray* batch) {

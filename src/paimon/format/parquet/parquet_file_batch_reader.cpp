@@ -118,8 +118,7 @@ bool HasSameNestedProjectionShape(const std::shared_ptr<arrow::DataType>& read_t
             const auto& read_vector = checked_cast<const arrow::FixedSizeListType&>(*read_type);
             const auto& file_vector = checked_cast<const arrow::FixedSizeListType&>(*file_type);
             return read_vector.list_size() == file_vector.list_size() &&
-                   HasSameNestedProjectionShape(read_vector.value_type(),
-                                                file_vector.value_type());
+                   HasSameNestedProjectionShape(read_vector.value_type(), file_vector.value_type());
         }
         case arrow::Type::MAP: {
             const auto& read_map = static_cast<const arrow::MapType&>(*read_type);

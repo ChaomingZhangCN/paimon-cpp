@@ -44,8 +44,7 @@ TEST(VectorUtilsTest, TestContainsVector) {
     ASSERT_TRUE(VectorUtils::ContainsVectorType(vector_type));
     ASSERT_TRUE(VectorUtils::ContainsVectorType(arrow::list(vector_type)));
     ASSERT_TRUE(VectorUtils::ContainsVectorType(arrow::map(arrow::utf8(), vector_type)));
-    ASSERT_TRUE(
-        VectorUtils::ContainsVectorType(arrow::struct_({arrow::field("v", vector_type)})));
+    ASSERT_TRUE(VectorUtils::ContainsVectorType(arrow::struct_({arrow::field("v", vector_type)})));
     ASSERT_FALSE(VectorUtils::ContainsVectorType(arrow::list(arrow::float32())));
     ASSERT_FALSE(VectorUtils::ContainsVectorType(nullptr));
 
@@ -63,10 +62,9 @@ TEST(VectorUtilsTest, TestValidateVectorElements) {
     auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
     ASSERT_OK(VectorUtils::ValidateVectorElements(
         *ArrayFromJSON(vector_type, R"([[1.0, 2.0, 3.0], null, [4.0, 5.0, 6.0]])")));
-    ASSERT_NOK_WITH_MSG(
-        VectorUtils::ValidateVectorElements(
-            *ArrayFromJSON(vector_type, R"([[1.0, 2.0, 3.0], [4.0, null, 6.0]])")),
-        "VECTOR cannot contain null elements, found one at row 1 position 1");
+    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateVectorElements(
+                            *ArrayFromJSON(vector_type, R"([[1.0, 2.0, 3.0], [4.0, null, 6.0]])")),
+                        "VECTOR cannot contain null elements, found one at row 1 position 1");
 
     // A sliced array must be validated against its own rows only.
     std::shared_ptr<arrow::Array> sliced =
@@ -91,9 +89,9 @@ TEST(VectorUtilsTest, TestValidateVectorElements) {
 TEST(VectorUtilsTest, TestValidateVectorElementsRejectsTruncatedValues) {
     auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
     std::shared_ptr<arrow::Array> values = ArrayFromJSON(arrow::float32(), "[1.0, null, 3.0]");
-    auto truncated = arrow::MakeArray(
-        arrow::ArrayData::Make(vector_type, /*length=*/2, {nullptr}, {values->data()},
-                               /*null_count=*/0));
+    auto truncated = arrow::MakeArray(arrow::ArrayData::Make(vector_type, /*length=*/2, {nullptr},
+                                                             {values->data()},
+                                                             /*null_count=*/0));
 
     ASSERT_NOK_WITH_MSG(VectorUtils::ValidateVectorElements(*truncated),
                         "VECTOR holds 3 elements while 2 rows of dimension 3 require 6");
@@ -108,14 +106,12 @@ TEST(VectorUtilsTest, TestValidateNestedVectorElements) {
     });
     ASSERT_OK(VectorUtils::ValidateNestedVectorElements(
         ArrayFromJSON(nested_type, R"([[1, [[1.0, 2.0], null], [["a", [3.0, 4.0]]]]])")));
-    ASSERT_NOK_WITH_MSG(
-        VectorUtils::ValidateNestedVectorElements(
-            ArrayFromJSON(nested_type, R"([[1, [[1.0, null]], [["a", [3.0, 4.0]]]]])")),
-        "VECTOR cannot contain null elements");
-    ASSERT_NOK_WITH_MSG(
-        VectorUtils::ValidateNestedVectorElements(
-            ArrayFromJSON(nested_type, R"([[1, [[1.0, 2.0]], [["a", [null, 4.0]]]]])")),
-        "VECTOR cannot contain null elements");
+    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateNestedVectorElements(ArrayFromJSON(
+                            nested_type, R"([[1, [[1.0, null]], [["a", [3.0, 4.0]]]]])")),
+                        "VECTOR cannot contain null elements");
+    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateNestedVectorElements(ArrayFromJSON(
+                            nested_type, R"([[1, [[1.0, 2.0]], [["a", [null, 4.0]]]]])")),
+                        "VECTOR cannot contain null elements");
     ASSERT_OK(VectorUtils::ValidateNestedVectorElements(
         ArrayFromJSON(arrow::list(arrow::float32()), R"([[1.0, null]])")));
     ASSERT_OK(VectorUtils::ValidateNestedVectorElements(nullptr));

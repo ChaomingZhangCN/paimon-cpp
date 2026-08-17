@@ -158,25 +158,26 @@ class ParquetVectorIoTest : public ::testing::Test {
         ASSERT_OK(out->Close());
     }
 
-    std::unique_ptr<FileBatchReader> CreateVectorReader(
-        const std::string& file_path, const std::shared_ptr<arrow::Schema>& read_schema,
-        const std::shared_ptr<Predicate>& predicate,
-        const std::map<std::string, std::string>& options, int32_t batch_size) {
-        std::unique_ptr<FileBatchReader> vector_reader;
+    void CreateVectorReader(const std::string& file_path,
+                            const std::shared_ptr<arrow::Schema>& read_schema,
+                            const std::shared_ptr<Predicate>& predicate,
+                            const std::map<std::string, std::string>& options, int32_t batch_size,
+                            std::unique_ptr<FileBatchReader>* vector_reader_out) {
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(file_path));
         ASSERT_OK_AND_ASSIGN(int64_t length, in->Length());
         auto in_stream = std::make_shared<ArrowInputStreamAdapter>(in, length, arrow_pool_);
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ParquetFileBatchReader> reader,
-                             ParquetFileBatchReader::Create(std::move(in_stream), options,
-                                                            batch_size, /*file_metadata=*/nullptr,
-                                                            /*storage_read_bytes=*/nullptr,
-                                                            arrow_pool_));
-        vector_reader = std::make_unique<VectorFileBatchReader>(std::move(reader), pool_);
+        ASSERT_OK_AND_ASSIGN(
+            std::unique_ptr<ParquetFileBatchReader> reader,
+            ParquetFileBatchReader::Create(std::move(in_stream), options, batch_size,
+                                           /*file_metadata=*/nullptr,
+                                           /*storage_read_bytes=*/nullptr, arrow_pool_));
+        std::unique_ptr<FileBatchReader> vector_reader =
+            std::make_unique<VectorFileBatchReader>(std::move(reader), pool_);
         auto c_schema = std::make_unique<ArrowSchema>();
         ASSERT_TRUE(arrow::ExportSchema(*read_schema, c_schema.get()).ok());
         ASSERT_OK(vector_reader->SetReadSchema(c_schema.get(), predicate,
                                                /*selection_bitmap=*/std::nullopt));
-        return vector_reader;
+        *vector_reader_out = std::move(vector_reader);
     }
 
     void ReadFixtureAndCheck(
@@ -304,9 +305,9 @@ TEST_F(ParquetVectorIoTest, ReadNestedFixedSizeListFile) {
     std::string file_path = dir_->Str() + "/nested-fixed-size-list.parquet";
     WriteWithArrowWriter(file_path, logical_type, json);
 
-    std::unique_ptr<FileBatchReader> reader =
-        CreateVectorReader(file_path, arrow::schema(logical_type->fields()), /*predicate=*/nullptr,
-                           /*options=*/{}, /*batch_size=*/10);
+    std::unique_ptr<FileBatchReader> reader;
+    CreateVectorReader(file_path, arrow::schema(logical_type->fields()), /*predicate=*/nullptr,
+                       /*options=*/{}, /*batch_size=*/10, &reader);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
                          paimon::test::ReadResultCollector::CollectResult(reader.get()));
     arrow::Result<std::shared_ptr<arrow::Array>> expected_result =
@@ -331,9 +332,9 @@ TEST_F(ParquetVectorIoTest, ReadVectorWithPredicatePushdown) {
 
     std::shared_ptr<Predicate> predicate = PredicateBuilder::GreaterThan(
         /*field_index=*/0, /*field_name=*/"id", FieldType::INT, Literal(2));
-    std::unique_ptr<FileBatchReader> reader =
-        CreateVectorReader(file_path, arrow::schema(logical_type->fields()), predicate,
-                           /*options=*/{}, /*batch_size=*/10);
+    std::unique_ptr<FileBatchReader> reader;
+    CreateVectorReader(file_path, arrow::schema(logical_type->fields()), predicate,
+                       /*options=*/{}, /*batch_size=*/10, &reader);
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
                          paimon::test::ReadResultCollector::CollectResult(reader.get()));
     arrow::Result<std::shared_ptr<arrow::Array>> expected_result =
