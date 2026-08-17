@@ -41,9 +41,13 @@ TEST(ParquetVectorConverterTest, ConvertNullableVectorToList) {
     auto list_array = checked_pointer_cast<arrow::ListArray>(converted);
     ASSERT_EQ(list_array->value_length(0), 3);
     ASSERT_TRUE(list_array->IsNull(1));
-    ASSERT_EQ(list_array->value_length(1), 3);
+    // The Parquet writer rejects a null LIST slot spanning values, so the values Arrow keeps for
+    // a null VECTOR row are dropped.
+    ASSERT_EQ(list_array->value_length(1), 0);
     ASSERT_EQ(list_array->value_length(2), 3);
-    ASSERT_EQ(list_array->values()->length(), 9);
+    ASSERT_EQ(list_array->values()->length(), 6);
+    auto values = checked_pointer_cast<arrow::FloatArray>(list_array->values());
+    ASSERT_FLOAT_EQ(values->Value(3), 4.0f);
 }
 
 TEST(ParquetVectorConverterTest, ConvertNestedVectorsToList) {
