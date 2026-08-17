@@ -173,19 +173,11 @@ TEST(VectorFileBatchReaderTest, RejectInvalidVectorValues) {
 }
 
 TEST(VectorFileBatchReaderTest, RejectInvalidFixedSizeListVectorValues) {
-    auto values_builder = std::make_shared<arrow::FloatBuilder>();
-    arrow::FixedSizeListBuilder vector_builder(arrow::default_memory_pool(), values_builder, 3);
-    ASSERT_TRUE(values_builder->Append(1.0f).ok());
-    ASSERT_TRUE(values_builder->AppendNull().ok());
-    ASSERT_TRUE(values_builder->Append(3.0f).ok());
-    ASSERT_TRUE(vector_builder.Append().ok());
-    std::shared_ptr<arrow::Array> vector_array;
-    ASSERT_TRUE(vector_builder.Finish(&vector_array).ok());
-    arrow::Result<std::shared_ptr<arrow::StructArray>> struct_result =
-        arrow::StructArray::Make({vector_array}, {"embedding"});
-    ASSERT_TRUE(struct_result.ok()) << struct_result.status().ToString();
-    std::shared_ptr<arrow::StructArray> physical_array = std::move(struct_result).ValueOrDie();
-    auto physical_type = AsStructType(physical_array->type());
+    auto physical_type = AsStructType(
+        arrow::struct_({arrow::field("embedding", arrow::fixed_size_list(arrow::float32(), 3))}));
+    auto physical_array =
+        arrow::ipc::internal::json::ArrayFromJSON(physical_type, R"([[[1.0, null, 3.0]]])")
+            .ValueOrDie();
     auto mock_reader = std::make_unique<MockFileBatchReader>(physical_array, physical_type,
                                                              /*read_batch_size=*/10);
     mock_reader->EnableRandomizeBatchSize(false);

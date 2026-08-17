@@ -72,8 +72,8 @@ class ParquetFormatWriter : public FormatWriter {
     ParquetFormatWriter(std::unique_ptr<::parquet::arrow::FileWriter> writer,
                         const std::shared_ptr<ArrowOutputStreamAdapter>& out,
                         const std::shared_ptr<arrow::Schema>& schema, uint64_t max_memory_use,
-                        const std::shared_ptr<arrow::MemoryPool>& pool,
-                        bool needs_vector_conversion);
+                        bool needs_vector_conversion,
+                        const std::shared_ptr<arrow::MemoryPool>& pool);
 
     Result<uint64_t> GetEstimateLength() const;
 
