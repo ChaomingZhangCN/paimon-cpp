@@ -161,6 +161,28 @@ Result<std::shared_ptr<arrow::ArrayData>> RebaseListLike(
     return rebased;
 }
 
+/// Rebases a fixed size list array, whose child holds `list_size` values per row.
+Result<std::shared_ptr<arrow::ArrayData>> RebaseFixedSizeList(
+    const std::shared_ptr<arrow::ArrayData>& data, arrow::MemoryPool* pool) {
+    if (data->child_data.size() != 1) {
+        return CopyToZeroOffset(data, pool);
+    }
+    const int64_t list_size =
+        checked_cast<const arrow::FixedSizeListType&>(*data->type).list_size();
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Buffer> validity,
+                           RebaseValidityBitmap(*data, pool));
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+        std::shared_ptr<arrow::ArrayData> child_slice,
+        data->child_data[0]->SliceSafe(data->offset * list_size, data->length * list_size));
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::ArrayData> child,
+                           RebaseToZeroOffset(child_slice, pool));
+    std::shared_ptr<arrow::ArrayData> rebased =
+        arrow::ArrayData::Make(data->type, data->length, data->null_count.load(), /*offset=*/0);
+    rebased->buffers = {std::move(validity)};
+    rebased->child_data = {std::move(child)};
+    return rebased;
+}
+
 /// Rebases a struct array, whose slices keep full length children.
 Result<std::shared_ptr<arrow::ArrayData>> RebaseStruct(
     const std::shared_ptr<arrow::ArrayData>& data, arrow::MemoryPool* pool) {
@@ -234,6 +256,8 @@ Result<std::shared_ptr<arrow::ArrayData>> RebaseToZeroOffset(
             return RebaseListLike<int32_t>(data, pool);
         case arrow::Type::LARGE_LIST:
             return RebaseListLike<int64_t>(data, pool);
+        case arrow::Type::FIXED_SIZE_LIST:
+            return RebaseFixedSizeList(data, pool);
         case arrow::Type::STRUCT:
             return RebaseStruct(data, pool);
         case arrow::Type::DICTIONARY:
