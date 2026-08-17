@@ -18,14 +18,12 @@
 
 #include "paimon/core/io/vector_file_batch_reader.h"
 
-#include <cstdint>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include "arrow/array.h"
-#include "arrow/array/array_nested.h"
 #include "arrow/c/abi.h"
 #include "arrow/c/bridge.h"
 #include "arrow/compute/api.h"
@@ -33,23 +31,12 @@
 #include "fmt/format.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/arrow/vector_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/status.h"
 
 namespace paimon {
 namespace {
-
-bool ContainsVectorType(const std::shared_ptr<arrow::DataType>& type) {
-    if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
-        return true;
-    }
-    for (const auto& field : type->fields()) {
-        if (ContainsVectorType(field->type())) {
-            return true;
-        }
-    }
-    return false;
-}
 
 std::shared_ptr<arrow::Field> FindField(const std::shared_ptr<arrow::DataType>& type,
                                         const std::string& name) {
@@ -61,6 +48,19 @@ std::shared_ptr<arrow::Field> FindField(const std::shared_ptr<arrow::DataType>& 
     return nullptr;
 }
 
+/// Rebuilds `map_type` with new key and item types, keeping the name and metadata of its
+/// entries field.
+std::shared_ptr<arrow::DataType> MakeMapType(const arrow::MapType& map_type,
+                                             const std::shared_ptr<arrow::Field>& key_field,
+                                             const std::shared_ptr<arrow::Field>& item_field) {
+    return std::make_shared<arrow::MapType>(
+        map_type.value_field()->WithType(arrow::struct_({key_field, item_field})),
+        map_type.keys_sorted());
+}
+
+/// Returns the type to request from the file format plugin. A VECTOR is only read back as a
+/// LIST when the file itself stores it as one: writers such as Paimon Java expose VECTOR
+/// columns as Arrow LIST, while Paimon Rust and Python expose them as FixedSizeList.
 std::shared_ptr<arrow::DataType> GetPhysicalReadType(
     const std::shared_ptr<arrow::DataType>& logical_type,
     const std::shared_ptr<arrow::DataType>& file_type) {
@@ -100,50 +100,15 @@ std::shared_ptr<arrow::DataType> GetPhysicalReadType(
             }
             const auto& map_type = checked_cast<const arrow::MapType&>(*logical_type);
             const auto& file_map_type = checked_cast<const arrow::MapType&>(*file_type);
-            return std::make_shared<arrow::MapType>(
-                map_type.key_field()->WithType(
-                    GetPhysicalReadType(map_type.key_type(), file_map_type.key_type())),
-                map_type.item_field()->WithType(
-                    GetPhysicalReadType(map_type.item_type(), file_map_type.item_type())),
-                map_type.keys_sorted());
+            return MakeMapType(map_type,
+                               map_type.key_field()->WithType(GetPhysicalReadType(
+                                   map_type.key_type(), file_map_type.key_type())),
+                               map_type.item_field()->WithType(GetPhysicalReadType(
+                                   map_type.item_type(), file_map_type.item_type())));
         }
         default:
             return logical_type;
     }
-}
-
-Status ValidateVectorElements(const arrow::ListArray& array) {
-    for (int64_t i = 0; i < array.length(); ++i) {
-        if (array.IsNull(i)) {
-            continue;
-        }
-        int64_t value_offset = array.value_offset(i);
-        int64_t value_length = array.value_length(i);
-        for (int64_t j = 0; j < value_length; ++j) {
-            if (array.values()->IsNull(value_offset + j)) {
-                return Status::Invalid(fmt::format(
-                    "VECTOR cannot contain null elements, found one at row {} position {}", i, j));
-            }
-        }
-    }
-    return Status::OK();
-}
-
-Status ValidateVectorElements(const arrow::FixedSizeListArray& array) {
-    const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*array.type());
-    for (int64_t i = 0; i < array.length(); ++i) {
-        if (array.IsNull(i)) {
-            continue;
-        }
-        int64_t value_offset = (array.offset() + i) * vector_type.list_size();
-        for (int32_t j = 0; j < vector_type.list_size(); ++j) {
-            if (array.values()->IsNull(value_offset + j)) {
-                return Status::Invalid(fmt::format(
-                    "VECTOR cannot contain null elements, found one at row {} position {}", i, j));
-            }
-        }
-    }
-    return Status::OK();
 }
 
 Result<std::shared_ptr<arrow::Array>> CastListToVector(
@@ -153,7 +118,7 @@ Result<std::shared_ptr<arrow::Array>> CastListToVector(
         return Status::Invalid(
             fmt::format("Cannot restore VECTOR from type {}", array->type()->ToString()));
     }
-    PAIMON_RETURN_NOT_OK(ValidateVectorElements(checked_cast<const arrow::ListArray&>(*array)));
+    PAIMON_RETURN_NOT_OK(VectorUtils::ValidateVectorElements(*array));
     arrow::compute::ExecContext exec_context(pool);
     arrow::TypeHolder type_holder(read_type.get());
     arrow::compute::CastOptions options = arrow::compute::CastOptions::Safe();
@@ -180,14 +145,14 @@ std::shared_ptr<arrow::DataType> RebuildNestedType(
 
     const auto& entries_type = checked_cast<const arrow::StructType&>(*children[0]->type);
     const auto& map_type = checked_cast<const arrow::MapType&>(*read_type);
-    return std::make_shared<arrow::MapType>(entries_type.field(0), entries_type.field(1),
-                                            map_type.keys_sorted());
+    return MakeMapType(map_type, map_type.key_field()->WithType(entries_type.field(0)->type()),
+                       map_type.item_field()->WithType(entries_type.field(1)->type()));
 }
 
 Result<std::shared_ptr<arrow::Array>> ConvertToReadType(
     const std::shared_ptr<arrow::Array>& array, const std::shared_ptr<arrow::DataType>& read_type,
     arrow::MemoryPool* pool) {
-    if (!ContainsVectorType(read_type)) {
+    if (!VectorUtils::ContainsVectorType(read_type)) {
         return array;
     }
     switch (read_type->id()) {
@@ -202,8 +167,7 @@ Result<std::shared_ptr<arrow::Array>> ConvertToReadType(
                                                        source_type.ToString(),
                                                        vector_type.ToString()));
                 }
-                PAIMON_RETURN_NOT_OK(
-                    ValidateVectorElements(checked_cast<const arrow::FixedSizeListArray&>(*array)));
+                PAIMON_RETURN_NOT_OK(VectorUtils::ValidateVectorElements(*array));
                 return array;
             }
             return CastListToVector(
@@ -249,12 +213,7 @@ VectorFileBatchReader::VectorFileBatchReader(std::unique_ptr<FileBatchReader>&& 
     : arrow_pool_(GetArrowPool(pool)), reader_(std::move(reader)) {}
 
 bool VectorFileBatchReader::ContainsVector(const std::shared_ptr<arrow::Schema>& schema) {
-    for (const auto& field : schema->fields()) {
-        if (ContainsVectorType(field->type())) {
-            return true;
-        }
-    }
-    return false;
+    return VectorUtils::ContainsVector(schema);
 }
 
 Status VectorFileBatchReader::SetReadSchema(

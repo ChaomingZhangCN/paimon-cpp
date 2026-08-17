@@ -263,7 +263,26 @@ TEST(ArrowUtilsTest, TestCheckNullableMatchRejectsNullVectorElement) {
 
     ASSERT_NOK_WITH_MSG(
         ArrowUtils::CheckNullabilityMatch(arrow::schema({vector_field}), struct_array),
-        "VECTOR field embedding cannot contain null elements");
+        "VECTOR field embedding is invalid: VECTOR cannot contain null elements");
+}
+
+// Arrow accepts a FixedSizeList whose child is shorter than `length * list_size` when importing
+// it over the C data interface, so the nullability check must reject it rather than scan past the
+// end of the child.
+TEST(ArrowUtilsTest, TestCheckNullableMatchRejectsTruncatedVector) {
+    auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
+    auto vector_field = arrow::field("embedding", vector_type);
+    arrow::FloatBuilder values_builder;
+    ASSERT_TRUE(values_builder.AppendValues({1.0f, 2.0f, 3.0f}).ok());
+    std::shared_ptr<arrow::Array> values = values_builder.Finish().ValueOrDie();
+    auto vector_data = arrow::ArrayData::Make(vector_type, /*length=*/2, {nullptr},
+                                              {values->data()}, /*null_count=*/0);
+    auto vector_array = arrow::MakeArray(vector_data);
+    auto struct_array = arrow::StructArray::Make({vector_array}, {vector_field}).ValueOrDie();
+
+    ASSERT_NOK_WITH_MSG(
+        ArrowUtils::CheckNullabilityMatch(arrow::schema({vector_field}), struct_array),
+        "VECTOR field embedding is invalid: VECTOR holds 3 elements while 2 rows of dimension 3");
 }
 
 TEST(ArrowUtilsTest, TestCheckNullableMatchWithMap) {

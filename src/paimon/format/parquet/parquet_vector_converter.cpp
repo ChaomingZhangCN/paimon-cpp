@@ -18,63 +18,17 @@
 
 #include "paimon/format/parquet/parquet_vector_converter.h"
 
-#include <cstdint>
 #include <memory>
 
 #include "arrow/array.h"
-#include "arrow/array/array_nested.h"
 #include "arrow/compute/api.h"
 #include "arrow/type.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/arrow/vector_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/status.h"
 
 namespace paimon::parquet {
-namespace {
-
-bool ContainsVectorType(const std::shared_ptr<arrow::DataType>& type) {
-    if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
-        return true;
-    }
-    for (const auto& field : type->fields()) {
-        if (ContainsVectorType(field->type())) {
-            return true;
-        }
-    }
-    return false;
-}
-
-Status ValidateVectorElements(const std::shared_ptr<arrow::Array>& array) {
-    if (!ContainsVectorType(array->type())) {
-        return Status::OK();
-    }
-    if (array->type_id() == arrow::Type::FIXED_SIZE_LIST) {
-        const auto& vector_array = checked_cast<const arrow::FixedSizeListArray&>(*array);
-        const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*array->type());
-        const std::shared_ptr<arrow::Array>& values = vector_array.values();
-        if (values->null_count() == 0) {
-            return Status::OK();
-        }
-        for (int64_t i = 0; i < vector_array.length(); ++i) {
-            if (vector_array.IsNull(i)) {
-                continue;
-            }
-            int64_t value_offset = (vector_array.offset() + i) * vector_type.list_size();
-            for (int32_t j = 0; j < vector_type.list_size(); ++j) {
-                if (values->IsNull(value_offset + j)) {
-                    return Status::Invalid("VECTOR cannot contain null elements");
-                }
-            }
-        }
-        return Status::OK();
-    }
-    for (const auto& child_data : array->data()->child_data) {
-        PAIMON_RETURN_NOT_OK(ValidateVectorElements(arrow::MakeArray(child_data)));
-    }
-    return Status::OK();
-}
-
-}  // namespace
 
 std::shared_ptr<arrow::DataType> ParquetVectorConverter::GetWriteType(
     const std::shared_ptr<arrow::DataType>& logical_type) {
@@ -98,8 +52,11 @@ std::shared_ptr<arrow::DataType> ParquetVectorConverter::GetWriteType(
         case arrow::Type::MAP: {
             const auto& map_type = checked_cast<const arrow::MapType&>(*logical_type);
             return std::make_shared<arrow::MapType>(
-                map_type.key_field()->WithType(GetWriteType(map_type.key_type())),
-                map_type.item_field()->WithType(GetWriteType(map_type.item_type())),
+                map_type.value_field()->WithType(
+                    arrow::struct_({map_type.key_field()->WithType(
+                                        GetWriteType(map_type.key_type())),
+                                    map_type.item_field()->WithType(
+                                        GetWriteType(map_type.item_type()))})),
                 map_type.keys_sorted());
         }
         default:
@@ -109,10 +66,10 @@ std::shared_ptr<arrow::DataType> ParquetVectorConverter::GetWriteType(
 
 Result<std::shared_ptr<arrow::Array>> ParquetVectorConverter::ConvertToWriteType(
     const std::shared_ptr<arrow::Array>& array, arrow::MemoryPool* pool) {
-    if (!ContainsVectorType(array->type())) {
+    if (!VectorUtils::ContainsVectorType(array->type())) {
         return array;
     }
-    PAIMON_RETURN_NOT_OK(ValidateVectorElements(array));
+    PAIMON_RETURN_NOT_OK(VectorUtils::ValidateNestedVectorElements(array));
     std::shared_ptr<arrow::DataType> write_type = GetWriteType(array->type());
     arrow::compute::ExecContext exec_context(pool);
     arrow::TypeHolder type_holder(write_type.get());

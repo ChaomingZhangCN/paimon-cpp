@@ -38,6 +38,7 @@
 #include "paimon/common/data/variant/variant_type_utils.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
+#include "paimon/common/utils/arrow/vector_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/object_utils.h"
 #include "paimon/common/utils/preconditions.h"
@@ -72,18 +73,6 @@ bool ContainsBlobField(const std::shared_ptr<arrow::Field>& field) {
     } else if (type->id() == arrow::Type::MAP) {
         const auto& map_type = checked_cast<const arrow::MapType&>(*type);
         return ContainsBlobField(map_type.key_field()) || ContainsBlobField(map_type.item_field());
-    }
-    return false;
-}
-
-bool ContainsVectorField(const std::shared_ptr<arrow::Field>& field) {
-    if (field->type()->id() == arrow::Type::FIXED_SIZE_LIST) {
-        return true;
-    }
-    for (const auto& child : field->type()->fields()) {
-        if (ContainsVectorField(child)) {
-            return true;
-        }
     }
     return false;
 }
@@ -644,7 +633,7 @@ Status SchemaValidation::ValidateMapStorageLayout(const TableSchema& schema,
         if (ContainsBlobField(map_type->item_field())) {
             return Status::Invalid("MAP shared-shredding currently cannot contain BLOB fields.");
         }
-        if (ContainsVectorField(map_type->item_field())) {
+        if (VectorUtils::ContainsVectorField(map_type->item_field())) {
             return Status::Invalid("MAP shared-shredding currently cannot contain VECTOR fields.");
         }
         // Validate max-columns config
@@ -677,7 +666,7 @@ Status SchemaValidation::ValidateVectorFields(const TableSchema& schema,
                                               const CoreOptions& options) {
     bool has_vector = false;
     for (const auto& field : schema.Fields()) {
-        if (ContainsVectorField(field.ArrowField())) {
+        if (VectorUtils::ContainsVectorField(field.ArrowField())) {
             has_vector = true;
             break;
         }

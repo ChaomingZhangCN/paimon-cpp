@@ -30,6 +30,7 @@
 #include "arrow/util/compression.h"
 #include "fmt/format.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/arrow/vector_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/string_utils.h"
 
@@ -376,23 +377,10 @@ Status ArrowUtils::InnerCheckNullabilityMatch(const std::shared_ptr<arrow::Field
         PAIMON_RETURN_NOT_OK(
             InnerCheckNullabilityMatch(list_type->value_field(), list_array->values()));
     } else if (type->id() == arrow::Type::FIXED_SIZE_LIST) {
-        auto vector_type = checked_pointer_cast<arrow::FixedSizeListType>(field->type());
-        auto vector_array = checked_pointer_cast<arrow::FixedSizeListArray>(data);
-        const std::shared_ptr<arrow::Array>& values = vector_array->values();
-        if (values->null_count() != 0) {
-            int32_t vector_length = vector_type->list_size();
-            for (int64_t i = 0; i < vector_array->length(); ++i) {
-                if (vector_array->IsNull(i)) {
-                    continue;
-                }
-                int64_t value_offset = (vector_array->offset() + i) * vector_length;
-                for (int32_t j = 0; j < vector_length; ++j) {
-                    if (values->IsNull(value_offset + j)) {
-                        return Status::Invalid(fmt::format(
-                            "VECTOR field {} cannot contain null elements", field->name()));
-                    }
-                }
-            }
+        Status status = VectorUtils::ValidateVectorElements(*data);
+        if (!status.ok()) {
+            return Status::Invalid(
+                fmt::format("VECTOR field {} is invalid: {}", field->name(), status.message()));
         }
     } else if (type->id() == arrow::Type::MAP) {
         auto map_type = checked_pointer_cast<arrow::MapType>(field->type());
