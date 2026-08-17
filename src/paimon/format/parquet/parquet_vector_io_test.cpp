@@ -29,17 +29,26 @@
 #include "arrow/ipc/json_simple.h"
 #include "gtest/gtest.h"
 #include "paimon/common/utils/arrow/arrow_input_stream_adapter.h"
+#include "paimon/common/utils/arrow/arrow_output_stream_adapter.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/checked_cast.h"
 #include "paimon/core/io/vector_file_batch_reader.h"
+#include "paimon/defs.h"
 #include "paimon/format/parquet/parquet_file_batch_reader.h"
 #include "paimon/format/parquet/parquet_format_defs.h"
 #include "paimon/format/parquet/parquet_format_writer.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/memory/memory_pool.h"
+#include "paimon/predicate/literal.h"
+#include "paimon/predicate/predicate_builder.h"
 #include "paimon/testing/utils/read_result_collector.h"
 #include "paimon/testing/utils/testharness.h"
+#include "parquet/arrow/writer.h"
 #include "parquet/properties.h"
+
+namespace paimon {
+class Predicate;
+}  // namespace paimon
 
 namespace paimon::parquet::test {
 
@@ -57,25 +66,8 @@ class ParquetVectorIoTest : public ::testing::Test {
                        const std::shared_ptr<arrow::StructType>& write_type,
                        const std::shared_ptr<arrow::StructType>& read_type,
                        const std::string& json) {
-        arrow::Result<std::shared_ptr<arrow::Array>> write_array_result =
-            arrow::ipc::internal::json::ArrayFromJSON(write_type, json);
-        ASSERT_TRUE(write_array_result.ok()) << write_array_result.status().ToString();
-        std::shared_ptr<arrow::Array> write_array = std::move(write_array_result).ValueOrDie();
-        auto c_array = std::make_unique<ArrowArray>();
-        ASSERT_TRUE(arrow::ExportArray(*write_array, c_array.get()).ok());
-
         std::string file_path = dir_->Str() + "/" + file_name;
-        ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> out,
-                             fs_->Create(file_path, /*overwrite=*/false));
-        ::parquet::WriterProperties::Builder properties_builder;
-        ASSERT_OK_AND_ASSIGN(
-            std::unique_ptr<ParquetFormatWriter> writer,
-            ParquetFormatWriter::Create(out, arrow::schema(write_type->fields()),
-                                        properties_builder.build(),
-                                        DEFAULT_PARQUET_WRITER_MAX_MEMORY_USE, arrow_pool_));
-        ASSERT_OK(writer->AddBatch(c_array.get()));
-        ASSERT_OK(writer->Finish());
-        ASSERT_OK(out->Close());
+        WriteWithFormatWriter(file_path, write_type, json, /*max_row_group_length=*/1024);
 
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(file_path));
         ASSERT_OK_AND_ASSIGN(int64_t length, in->Length());
@@ -112,6 +104,79 @@ class ParquetVectorIoTest : public ::testing::Test {
         std::shared_ptr<arrow::Array> expected = std::move(expected_result).ValueOrDie();
         ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(actual))
             << actual->ToString();
+    }
+
+    /// Writes the JSON rows through the Paimon Parquet writer, which stores VECTOR values as
+    /// Parquet LIST.
+    void WriteWithFormatWriter(const std::string& file_path,
+                               const std::shared_ptr<arrow::StructType>& write_type,
+                               const std::string& json, int64_t max_row_group_length) {
+        arrow::Result<std::shared_ptr<arrow::Array>> write_array_result =
+            arrow::ipc::internal::json::ArrayFromJSON(write_type, json);
+        ASSERT_TRUE(write_array_result.ok()) << write_array_result.status().ToString();
+        std::shared_ptr<arrow::Array> write_array = std::move(write_array_result).ValueOrDie();
+        auto c_array = std::make_unique<ArrowArray>();
+        ASSERT_TRUE(arrow::ExportArray(*write_array, c_array.get()).ok());
+
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> out,
+                             fs_->Create(file_path, /*overwrite=*/false));
+        ::parquet::WriterProperties::Builder properties_builder;
+        properties_builder.max_row_group_length(max_row_group_length);
+        ASSERT_OK_AND_ASSIGN(
+            std::unique_ptr<ParquetFormatWriter> writer,
+            ParquetFormatWriter::Create(out, arrow::schema(write_type->fields()),
+                                        properties_builder.build(),
+                                        DEFAULT_PARQUET_WRITER_MAX_MEMORY_USE, arrow_pool_));
+        ASSERT_OK(writer->AddBatch(c_array.get()));
+        ASSERT_OK(writer->Finish());
+        ASSERT_OK(out->Close());
+    }
+
+    /// Writes `array` with the plain Arrow Parquet writer, so FixedSizeList columns keep their
+    /// Arrow type in the file schema the way Paimon Rust and Python writers store them.
+    void WriteWithArrowWriter(const std::string& file_path,
+                              const std::shared_ptr<arrow::StructType>& type,
+                              const std::string& json) {
+        arrow::Result<std::shared_ptr<arrow::Array>> array_result =
+            arrow::ipc::internal::json::ArrayFromJSON(type, json);
+        ASSERT_TRUE(array_result.ok()) << array_result.status().ToString();
+        arrow::Result<std::shared_ptr<arrow::RecordBatch>> batch_result =
+            arrow::RecordBatch::FromStructArray(std::move(array_result).ValueOrDie());
+        ASSERT_TRUE(batch_result.ok()) << batch_result.status().ToString();
+        arrow::Result<std::shared_ptr<arrow::Table>> table_result =
+            arrow::Table::FromRecordBatches({std::move(batch_result).ValueOrDie()});
+        ASSERT_TRUE(table_result.ok()) << table_result.status().ToString();
+
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> out,
+                             fs_->Create(file_path, /*overwrite=*/false));
+        auto arrow_out = std::make_shared<ArrowOutputStreamAdapter>(out);
+        ::parquet::WriterProperties::Builder properties_builder;
+        arrow::Status status = ::parquet::arrow::WriteTable(
+            *std::move(table_result).ValueOrDie(), arrow_pool_.get(), arrow_out,
+            /*chunk_size=*/1024, properties_builder.build());
+        ASSERT_TRUE(status.ok()) << status.ToString();
+        ASSERT_OK(out->Close());
+    }
+
+    std::unique_ptr<FileBatchReader> CreateVectorReader(
+        const std::string& file_path, const std::shared_ptr<arrow::Schema>& read_schema,
+        const std::shared_ptr<Predicate>& predicate,
+        const std::map<std::string, std::string>& options, int32_t batch_size) {
+        std::unique_ptr<FileBatchReader> vector_reader;
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(file_path));
+        ASSERT_OK_AND_ASSIGN(int64_t length, in->Length());
+        auto in_stream = std::make_shared<ArrowInputStreamAdapter>(in, length, arrow_pool_);
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ParquetFileBatchReader> reader,
+                             ParquetFileBatchReader::Create(std::move(in_stream), options,
+                                                            batch_size, /*file_metadata=*/nullptr,
+                                                            /*storage_read_bytes=*/nullptr,
+                                                            arrow_pool_));
+        vector_reader = std::make_unique<VectorFileBatchReader>(std::move(reader), pool_);
+        auto c_schema = std::make_unique<ArrowSchema>();
+        ASSERT_TRUE(arrow::ExportSchema(*read_schema, c_schema.get()).ok());
+        ASSERT_OK(vector_reader->SetReadSchema(c_schema.get(), predicate,
+                                               /*selection_bitmap=*/std::nullopt));
+        return vector_reader;
     }
 
     void ReadFixtureAndCheck(
@@ -224,6 +289,60 @@ TEST_F(ParquetVectorIoTest, WriteAndReadNestedDoubleVector) {
     WriteAndCheck("nested-vector.parquet", struct_type, struct_type,
                   R"([[1, [[1.0, 2.0], [[3.0, 4.0], null], [["a", [5.0, 6.0]]]]],
                        [2, [null, null, [["b", null]]]]])");
+}
+
+// Vectors nested in a LIST keep their Arrow type when a third-party writer stores them as
+// FixedSizeList, so the Parquet reader must accept a FixedSizeList read type as well.
+TEST_F(ParquetVectorIoTest, ReadNestedFixedSizeListFile) {
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto logical_type = checked_pointer_cast<arrow::StructType>(arrow::struct_({
+        arrow::field("id", arrow::int32()),
+        arrow::field("history", arrow::list(vector_type)),
+    }));
+    const std::string json = R"([[1, [[1.0, 2.0, 3.0], null]], [2, null]])";
+    std::string file_path = dir_->Str() + "/nested-fixed-size-list.parquet";
+    WriteWithArrowWriter(file_path, logical_type, json);
+
+    std::unique_ptr<FileBatchReader> reader =
+        CreateVectorReader(file_path, arrow::schema(logical_type->fields()), /*predicate=*/nullptr,
+                           /*options=*/{}, /*batch_size=*/10);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                         paimon::test::ReadResultCollector::CollectResult(reader.get()));
+    arrow::Result<std::shared_ptr<arrow::Array>> expected_result =
+        arrow::ipc::internal::json::ArrayFromJSON(logical_type, json);
+    ASSERT_TRUE(expected_result.ok()) << expected_result.status().ToString();
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(std::move(expected_result).ValueOrDie())
+                    ->Equals(actual))
+        << actual->ToString();
+}
+
+TEST_F(ParquetVectorIoTest, ReadVectorWithPredicatePushdown) {
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto logical_type = checked_pointer_cast<arrow::StructType>(arrow::struct_(
+        {arrow::field("id", arrow::int32()), arrow::field("embedding", vector_type)}));
+    // One row per row group, so the predicate on `id` prunes row groups while reading.
+    std::string file_path = dir_->Str() + "/vector-predicate.parquet";
+    WriteWithFormatWriter(file_path, logical_type,
+                          R"([[1, [1.0, 2.0, 3.0]], [2, null], [3, [4.0, 5.0, 6.0]],
+                              [4, [7.0, 8.0, 9.0]]])",
+                          /*max_row_group_length=*/1);
+
+    std::shared_ptr<Predicate> predicate = PredicateBuilder::GreaterThan(
+        /*field_index=*/0, /*field_name=*/"id", FieldType::INT, Literal(2));
+    std::unique_ptr<FileBatchReader> reader =
+        CreateVectorReader(file_path, arrow::schema(logical_type->fields()), predicate,
+                           /*options=*/{}, /*batch_size=*/10);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                         paimon::test::ReadResultCollector::CollectResult(reader.get()));
+    arrow::Result<std::shared_ptr<arrow::Array>> expected_result =
+        arrow::ipc::internal::json::ArrayFromJSON(
+            logical_type, R"([[3, [4.0, 5.0, 6.0]], [4, [7.0, 8.0, 9.0]]])");
+    ASSERT_TRUE(expected_result.ok()) << expected_result.status().ToString();
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(std::move(expected_result).ValueOrDie())
+                    ->Equals(actual))
+        << actual->ToString();
 }
 
 TEST_F(ParquetVectorIoTest, ReadJavaFixture) {
