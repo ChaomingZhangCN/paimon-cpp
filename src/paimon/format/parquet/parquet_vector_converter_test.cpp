@@ -29,10 +29,15 @@
 namespace paimon::parquet::test {
 
 TEST(ParquetVectorConverterTest, ConvertNullableVectorToList) {
-    auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
-    auto vector_array = arrow::ipc::internal::json::ArrayFromJSON(
-                            vector_type, R"([[1.0, 2.0, 3.0], null, [4.0, 5.0, 6.0]])")
-                            .ValueOrDie();
+    auto values_builder = std::make_shared<arrow::FloatBuilder>();
+    arrow::FixedSizeListBuilder vector_builder(arrow::default_memory_pool(), values_builder, 3);
+    ASSERT_TRUE(values_builder->AppendValues({1.0f, 2.0f, 3.0f}).ok());
+    ASSERT_TRUE(vector_builder.Append().ok());
+    ASSERT_TRUE(vector_builder.AppendNull().ok());
+    ASSERT_TRUE(values_builder->AppendValues({4.0f, 5.0f, 6.0f}).ok());
+    ASSERT_TRUE(vector_builder.Append().ok());
+    std::shared_ptr<arrow::FixedSizeListArray> vector_array;
+    ASSERT_TRUE(vector_builder.Finish(&vector_array).ok());
 
     ASSERT_OK_AND_ASSIGN(
         std::shared_ptr<arrow::Array> converted,
@@ -41,9 +46,9 @@ TEST(ParquetVectorConverterTest, ConvertNullableVectorToList) {
     auto list_array = checked_pointer_cast<arrow::ListArray>(converted);
     ASSERT_EQ(list_array->value_length(0), 3);
     ASSERT_TRUE(list_array->IsNull(1));
-    ASSERT_EQ(list_array->value_length(1), 0);
+    ASSERT_EQ(list_array->value_length(1), 3);
     ASSERT_EQ(list_array->value_length(2), 3);
-    ASSERT_EQ(list_array->values()->length(), 6);
+    ASSERT_EQ(list_array->values()->length(), 9);
 }
 
 TEST(ParquetVectorConverterTest, ConvertNestedVectorsToList) {

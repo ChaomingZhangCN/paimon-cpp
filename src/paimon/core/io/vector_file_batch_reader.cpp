@@ -19,14 +19,13 @@
 #include "paimon/core/io/vector_file_batch_reader.h"
 
 #include <cstdint>
-#include <limits>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "arrow/array.h"
 #include "arrow/array/array_nested.h"
-#include "arrow/array/builder_primitive.h"
 #include "arrow/c/abi.h"
 #include "arrow/c/bridge.h"
 #include "arrow/compute/api.h"
@@ -52,30 +51,60 @@ bool ContainsVectorType(const std::shared_ptr<arrow::DataType>& type) {
     return false;
 }
 
+std::shared_ptr<arrow::Field> FindField(const std::shared_ptr<arrow::DataType>& type,
+                                        const std::string& name) {
+    for (const auto& field : type->fields()) {
+        if (field->name() == name) {
+            return field;
+        }
+    }
+    return nullptr;
+}
+
 std::shared_ptr<arrow::DataType> GetPhysicalReadType(
-    const std::shared_ptr<arrow::DataType>& logical_type) {
+    const std::shared_ptr<arrow::DataType>& logical_type,
+    const std::shared_ptr<arrow::DataType>& file_type) {
     switch (logical_type->id()) {
         case arrow::Type::FIXED_SIZE_LIST: {
+            if (!file_type || file_type->id() != arrow::Type::LIST) {
+                return logical_type;
+            }
             const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*logical_type);
-            return arrow::list(
-                vector_type.value_field()->WithType(GetPhysicalReadType(vector_type.value_type())));
+            const auto& list_type = checked_cast<const arrow::ListType&>(*file_type);
+            return arrow::list(vector_type.value_field()->WithType(
+                GetPhysicalReadType(vector_type.value_type(), list_type.value_type())));
         }
         case arrow::Type::STRUCT: {
+            if (!file_type || file_type->id() != arrow::Type::STRUCT) {
+                return logical_type;
+            }
             arrow::FieldVector fields;
             fields.reserve(logical_type->num_fields());
             for (const auto& field : logical_type->fields()) {
-                fields.push_back(field->WithType(GetPhysicalReadType(field->type())));
+                std::shared_ptr<arrow::Field> file_field = FindField(file_type, field->name());
+                fields.push_back(field->WithType(
+                    GetPhysicalReadType(field->type(), file_field ? file_field->type() : nullptr)));
             }
             return arrow::struct_(fields);
         }
-        case arrow::Type::LIST:
+        case arrow::Type::LIST: {
+            if (!file_type || file_type->id() != arrow::Type::LIST) {
+                return logical_type;
+            }
             return arrow::list(logical_type->field(0)->WithType(
-                GetPhysicalReadType(logical_type->field(0)->type())));
+                GetPhysicalReadType(logical_type->field(0)->type(), file_type->field(0)->type())));
+        }
         case arrow::Type::MAP: {
+            if (!file_type || file_type->id() != arrow::Type::MAP) {
+                return logical_type;
+            }
             const auto& map_type = checked_cast<const arrow::MapType&>(*logical_type);
+            const auto& file_map_type = checked_cast<const arrow::MapType&>(*file_type);
             return std::make_shared<arrow::MapType>(
-                map_type.key_field()->WithType(GetPhysicalReadType(map_type.key_type())),
-                map_type.item_field()->WithType(GetPhysicalReadType(map_type.item_type())),
+                map_type.key_field()->WithType(
+                    GetPhysicalReadType(map_type.key_type(), file_map_type.key_type())),
+                map_type.item_field()->WithType(
+                    GetPhysicalReadType(map_type.item_type(), file_map_type.item_type())),
                 map_type.keys_sorted());
         }
         default:
@@ -83,114 +112,54 @@ std::shared_ptr<arrow::DataType> GetPhysicalReadType(
     }
 }
 
-Status ValidateVectorElements(const arrow::FixedSizeListArray& array, int32_t vector_length) {
-    const std::shared_ptr<arrow::Array>& values = array.values();
-    if (values->null_count() == 0) {
-        return Status::OK();
-    }
+Status ValidateVectorElements(const arrow::ListArray& array) {
     for (int64_t i = 0; i < array.length(); ++i) {
         if (array.IsNull(i)) {
             continue;
         }
-        int64_t value_offset = (array.offset() + i) * vector_length;
-        for (int32_t j = 0; j < vector_length; ++j) {
-            if (values->IsNull(value_offset + j)) {
-                return Status::Invalid("VECTOR cannot contain null elements");
+        int64_t value_offset = array.value_offset(i);
+        int64_t value_length = array.value_length(i);
+        for (int64_t j = 0; j < value_length; ++j) {
+            if (array.values()->IsNull(value_offset + j)) {
+                return Status::Invalid(fmt::format(
+                    "VECTOR cannot contain null elements, found one at row {} position {}", i, j));
             }
         }
     }
     return Status::OK();
 }
 
-Result<int64_t> GetIndexCapacity(int64_t row_count, int32_t vector_length) {
-    if (vector_length < 1) {
-        return Status::Invalid("VECTOR length must be positive");
-    }
-    if (row_count > std::numeric_limits<int64_t>::max() / vector_length) {
-        return Status::Invalid("VECTOR values exceed the supported Arrow array length");
-    }
-    return row_count * vector_length;
-}
-
-Result<std::shared_ptr<arrow::Array>> ConvertListToVector(
-    const std::shared_ptr<arrow::Array>& array,
-    const std::shared_ptr<arrow::FixedSizeListType>& read_type, arrow::MemoryPool* pool) {
-    int32_t vector_length = read_type->list_size();
-    if (array->type()->id() == arrow::Type::FIXED_SIZE_LIST) {
-        const auto& source_type = checked_cast<const arrow::FixedSizeListType&>(*array->type());
-        if (source_type.list_size() != vector_length ||
-            !source_type.value_type()->Equals(read_type->value_type())) {
-            return Status::Invalid(fmt::format("VECTOR type mismatch: data {} vs read {}",
-                                               array->type()->ToString(), read_type->ToString()));
-        }
-        const auto& vector_array = checked_cast<const arrow::FixedSizeListArray&>(*array);
-        PAIMON_RETURN_NOT_OK(ValidateVectorElements(vector_array, vector_length));
-        std::shared_ptr<arrow::ArrayData> data = array->data()->Copy();
-        data->type = read_type;
-        return arrow::MakeArray(data);
-    }
-    if (array->type()->id() != arrow::Type::LIST) {
-        return Status::Invalid(
-            fmt::format("Cannot restore VECTOR from type {}", array->type()->ToString()));
-    }
-
-    const auto& list_array = checked_cast<const arrow::ListArray&>(*array);
-    if (!list_array.value_type()->Equals(read_type->value_type())) {
-        return Status::Invalid(fmt::format("VECTOR element type mismatch: data {} vs read {}",
-                                           list_array.value_type()->ToString(),
-                                           read_type->value_type()->ToString()));
-    }
-
-    arrow::Int64Builder indices_builder(pool);
-    PAIMON_ASSIGN_OR_RAISE(int64_t index_capacity,
-                           GetIndexCapacity(list_array.length(), vector_length));
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(indices_builder.Reserve(index_capacity));
-    arrow::BooleanBuilder validity_builder(pool);
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(validity_builder.Reserve(list_array.length()));
-
-    for (int64_t i = 0; i < list_array.length(); ++i) {
-        bool valid = !list_array.IsNull(i);
-        PAIMON_RETURN_NOT_OK_FROM_ARROW(validity_builder.Append(valid));
-        if (!valid) {
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(indices_builder.AppendNulls(vector_length));
+Status ValidateVectorElements(const arrow::FixedSizeListArray& array) {
+    const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*array.type());
+    for (int64_t i = 0; i < array.length(); ++i) {
+        if (array.IsNull(i)) {
             continue;
         }
-        int64_t value_length = list_array.value_length(i);
-        if (value_length != vector_length) {
-            return Status::Invalid(
-                fmt::format("Vector length mismatch at row {}: expected {} but got {}", i,
-                            vector_length, value_length));
-        }
-        int64_t value_offset = list_array.value_offset(i);
-        for (int32_t j = 0; j < vector_length; ++j) {
-            int64_t index = value_offset + j;
-            if (list_array.values()->IsNull(index)) {
+        int64_t value_offset = (array.offset() + i) * vector_type.list_size();
+        for (int32_t j = 0; j < vector_type.list_size(); ++j) {
+            if (array.values()->IsNull(value_offset + j)) {
                 return Status::Invalid(fmt::format(
                     "VECTOR cannot contain null elements, found one at row {} position {}", i, j));
             }
-            PAIMON_RETURN_NOT_OK_FROM_ARROW(indices_builder.Append(index));
         }
     }
+    return Status::OK();
+}
 
-    std::shared_ptr<arrow::Array> indices;
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(indices_builder.Finish(&indices));
-    arrow::compute::ExecContext exec_context(pool);
-    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
-        arrow::Datum values,
-        arrow::compute::Take(arrow::Datum(list_array.values()), arrow::Datum(indices),
-                             arrow::compute::TakeOptions::NoBoundsCheck(), &exec_context));
-
-    std::shared_ptr<arrow::Array> validity;
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(validity_builder.Finish(&validity));
-    std::shared_ptr<arrow::Buffer> null_bitmap;
-    if (list_array.null_count() != 0) {
-        null_bitmap = validity->data()->buffers[1];
+Result<std::shared_ptr<arrow::Array>> CastListToVector(
+    const std::shared_ptr<arrow::Array>& array,
+    const std::shared_ptr<arrow::FixedSizeListType>& read_type, arrow::MemoryPool* pool) {
+    if (array->type_id() != arrow::Type::LIST) {
+        return Status::Invalid(
+            fmt::format("Cannot restore VECTOR from type {}", array->type()->ToString()));
     }
-    std::shared_ptr<arrow::ArrayData> data =
-        arrow::ArrayData::Make(read_type, list_array.length(), {null_bitmap},
-                               {values.make_array()->data()}, list_array.null_count());
-    std::shared_ptr<arrow::Array> result = arrow::MakeArray(data);
-    PAIMON_RETURN_NOT_OK_FROM_ARROW(result->ValidateFull());
+    PAIMON_RETURN_NOT_OK(ValidateVectorElements(checked_cast<const arrow::ListArray&>(*array)));
+    arrow::compute::ExecContext exec_context(pool);
+    arrow::TypeHolder type_holder(read_type.get());
+    arrow::compute::CastOptions options = arrow::compute::CastOptions::Safe();
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+        std::shared_ptr<arrow::Array> result,
+        arrow::compute::Cast(*array, type_holder, options, &exec_context));
     return result;
 }
 
@@ -222,21 +191,37 @@ Result<std::shared_ptr<arrow::Array>> ConvertToReadType(
         return array;
     }
     switch (read_type->id()) {
-        case arrow::Type::FIXED_SIZE_LIST:
-            return ConvertListToVector(
+        case arrow::Type::FIXED_SIZE_LIST: {
+            if (array->type_id() == arrow::Type::FIXED_SIZE_LIST) {
+                const auto& source_type =
+                    checked_cast<const arrow::FixedSizeListType&>(*array->type());
+                const auto& vector_type = checked_cast<const arrow::FixedSizeListType&>(*read_type);
+                if (source_type.list_size() != vector_type.list_size() ||
+                    !source_type.value_type()->Equals(vector_type.value_type())) {
+                    return Status::Invalid(fmt::format("VECTOR type mismatch: data {} vs read {}",
+                                                       source_type.ToString(),
+                                                       vector_type.ToString()));
+                }
+                PAIMON_RETURN_NOT_OK(
+                    ValidateVectorElements(checked_cast<const arrow::FixedSizeListArray&>(*array)));
+                return array;
+            }
+            return CastListToVector(
                 array, checked_pointer_cast<arrow::FixedSizeListType>(read_type), pool);
+        }
         case arrow::Type::STRUCT:
         case arrow::Type::LIST:
         case arrow::Type::MAP: {
-            if (array->type()->id() != read_type->id()) {
+            if (array->type_id() != read_type->id()) {
                 return Status::Invalid(fmt::format("Cannot reconcile file type {} with {}",
                                                    array->type()->ToString(),
                                                    read_type->ToString()));
             }
-            if (array->type()->num_fields() != read_type->num_fields()) {
-                return Status::Invalid(fmt::format("Nested type field count mismatch: {} vs {}",
-                                                   array->type()->ToString(),
-                                                   read_type->ToString()));
+            if (array->type()->num_fields() != read_type->num_fields() ||
+                array->data()->child_data.size() != static_cast<size_t>(read_type->num_fields())) {
+                return Status::Invalid(
+                    fmt::format("Cannot reconcile file type {} with {}: nested field count differs",
+                                array->type()->ToString(), read_type->ToString()));
             }
             std::vector<std::shared_ptr<arrow::ArrayData>> children;
             children.reserve(read_type->num_fields());
@@ -280,10 +265,15 @@ Status VectorFileBatchReader::SetReadSchema(
     }
     PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> logical_schema,
                                       arrow::ImportSchema(read_schema));
+    PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<::ArrowSchema> c_file_schema, reader_->GetFileSchema());
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Schema> file_schema,
+                                      arrow::ImportSchema(c_file_schema.get()));
     arrow::FieldVector physical_fields;
     physical_fields.reserve(logical_schema->num_fields());
     for (const auto& field : logical_schema->fields()) {
-        physical_fields.push_back(field->WithType(GetPhysicalReadType(field->type())));
+        std::shared_ptr<arrow::Field> file_field = file_schema->GetFieldByName(field->name());
+        physical_fields.push_back(field->WithType(
+            GetPhysicalReadType(field->type(), file_field ? file_field->type() : nullptr)));
     }
     std::shared_ptr<arrow::Schema> physical_schema =
         arrow::schema(physical_fields, logical_schema->metadata());

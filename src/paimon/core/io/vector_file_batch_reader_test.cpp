@@ -82,6 +82,36 @@ TEST(VectorFileBatchReaderTest, ConvertSchemaAndNextBatch) {
     ASSERT_TRUE(BatchReader::IsEofBatch(batch));
 }
 
+TEST(VectorFileBatchReaderTest, KeepFixedSizeListFileSchema) {
+    auto logical_type = AsStructType(arrow::struct_({
+        arrow::field("id", arrow::int32()),
+        arrow::field("embedding", arrow::fixed_size_list(arrow::float32(), 3)),
+    }));
+    const std::string json = R"([
+        [1, [1.0, 2.0, 3.0]],
+        [2, null],
+        [3, [4.0, 5.0, 6.0]]
+    ])";
+    auto logical_array = arrow::ipc::internal::json::ArrayFromJSON(logical_type, json).ValueOrDie();
+    auto mock_reader =
+        std::make_unique<MockFileBatchReader>(logical_array, logical_type, /*batch_size=*/10);
+    mock_reader->EnableRandomizeBatchSize(false);
+    MockFileBatchReader* inner_reader = mock_reader.get();
+    VectorFileBatchReader reader(std::move(mock_reader), GetDefaultPool());
+
+    ArrowSchema c_read_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(logical_type->fields()), &c_read_schema).ok());
+    ASSERT_OK(reader.SetReadSchema(&c_read_schema, /*predicate=*/nullptr,
+                                   /*selection_bitmap=*/std::nullopt));
+    ASSERT_EQ(inner_reader->read_schema_->field(1)->type()->id(), arrow::Type::FIXED_SIZE_LIST);
+
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader.NextBatch());
+    arrow::Result<std::shared_ptr<arrow::Array>> actual_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(actual_result.ok()) << actual_result.status().ToString();
+    ASSERT_TRUE(logical_array->Equals(std::move(actual_result).ValueOrDie()));
+}
+
 TEST(VectorFileBatchReaderTest, ConvertNestedVectorsWithBitmap) {
     auto logical_vector =
         arrow::fixed_size_list(arrow::field("item", arrow::float64(), /*nullable=*/false), 2);
@@ -140,6 +170,31 @@ TEST(VectorFileBatchReaderTest, RejectInvalidVectorValues) {
                                        /*selection_bitmap=*/std::nullopt));
         ASSERT_NOK(reader.NextBatch());
     }
+}
+
+TEST(VectorFileBatchReaderTest, RejectInvalidFixedSizeListVectorValues) {
+    auto values_builder = std::make_shared<arrow::FloatBuilder>();
+    arrow::FixedSizeListBuilder vector_builder(arrow::default_memory_pool(), values_builder, 3);
+    ASSERT_TRUE(values_builder->Append(1.0f).ok());
+    ASSERT_TRUE(values_builder->AppendNull().ok());
+    ASSERT_TRUE(values_builder->Append(3.0f).ok());
+    ASSERT_TRUE(vector_builder.Append().ok());
+    std::shared_ptr<arrow::Array> vector_array;
+    ASSERT_TRUE(vector_builder.Finish(&vector_array).ok());
+    arrow::Result<std::shared_ptr<arrow::StructArray>> struct_result =
+        arrow::StructArray::Make({vector_array}, {"embedding"});
+    ASSERT_TRUE(struct_result.ok()) << struct_result.status().ToString();
+    std::shared_ptr<arrow::StructArray> physical_array = std::move(struct_result).ValueOrDie();
+    auto physical_type = AsStructType(physical_array->type());
+    auto mock_reader = std::make_unique<MockFileBatchReader>(physical_array, physical_type,
+                                                             /*read_batch_size=*/10);
+    mock_reader->EnableRandomizeBatchSize(false);
+    VectorFileBatchReader reader(std::move(mock_reader), GetDefaultPool());
+    ArrowSchema c_read_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(physical_type->fields()), &c_read_schema).ok());
+    ASSERT_OK(reader.SetReadSchema(&c_read_schema, /*predicate=*/nullptr,
+                                   /*selection_bitmap=*/std::nullopt));
+    ASSERT_NOK(reader.NextBatch());
 }
 
 }  // namespace paimon::test

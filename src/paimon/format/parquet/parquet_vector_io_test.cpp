@@ -21,6 +21,7 @@
 #include <optional>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "arrow/api.h"
 #include "arrow/c/abi.h"
@@ -113,6 +114,75 @@ class ParquetVectorIoTest : public ::testing::Test {
             << actual->ToString();
     }
 
+    void ReadFixtureAndCheck(
+        const std::string& file_name, arrow::Type::type expected_file_vector_type,
+        int32_t vector_length, const std::vector<int32_t>& expected_ids,
+        const std::vector<std::optional<std::vector<float>>>& expected_vectors) {
+        std::string file_path =
+            paimon::test::GetDataDir() + "/parquet/vector_compatibility/" + file_name;
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<InputStream> in, fs_->Open(file_path));
+        ASSERT_OK_AND_ASSIGN(int64_t length, in->Length());
+        auto in_stream = std::make_shared<ArrowInputStreamAdapter>(in, length, arrow_pool_);
+        ASSERT_OK_AND_ASSIGN(
+            std::unique_ptr<ParquetFileBatchReader> reader,
+            ParquetFileBatchReader::Create(std::move(in_stream), /*options=*/{},
+                                           /*batch_size=*/10, /*file_metadata=*/nullptr,
+                                           /*storage_read_bytes=*/nullptr, arrow_pool_));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ArrowSchema> c_file_schema, reader->GetFileSchema());
+        arrow::Result<std::shared_ptr<arrow::DataType>> file_type_result =
+            arrow::ImportType(c_file_schema.get());
+        ASSERT_TRUE(file_type_result.ok()) << file_type_result.status().ToString();
+        auto file_type =
+            checked_pointer_cast<arrow::StructType>(std::move(file_type_result).ValueOrDie());
+        std::shared_ptr<arrow::Field> file_vector_field = file_type->GetFieldByName("embedding");
+        ASSERT_TRUE(file_vector_field);
+        ASSERT_EQ(file_vector_field->type()->id(), expected_file_vector_type);
+        std::shared_ptr<arrow::Field> file_id_field = file_type->GetFieldByName("id");
+        ASSERT_TRUE(file_id_field);
+
+        auto vector_type = arrow::fixed_size_list(
+            arrow::field("element", arrow::float32(), /*nullable=*/false), vector_length);
+        auto logical_schema =
+            arrow::schema({file_id_field, file_vector_field->WithType(vector_type)});
+        std::unique_ptr<FileBatchReader> vector_reader =
+            std::make_unique<VectorFileBatchReader>(std::move(reader), pool_);
+        auto c_read_schema = std::make_unique<ArrowSchema>();
+        ASSERT_TRUE(arrow::ExportSchema(*logical_schema, c_read_schema.get()).ok());
+        ASSERT_OK(vector_reader->SetReadSchema(c_read_schema.get(), /*predicate=*/nullptr,
+                                               /*selection_bitmap=*/std::nullopt));
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                             paimon::test::ReadResultCollector::CollectResult(vector_reader.get()));
+        ASSERT_EQ(actual->num_chunks(), 1);
+        ASSERT_EQ(actual->type()->id(), arrow::Type::STRUCT);
+        auto struct_array = checked_pointer_cast<arrow::StructArray>(actual->chunk(0));
+        std::shared_ptr<arrow::Array> id_field = struct_array->GetFieldByName("id");
+        std::shared_ptr<arrow::Array> vector_field = struct_array->GetFieldByName("embedding");
+        ASSERT_TRUE(id_field);
+        ASSERT_TRUE(vector_field);
+        ASSERT_EQ(id_field->type_id(), arrow::Type::INT32);
+        ASSERT_EQ(vector_field->type_id(), arrow::Type::FIXED_SIZE_LIST);
+        auto vector_array = checked_pointer_cast<arrow::FixedSizeListArray>(vector_field);
+        ASSERT_EQ(id_field->length(), static_cast<int64_t>(expected_ids.size()));
+        ASSERT_EQ(vector_array->length(), static_cast<int64_t>(expected_vectors.size()));
+        const int32_t* id_values = id_field->data()->GetValues<int32_t>(1);
+        for (int64_t i = 0; i < id_field->length(); ++i) {
+            ASSERT_FALSE(id_field->IsNull(i));
+            ASSERT_EQ(id_values[id_field->offset() + i], expected_ids[i]);
+            if (!expected_vectors[i]) {
+                ASSERT_TRUE(vector_array->IsNull(i));
+                continue;
+            }
+            ASSERT_FALSE(vector_array->IsNull(i));
+            ASSERT_EQ(vector_array->value_length(i),
+                      static_cast<int64_t>(expected_vectors[i]->size()));
+            std::shared_ptr<arrow::Array> values = vector_array->value_slice(i);
+            const float* vector_values = values->data()->GetValues<float>(1);
+            for (int64_t j = 0; j < vector_array->value_length(i); ++j) {
+                ASSERT_FLOAT_EQ(vector_values[j], expected_vectors[i].value()[j]);
+            }
+        }
+    }
+
  private:
     std::shared_ptr<MemoryPool> pool_;
     std::shared_ptr<arrow::MemoryPool> arrow_pool_;
@@ -154,6 +224,21 @@ TEST_F(ParquetVectorIoTest, WriteAndReadNestedDoubleVector) {
     WriteAndCheck("nested-vector.parquet", struct_type, struct_type,
                   R"([[1, [[1.0, 2.0], [[3.0, 4.0], null], [["a", [5.0, 6.0]]]]],
                        [2, [null, null, [["b", null]]]]])");
+}
+
+TEST_F(ParquetVectorIoTest, ReadJavaFixture) {
+    ReadFixtureAndCheck(
+        "java_vector.parquet", arrow::Type::LIST, /*vector_length=*/2,
+        /*expected_ids=*/{0, 1, 2, 3, 4},
+        /*expected_vectors=*/
+        {{{0.0f, 0.0f}}, {{1.0f, 0.0f}}, {{2.0f, 0.0f}}, {{3.0f, 0.0f}}, {{4.0f, 0.0f}}});
+}
+
+TEST_F(ParquetVectorIoTest, ReadRustFixture) {
+    ReadFixtureAndCheck("rust_vector.parquet", arrow::Type::FIXED_SIZE_LIST,
+                        /*vector_length=*/3, /*expected_ids=*/{1, 2, 3},
+                        /*expected_vectors=*/
+                        {{{1.0f, 2.0f, 3.0f}}, {{7.0f, 8.0f, 9.0f}}, {{4.0f, 5.0f, 6.0f}}});
 }
 
 }  // namespace paimon::parquet::test
