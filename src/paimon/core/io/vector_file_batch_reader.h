@@ -22,6 +22,7 @@
 #include <memory>
 #include <optional>
 
+#include "arrow/c/abi.h"
 #include "paimon/reader/file_batch_reader.h"
 
 namespace arrow {
