@@ -368,6 +368,45 @@ TEST_F(ParquetVectorIoTest, ReadNullableJavaFixture) {
                         {{{1.0f, 2.0f, 3.0f}}, std::nullopt, {{4.0f, 5.0f, 6.0f}}});
 }
 
+// A table can hold files from several writers, and Paimon Java stores VECTOR as Parquet LIST
+// while Paimon Rust stores it as FixedSizeList. Reading both with the table schema must produce
+// batches of one Arrow type, otherwise they cannot be combined into a single result.
+TEST_F(ParquetVectorIoTest, ReadMixedListAndFixedSizeListFixtures) {
+    // The Arrow type a Paimon schema builds for `id INT, embedding VECTOR<FLOAT, 3>`. The Rust
+    // fixture instead names the element field `element` and marks it non-nullable.
+    auto logical_schema =
+        arrow::schema({arrow::field("id", arrow::int32()),
+                       arrow::field("embedding", arrow::fixed_size_list(arrow::float32(), 3))});
+    std::shared_ptr<arrow::DataType> logical_type = arrow::struct_(logical_schema->fields());
+
+    arrow::ArrayVector chunks;
+    for (const std::string& file_name : {"java_vector_nullable.parquet", "rust_vector.parquet"}) {
+        std::string file_path =
+            paimon::test::GetDataDir() + "/parquet/vector_compatibility/" + file_name;
+        std::unique_ptr<FileBatchReader> reader;
+        CreateVectorReader(file_path, logical_schema, /*predicate=*/nullptr, /*options=*/{},
+                           /*batch_size=*/10, &reader);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                             paimon::test::ReadResultCollector::CollectResult(reader.get()));
+        ASSERT_TRUE(actual->type()->Equals(logical_type))
+            << file_name << ": " << actual->type()->ToString();
+        chunks.insert(chunks.end(), actual->chunks().begin(), actual->chunks().end());
+    }
+
+    arrow::Result<std::shared_ptr<arrow::ChunkedArray>> merged_result =
+        arrow::ChunkedArray::Make(chunks);
+    ASSERT_TRUE(merged_result.ok()) << merged_result.status().ToString();
+    arrow::Result<std::shared_ptr<arrow::Array>> expected_result =
+        arrow::ipc::internal::json::ArrayFromJSON(
+            logical_type, R"([[1, [1.0, 2.0, 3.0]], [2, null], [3, [4.0, 5.0, 6.0]],
+                              [1, [1.0, 2.0, 3.0]], [2, [7.0, 8.0, 9.0]], [3, [4.0, 5.0, 6.0]]])");
+    ASSERT_TRUE(expected_result.ok()) << expected_result.status().ToString();
+    std::shared_ptr<arrow::ChunkedArray> merged = std::move(merged_result).ValueOrDie();
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(std::move(expected_result).ValueOrDie())
+                    ->Equals(merged))
+        << merged->ToString();
+}
+
 // A writer that stores the Arrow schema, such as Paimon Rust or Python, exposes the VECTOR column
 // as FixedSizeList. Arrow 17 cannot read a null value from such a column: Parquet stores a null
 // list slot with no values, while FixedSizeListReader::AssembleArray in

@@ -168,7 +168,13 @@ Result<std::shared_ptr<arrow::Array>> ConvertToReadType(
                                                        vector_type.ToString()));
                 }
                 PAIMON_RETURN_NOT_OK(VectorUtils::ValidateVectorElements(*array));
-                return array;
+                // Writers disagree on the element field, for example `element: float not null`
+                // for Paimon Rust against the `item: float` of a Paimon schema. Restore the
+                // requested type so that files storing VECTOR as LIST and files storing it as
+                // FixedSizeList produce batches of one type.
+                std::shared_ptr<arrow::ArrayData> data = array->data()->Copy();
+                data->type = read_type;
+                return arrow::MakeArray(data);
             }
             return CastListToVector(
                 array, checked_pointer_cast<arrow::FixedSizeListType>(read_type), pool);

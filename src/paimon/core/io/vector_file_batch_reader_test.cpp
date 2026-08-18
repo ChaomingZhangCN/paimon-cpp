@@ -112,6 +112,46 @@ TEST(VectorFileBatchReaderTest, KeepFixedSizeListFileSchema) {
     ASSERT_TRUE(logical_array->Equals(std::move(actual_result).ValueOrDie()));
 }
 
+// Paimon Rust names the element field of a VECTOR column `element` and marks it non-nullable,
+// while a Paimon schema names it `item`. Batches must carry the requested type either way,
+// otherwise they cannot be combined with batches read from a file storing VECTOR as LIST.
+TEST(VectorFileBatchReaderTest, NormalizeFixedSizeListElementField) {
+    auto file_vector =
+        arrow::fixed_size_list(arrow::field("element", arrow::float32(), /*nullable=*/false), 3);
+    auto logical_vector = arrow::fixed_size_list(arrow::float32(), 3);
+    auto file_type = AsStructType(arrow::struct_({
+        arrow::field("embedding", file_vector),
+        arrow::field("history", arrow::list(file_vector)),
+    }));
+    auto logical_type = AsStructType(arrow::struct_({
+        arrow::field("embedding", logical_vector),
+        arrow::field("history", arrow::list(logical_vector)),
+    }));
+    const std::string json = R"([
+        [[1.0, 2.0, 3.0], [[4.0, 5.0, 6.0]]],
+        [null, []]
+    ])";
+    auto file_array = arrow::ipc::internal::json::ArrayFromJSON(file_type, json).ValueOrDie();
+    auto mock_reader =
+        std::make_unique<MockFileBatchReader>(file_array, file_type, /*batch_size=*/10);
+    mock_reader->EnableRandomizeBatchSize(false);
+    VectorFileBatchReader reader(std::move(mock_reader), GetDefaultPool());
+
+    ArrowSchema c_read_schema;
+    ASSERT_TRUE(arrow::ExportSchema(*arrow::schema(logical_type->fields()), &c_read_schema).ok());
+    ASSERT_OK(reader.SetReadSchema(&c_read_schema, /*predicate=*/nullptr,
+                                   /*selection_bitmap=*/std::nullopt));
+
+    ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch batch, reader.NextBatch());
+    arrow::Result<std::shared_ptr<arrow::Array>> actual_result =
+        arrow::ImportArray(batch.first.get(), batch.second.get());
+    ASSERT_TRUE(actual_result.ok()) << actual_result.status().ToString();
+    std::shared_ptr<arrow::Array> actual = std::move(actual_result).ValueOrDie();
+    ASSERT_TRUE(actual->type()->Equals(logical_type)) << actual->type()->ToString();
+    auto expected = arrow::ipc::internal::json::ArrayFromJSON(logical_type, json).ValueOrDie();
+    ASSERT_TRUE(expected->Equals(actual)) << actual->ToString();
+}
+
 TEST(VectorFileBatchReaderTest, ConvertNestedVectorsWithBitmap) {
     auto logical_vector =
         arrow::fixed_size_list(arrow::field("item", arrow::float64(), /*nullable=*/false), 2);
