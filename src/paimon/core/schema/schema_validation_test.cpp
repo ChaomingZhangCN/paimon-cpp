@@ -88,6 +88,25 @@ TEST(SchemaValidationTest, TestVectorType) {
                             /*partition_keys=*/{}, /*primary_keys=*/{"id"}, primary_key_options));
     ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
                         "VECTOR fields in primary-key tables are not implemented yet.");
+
+    std::map<std::string, std::string> data_evolution_options = {
+        {Options::BUCKET, "-1"},
+        {Options::FILE_FORMAT, "parquet"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+    };
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, schema,
+                                             /*partition_keys=*/{},
+                                             /*primary_keys=*/{}, data_evolution_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "VECTOR fields in data-evolution tables are not implemented yet.");
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, nested_schema,
+                                             /*partition_keys=*/{},
+                                             /*primary_keys=*/{}, data_evolution_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "VECTOR fields in data-evolution tables are not implemented yet.");
 }
 
 TEST(SchemaValidationTest, TestRowTracking) {

@@ -678,6 +678,10 @@ Status SchemaValidation::ValidateVectorFields(const TableSchema& schema,
         return Status::NotImplemented(
             "VECTOR fields in primary-key tables are not implemented yet.");
     }
+    if (options.DataEvolutionEnabled()) {
+        return Status::NotImplemented(
+            "VECTOR fields in data-evolution tables are not implemented yet.");
+    }
     PAIMON_RETURN_NOT_OK(
         ValidateVectorFileFormat(Options::FILE_FORMAT, options.GetFileFormat()->Identifier()));
     return ValidatePerLevelOption(options.ToMap(), Options::FILE_FORMAT_PER_LEVEL,
