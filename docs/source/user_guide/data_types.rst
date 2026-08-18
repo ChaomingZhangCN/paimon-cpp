@@ -201,11 +201,9 @@ and `Arrow DataTypes <https://arrow.apache.org/docs/format/Columnar.html#data-ty
        VECTOR fields are rejected. VECTOR columns also cannot be partition or
        bucket keys. Dedicated vector storage is not included yet.
 
-       **Note:** A data file written by another engine that records the column as
-       Arrow ``FixedSizeList`` instead of ``LIST``, such as Paimon Rust or Python,
-       can only be read while it holds no NULL vector. Parquet stores a NULL list
-       slot with no values, which the Arrow 17 Parquet reader rejects for a
-       ``FixedSizeList`` column.
+       A data file written by another engine is read either way: engines such as
+       Paimon Java record the column as a Parquet ``LIST``, while Paimon Rust and
+       Python record it as Arrow ``FixedSizeList``.
 
    * - ``MAP<kt, vt>``
      - Map
