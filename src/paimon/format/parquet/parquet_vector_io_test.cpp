@@ -379,8 +379,12 @@ TEST_F(ParquetVectorIoTest, ReadMixedListAndFixedSizeListFixtures) {
                        arrow::field("embedding", arrow::fixed_size_list(arrow::float32(), 3))});
     std::shared_ptr<arrow::DataType> logical_type = arrow::struct_(logical_schema->fields());
 
+    // A reader owns the memory pool that its batches are allocated from, so it has to outlive
+    // the chunks collected from it. This mirrors a scan, which holds every split reader until
+    // the whole result has been consumed.
+    std::vector<std::unique_ptr<FileBatchReader>> readers;
     arrow::ArrayVector chunks;
-    for (const std::string& file_name : {"java_vector_nullable.parquet", "rust_vector.parquet"}) {
+    for (const char* file_name : {"java_vector_nullable.parquet", "rust_vector.parquet"}) {
         std::string file_path =
             paimon::test::GetDataDir() + "/parquet/vector_compatibility/" + file_name;
         std::unique_ptr<FileBatchReader> reader;
@@ -388,6 +392,7 @@ TEST_F(ParquetVectorIoTest, ReadMixedListAndFixedSizeListFixtures) {
                            /*batch_size=*/10, &reader);
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
                              paimon::test::ReadResultCollector::CollectResult(reader.get()));
+        readers.push_back(std::move(reader));
         ASSERT_TRUE(actual->type()->Equals(logical_type))
             << file_name << ": " << actual->type()->ToString();
         chunks.insert(chunks.end(), actual->chunks().begin(), actual->chunks().end());
