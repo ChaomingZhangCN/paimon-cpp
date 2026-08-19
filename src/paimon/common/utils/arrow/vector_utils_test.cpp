@@ -97,24 +97,4 @@ TEST(VectorUtilsTest, TestValidateVectorElementsRejectsTruncatedValues) {
                         "VECTOR holds 3 elements while 2 rows of dimension 3 require 6");
 }
 
-TEST(VectorUtilsTest, TestValidateNestedVectorElements) {
-    auto vector_type = arrow::fixed_size_list(arrow::float32(), 2);
-    auto nested_type = arrow::struct_({
-        arrow::field("id", arrow::int32()),
-        arrow::field("vectors", arrow::list(vector_type)),
-        arrow::field("by_name", arrow::map(arrow::utf8(), vector_type)),
-    });
-    ASSERT_OK(VectorUtils::ValidateNestedVectorElements(
-        ArrayFromJSON(nested_type, R"([[1, [[1.0, 2.0], null], [["a", [3.0, 4.0]]]]])")));
-    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateNestedVectorElements(ArrayFromJSON(
-                            nested_type, R"([[1, [[1.0, null]], [["a", [3.0, 4.0]]]]])")),
-                        "VECTOR cannot contain null elements");
-    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateNestedVectorElements(ArrayFromJSON(
-                            nested_type, R"([[1, [[1.0, 2.0]], [["a", [null, 4.0]]]]])")),
-                        "VECTOR cannot contain null elements");
-    ASSERT_OK(VectorUtils::ValidateNestedVectorElements(
-        ArrayFromJSON(arrow::list(arrow::float32()), R"([[1.0, null]])")));
-    ASSERT_OK(VectorUtils::ValidateNestedVectorElements(nullptr));
-}
-
 }  // namespace paimon::test

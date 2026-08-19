@@ -21,7 +21,6 @@
 
 #include <memory>
 
-#include "paimon/result.h"
 #include "paimon/status.h"
 #include "paimon/visibility.h"
 
@@ -50,9 +49,6 @@ class PAIMON_EXPORT VectorUtils {
     /// Rejects VECTOR values whose elements are not fully materialized or contain nulls.
     /// `array` must be the List or FixedSizeList array holding the VECTOR values.
     static Status ValidateVectorElements(const arrow::Array& array);
-
-    /// Validates every VECTOR value reachable from `array`, including nested ones.
-    static Status ValidateNestedVectorElements(const std::shared_ptr<arrow::Array>& array);
 };
 
 }  // namespace paimon

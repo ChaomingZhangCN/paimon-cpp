@@ -125,17 +125,4 @@ Status VectorUtils::ValidateVectorElements(const arrow::Array& array) {
     }
 }
 
-Status VectorUtils::ValidateNestedVectorElements(const std::shared_ptr<arrow::Array>& array) {
-    if (!array || !ContainsVectorType(array->type())) {
-        return Status::OK();
-    }
-    if (array->type_id() == arrow::Type::FIXED_SIZE_LIST) {
-        return ValidateVectorElements(*array);
-    }
-    for (const auto& child_data : array->data()->child_data) {
-        PAIMON_RETURN_NOT_OK(ValidateNestedVectorElements(arrow::MakeArray(child_data)));
-    }
-    return Status::OK();
-}
-
 }  // namespace paimon
