@@ -413,25 +413,13 @@ TEST_F(ParquetVectorIoTest, ReadMixedListAndFixedSizeListFixtures) {
 }
 
 // A writer that stores the Arrow schema, such as Paimon Rust or Python, exposes the VECTOR column
-// as FixedSizeList. Arrow 17 cannot read a null value from such a column: Parquet stores a null
-// list slot with no values, while FixedSizeListReader::AssembleArray in
-// parquet/arrow/reader.cc requires every slot to span exactly `list_size` values.
-//
-// TODO(ChaomingZhangCN): Turn this into a read check once Arrow is upgraded.
-TEST_F(ParquetVectorIoTest, ReadNullableRustFixtureIsUnsupported) {
-    std::string file_path =
-        paimon::test::GetDataDir() + "/parquet/vector_compatibility/rust_vector_nullable.parquet";
-    std::shared_ptr<arrow::StructType> file_type;
-    ReadFileType(file_path, &file_type);
-    std::shared_ptr<arrow::Field> file_vector_field = file_type->GetFieldByName("embedding");
-    ASSERT_TRUE(file_vector_field);
-    ASSERT_EQ(file_vector_field->type()->id(), arrow::Type::FIXED_SIZE_LIST);
-
-    std::unique_ptr<FileBatchReader> reader;
-    CreateVectorReader(file_path, arrow::schema(file_type->fields()), /*predicate=*/nullptr,
-                       /*options=*/{}, /*batch_size=*/10, &reader);
-    ASSERT_NOK_WITH_MSG(paimon::test::ReadResultCollector::CollectResult(reader.get()),
-                        "Expected all lists to be of size=3");
+// as FixedSizeList. Parquet stores a null list slot without any value, and the Arrow patch of
+// FixedSizeListReader::AssembleArray restores the values every fixed size slot must have.
+TEST_F(ParquetVectorIoTest, ReadNullableRustFixture) {
+    ReadFixtureAndCheck("rust_vector_nullable.parquet", arrow::Type::FIXED_SIZE_LIST,
+                        /*vector_length=*/3, /*expected_ids=*/{1, 2, 3},
+                        /*expected_vectors=*/
+                        {{{1.0f, 2.0f, 3.0f}}, std::nullopt, {{4.0f, 5.0f, 6.0f}}});
 }
 
 }  // namespace paimon::parquet::test

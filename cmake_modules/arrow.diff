@@ -613,6 +613,93 @@ diff --git a/cpp/src/arrow/io/interfaces.h b/cpp/src/arrow/io/interfaces.h
    return Status::OK();
  }
 
+diff --git a/cpp/src/parquet/arrow/reader.cc b/cpp/src/parquet/arrow/reader.cc
+--- a/cpp/src/parquet/arrow/reader.cc
++++ b/cpp/src/parquet/arrow/reader.cc
+@@ -25,6 +25,7 @@
+ #include <vector>
+
+ #include "arrow/array.h"
++#include "arrow/array/concatenate.h"
+ #include "arrow/buffer.h"
+ #include "arrow/extension_type.h"
+ #include "arrow/io/memory.h"
+@@ -32,6 +33,7 @@
+ #include "arrow/table.h"
+ #include "arrow/type.h"
+ #include "arrow/util/async_generator.h"
++#include "arrow/util/bit_run_reader.h"
+ #include "arrow/util/bit_util.h"
+ #include "arrow/util/future.h"
+ #include "arrow/util/iterator.h"
+@@ -709,7 +711,7 @@
+
+   const std::shared_ptr<Field> field() override { return field_; }
+
+- private:
++ protected:
+   std::shared_ptr<ReaderContext> ctx_;
+   std::shared_ptr<Field> field_;
+   ::parquet::internal::LevelInfo level_info_;
+@@ -729,12 +731,53 @@
+     DCHECK_EQ(field()->type()->id(), ::arrow::Type::FIXED_SIZE_LIST);
+     const auto& type = checked_cast<::arrow::FixedSizeListType&>(*field()->type());
+     const int32_t* offsets = reinterpret_cast<const int32_t*>(data->buffers[1]->data());
+-    for (int x = 1; x <= data->length; x++) {
+-      int32_t size = offsets[x] - offsets[x - 1];
+-      if (size != type.list_size()) {
+-        return Status::Invalid("Expected all lists to be of size=", type.list_size(),
+-                               " but index ", x, " had size=", size);
++    const int32_t list_size = type.list_size();
++    auto validate_offsets = [&](int64_t start, int64_t length, bool has_elements) -> Status {
++      const int32_t expected_size = has_elements ? list_size : 0;
++      for (int64_t x = start; x < start + length; x++) {
++        const int32_t size = offsets[x + 1] - offsets[x];
++        if (size != expected_size) {
++          if (has_elements) {
++            return Status::Invalid("Expected all lists to be of size=", list_size,
++                                   " but index ", x + 1, " had size=", size);
++          }
++          return Status::Invalid("Expected null fixed-size list at index ", x + 1,
++                                 " to have no child values but had size=", size);
++        }
++      }
++      return Status::OK();
++    };
++    if (data->GetNullCount() != 0) {
++      // Parquet stores a null fixed-size list slot without any child value, so rebuild the
++      // child array run by run to restore the list_size values every slot must have.
++      DCHECK_NE(data->buffers[0], nullptr);
++      ::arrow::ArrayVector child_arrays;
++      ::arrow::internal::BitRunReader run_reader(data->buffers[0]->data(), data->offset,
++                                                 data->length);
++      int64_t start = 0;
++      while (start < data->length) {
++        ::arrow::internal::BitRun run = run_reader.NextRun();
++        if (run.length == 0) {
++          break;
++        }
++        RETURN_NOT_OK(validate_offsets(start, run.length, run.set));
++        const int64_t child_length = run.length * list_size;
++        if (run.set) {
++          child_arrays.push_back(
++              ::arrow::MakeArray(data->child_data[0]->Slice(offsets[start], child_length)));
++        } else {
++          ARROW_ASSIGN_OR_RAISE(
++              std::shared_ptr<::arrow::Array> null_array,
++              ::arrow::MakeArrayOfNull(type.value_type(), child_length, ctx_->pool));
++          child_arrays.push_back(std::move(null_array));
++        }
++        start += run.length;
+       }
++      ARROW_ASSIGN_OR_RAISE(std::shared_ptr<::arrow::Array> padded_child,
++                            ::arrow::Concatenate(child_arrays, ctx_->pool));
++      data->child_data[0] = padded_child->data();
++    } else {
++      RETURN_NOT_OK(validate_offsets(/*start=*/0, data->length, /*has_elements=*/true));
+     }
+     data->buffers.resize(1);
+     std::shared_ptr<Array> result = ::arrow::MakeArray(data);
 --- a/cpp/src/parquet/arrow/reader.h
 +++ b/cpp/src/parquet/arrow/reader.h
 @@ -21,6 +21,7 @@
