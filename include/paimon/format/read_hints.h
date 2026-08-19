@@ -1,4 +1,4 @@
-/**
+/*
  * Licensed to the Apache Software Foundation (ASF) under one
  * or more contributor license agreements.  See the NOTICE file
  * distributed with this work for additional information
@@ -16,22 +16,20 @@
  * limitations under the License.
  */
 
-// Adapted from Apache ORC
-// https://github.com/apache/orc/blob/main/c%2B%2B/src/io/Cache.hh
-
 #pragma once
 
-#include <vector>
-
-#include "paimon/common/utils/read_ahead_cache.h"
-#include "paimon/result.h"
+#include "paimon/visibility.h"
 
 namespace paimon {
 
-struct ByteRangeCombiner {
-    static Result<std::vector<ByteRange>> CoalesceByteRanges(std::vector<ByteRange>&& ranges,
-                                                             uint64_t hole_size_limit,
-                                                             uint64_t range_size_limit);
+/// Runtime state of the framework read path, passed to format layers via
+/// `ReaderBuilder::WithReadHints` so each format can adapt its internal behavior
+/// (e.g. whether parquet enables its own pre-buffering).
+struct PAIMON_EXPORT ReadHints {
+    /// Whether framework-level prefetch is enabled for this read.
+    bool prefetch_enabled = false;
+    /// Whether the shared read-ahead cache is enabled for this read.
+    bool read_ahead_cache_enabled = false;
 };
 
 }  // namespace paimon
