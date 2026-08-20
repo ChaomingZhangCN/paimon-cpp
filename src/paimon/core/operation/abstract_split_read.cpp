@@ -43,6 +43,7 @@
 #include "paimon/core/io/data_file_meta.h"
 #include "paimon/core/io/data_file_path_factory.h"
 #include "paimon/core/io/field_mapping_reader.h"
+#include "paimon/core/io/vector_file_batch_reader.h"
 #include "paimon/core/operation/internal_read_context.h"
 #include "paimon/core/partition/partition_info.h"
 #include "paimon/core/schema/table_schema.h"
@@ -215,6 +216,9 @@ Result<std::unique_ptr<FileBatchReader>> AbstractSplitRead::CreateFieldMappingRe
     PAIMON_ASSIGN_OR_RAISE(std::unique_ptr<FileBatchReader> file_reader,
                            CreateFileBatchReader(file_format_identifier, data_file_path,
                                                  file_meta->file_size, reader_builder));
+    if (VectorFileBatchReader::ContainsVector(read_schema)) {
+        file_reader = std::make_unique<VectorFileBatchReader>(std::move(file_reader), pool_);
+    }
     std::set<int32_t> skip_map_selected_keys_filter_field_ids;
     if (file_format_identifier != "blob") {
         std::pair<std::unique_ptr<FileBatchReader>, std::set<int32_t>> shared_shredding_result;

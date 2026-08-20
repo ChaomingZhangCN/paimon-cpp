@@ -309,6 +309,183 @@ TEST_P(WriteAndReadInteTest, TestAppendSimple) {
     ASSERT_TRUE(success);
 }
 
+TEST_P(WriteAndReadInteTest, TestAppendVector) {
+    auto [file_format, file_system] = GetParam();
+    if (file_format != "parquet") {
+        return;
+    }
+
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
+                                 arrow::field("embedding", vector_type)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "avro"},  {Options::FILE_FORMAT, file_format},
+        {Options::TARGET_FILE_SIZE, "1024"}, {Options::BUCKET, "-1"},
+        {Options::FILE_SYSTEM, file_system},
+    };
+    if (file_system == "jindo") {
+        options = AddOptionsForJindo(options);
+    }
+    ASSERT_OK_AND_ASSIGN(auto helper,
+                         TestHelper::Create(test_dir_, arrow::schema(fields), /*partition_keys=*/{},
+                                            /*primary_keys=*/{}, options,
+                                            /*is_streaming_mode=*/false));
+    const std::string data_json = R"([
+        [1, [1.0, 2.0, 3.0]],
+        [2, null],
+        [3, [4.0, 5.0, 6.0]]
+    ])";
+    auto data =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), data_json).ValueOrDie();
+    auto c_array = std::make_unique<ArrowArray>();
+    ASSERT_TRUE(arrow::ExportArray(*data, c_array.get()).ok());
+    RecordBatchBuilder batch_builder(c_array.get());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch, batch_builder.SetBucket(0).Finish());
+    ASSERT_OK_AND_ASSIGN(auto commit_messages,
+                         helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                                /*expected_commit_messages=*/std::nullopt));
+    (void)commit_messages;
+
+    arrow::FieldVector result_fields = fields;
+    result_fields.insert(result_fields.begin(), arrow::field("_VALUE_KIND", arrow::int8()));
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
+                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> actual,
+                         helper->ReadResult(data_splits));
+    const std::string expected_json = R"([
+        [0, 1, [1.0, 2.0, 3.0]],
+        [0, 2, null],
+        [0, 3, [4.0, 5.0, 6.0]]
+    ])";
+    auto expected =
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(result_fields), expected_json)
+            .ValueOrDie();
+    ASSERT_TRUE(std::make_shared<arrow::ChunkedArray>(expected)->Equals(actual));
+}
+
+TEST_P(WriteAndReadInteTest, TestAppendNestedVector) {
+    auto [file_format, file_system] = GetParam();
+    if (file_format != "parquet") {
+        return;
+    }
+
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 2);
+    arrow::FieldVector fields = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("payload", arrow::struct_({arrow::field("embedding", vector_type)})),
+        arrow::field("history", arrow::list(vector_type)),
+        arrow::field("by_name", arrow::map(arrow::utf8(), vector_type)),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "avro"},  {Options::FILE_FORMAT, file_format},
+        {Options::TARGET_FILE_SIZE, "1024"}, {Options::BUCKET, "-1"},
+        {Options::FILE_SYSTEM, file_system},
+    };
+    if (file_system == "jindo") {
+        options = AddOptionsForJindo(options);
+    }
+    ASSERT_OK_AND_ASSIGN(auto helper,
+                         TestHelper::Create(test_dir_, arrow::schema(fields), /*partition_keys=*/{},
+                                            /*primary_keys=*/{}, options,
+                                            /*is_streaming_mode=*/false));
+    const std::string data_json = R"([
+        [1, [[1.0, 2.0]], [[3.0, 4.0], null], [["a", [5.0, 6.0]], ["b", null]]],
+        [2, [null], null, []],
+        [3, null, [], [["c", [7.0, 8.0]]]]
+    ])";
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), data_json,
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> data_splits,
+                         helper->NewScan(StartupMode::LatestFull(), /*snapshot_id=*/std::nullopt));
+    arrow::FieldVector result_fields = fields;
+    result_fields.insert(result_fields.begin(), arrow::field("_VALUE_KIND", arrow::int8()));
+    const std::string expected_json = R"([
+        [0, 1, [[1.0, 2.0]], [[3.0, 4.0], null], [["a", [5.0, 6.0]], ["b", null]]],
+        [0, 2, [null], null, []],
+        [0, 3, null, [], [["c", [7.0, 8.0]]]]
+    ])";
+    ASSERT_OK_AND_ASSIGN(bool success, helper->ReadAndCheckResult(arrow::struct_(result_fields),
+                                                                  data_splits, expected_json));
+    ASSERT_TRUE(success);
+}
+
+// Pushing a predicate down on a non-vector column must not disturb the VECTOR column, whose
+// read schema differs from the type stored in the data file.
+TEST_P(WriteAndReadInteTest, TestAppendVectorWithPredicate) {
+    auto [file_format, file_system] = GetParam();
+    if (file_format != "parquet") {
+        return;
+    }
+
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
+                                 arrow::field("embedding", vector_type)};
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "avro"},
+        {Options::FILE_FORMAT, file_format},
+        {Options::TARGET_FILE_SIZE, "1048576"},
+        {Options::BUCKET, "-1"},
+        {Options::FILE_SYSTEM, file_system},
+        // One row per row group, so the predicate prunes row groups instead of rows.
+        {"parquet.write.max-row-group-length", "1"},
+    };
+    if (file_system == "jindo") {
+        options = AddOptionsForJindo(options);
+    }
+    ASSERT_OK_AND_ASSIGN(auto helper,
+                         TestHelper::Create(test_dir_, arrow::schema(fields), /*partition_keys=*/{},
+                                            /*primary_keys=*/{}, options,
+                                            /*is_streaming_mode=*/false));
+    std::string table_path = PathUtil::JoinPath(test_dir_, "foo.db/bar");
+    const std::string data_json = R"([
+        [1, [1.0, 2.0, 3.0]],
+        [2, null],
+        [3, [4.0, 5.0, 6.0]],
+        [4, [7.0, 8.0, 9.0]]
+    ])";
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<RecordBatch> batch,
+                         TestHelper::MakeRecordBatch(arrow::struct_(fields), data_json,
+                                                     /*partition_map=*/{}, /*bucket=*/0, {}));
+    ASSERT_OK(helper->WriteAndCommit(std::move(batch), /*commit_identifier=*/0,
+                                     /*expected_commit_messages=*/std::nullopt));
+
+    auto predicate = PredicateBuilder::GreaterThan(/*field_index=*/0, /*field_name=*/"id",
+                                                   FieldType::INT, Literal(2));
+    ScanContextBuilder scan_context_builder(table_path);
+    scan_context_builder.SetOptions(options)
+        .AddOption(Options::SCAN_MODE, StartupMode::LatestFull().ToString())
+        .SetPredicate(predicate);
+    ASSERT_OK_AND_ASSIGN(auto scan_context, scan_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(auto table_scan, TableScan::Create(std::move(scan_context)));
+    ASSERT_OK_AND_ASSIGN(auto result_plan, table_scan->CreatePlan());
+    ASSERT_FALSE(result_plan->Splits().empty());
+
+    ReadContextBuilder read_context_builder(table_path);
+    read_context_builder.SetOptions(options).SetPredicate(predicate);
+    ASSERT_OK_AND_ASSIGN(auto read_context, read_context_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(auto table_read, TableRead::Create(std::move(read_context)));
+    ASSERT_OK_AND_ASSIGN(auto batch_reader, table_read->CreateReader(result_plan->Splits()));
+    ASSERT_OK_AND_ASSIGN(auto actual, ReadResultCollector::CollectResult(batch_reader.get()));
+
+    arrow::FieldVector fields_with_row_kind = fields;
+    fields_with_row_kind.insert(fields_with_row_kind.begin(),
+                                arrow::field("_VALUE_KIND", arrow::int8()));
+    auto expected = std::make_shared<arrow::ChunkedArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_with_row_kind), R"([
+        [0, 3, [4.0, 5.0, 6.0]],
+        [0, 4, [7.0, 8.0, 9.0]]
+    ])")
+            .ValueOrDie());
+    ASSERT_TRUE(expected->Equals(actual)) << actual->ToString();
+}
+
 TEST_P(WriteAndReadInteTest, TestPKSimple) {
     arrow::FieldVector fields = {
         arrow::field("pk", arrow::utf8()),

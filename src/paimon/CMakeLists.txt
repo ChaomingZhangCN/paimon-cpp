@@ -157,6 +157,7 @@ set(PAIMON_COMMON_SRCS
     common/utils/arrow/arrow_output_stream_adapter.cpp
     common/utils/arrow/arrow_utils.cpp
     common/utils/arrow/mem_utils.cpp
+    common/utils/arrow/vector_utils.cpp
     common/utils/binary_row_partition_computer.cpp
     common/utils/bit_set.cpp
     common/utils/bloom_filter.cpp
@@ -275,6 +276,7 @@ set(PAIMON_CORE_SRCS
     core/io/data_file_writer.cpp
     core/io/field_mapping_reader.cpp
     core/io/complete_row_tracking_fields_reader.cpp
+    core/io/vector_file_batch_reader.cpp
     core/io/file_index_evaluator.cpp
     core/io/key_value_data_file_record_reader.cpp
     core/io/key_value_data_file_writer_factory.cpp
@@ -611,6 +613,7 @@ if(PAIMON_BUILD_TESTS)
                     common/utils/row_range_index_test.cpp
                     common/utils/var_length_int_utils_test.cpp
                     common/utils/arrow/arrow_utils_test.cpp
+                    common/utils/arrow/vector_utils_test.cpp
                     common/utils/arrow/arrow_stream_adapter_test.cpp
                     common/utils/arrow/mem_utils_test.cpp
                     common/utils/arrow/status_utils_test.cpp
@@ -747,6 +750,7 @@ if(PAIMON_BUILD_TESTS)
                     core/io/key_value_in_memory_record_reader_test.cpp
                     core/io/merged_key_value_record_reader_test.cpp
                     core/io/complete_row_tracking_fields_reader_test.cpp
+                    core/io/vector_file_batch_reader_test.cpp
                     core/io/data_file_meta_test.cpp
                     core/io/file_index_evaluator_test.cpp
                     core/io/single_file_writer_test.cpp
