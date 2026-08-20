@@ -57,7 +57,7 @@ index 285e2a5973..db919d7ef8 100644
    }
 
 +  ::arrow::Status GetColumn(
-+      int i, const std::vector<int>& column_indices,
++      int i, const std::shared_ptr<std::unordered_set<int>>& column_indices,
 +      FileColumnIteratorFactory iterator_factory,
 +      std::unique_ptr<ColumnReader>* out) override;
 +
@@ -235,7 +235,7 @@ index 285e2a5973..db919d7ef8 100644
  }
 
 +::arrow::Status FileReaderImpl::GetColumn(
-+    int i, const std::vector<int>& column_indices,
++    int i, const std::shared_ptr<std::unordered_set<int>>& column_indices,
 +    FileColumnIteratorFactory iterator_factory,
 +    std::unique_ptr<ColumnReader>* out) {
 +  RETURN_NOT_OK(BoundsCheckColumn(i));
@@ -244,7 +244,7 @@ index 285e2a5973..db919d7ef8 100644
 +  ctx->pool = pool_;
 +  ctx->iterator_factory = iterator_factory;
 +  ctx->filter_leaves = true;
-+  ctx->included_leaves = VectorToSharedSet(column_indices);
++  ctx->included_leaves = column_indices;
 +  std::unique_ptr<ColumnReaderImpl> result;
 +  RETURN_NOT_OK(GetReader(manifest_.schema_fields[i], ctx, &result));
 +  *out = std::move(result);
@@ -298,7 +298,7 @@ index 6e46ca43f7..e86ff0ef52 100644
 +  /// \param iterator_factory factory to create FileColumnIterator per leaf
 +  /// \param[out] out the ColumnReader (may be nullptr if all leaves are pruned)
 +  virtual ::arrow::Status GetColumn(
-+      int i, const std::vector<int>& column_indices,
++      int i, const std::shared_ptr<std::unordered_set<int>>& column_indices,
 +      FileColumnIteratorFactory iterator_factory,
 +      std::unique_ptr<ColumnReader>* out) {
 +    return ::arrow::Status::NotImplemented(
