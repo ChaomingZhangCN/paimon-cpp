@@ -38,6 +38,7 @@
 #include "paimon/defs.h"
 #include "paimon/format/file_format.h"
 #include "paimon/format/file_format_factory.h"
+#include "paimon/statistics_mode.h"
 #include "paimon/status.h"
 
 namespace paimon {
@@ -391,7 +392,9 @@ struct CoreOptions::Impl {
     int64_t commit_timeout = std::numeric_limits<int64_t>::max();
     int64_t commit_min_retry_wait = 10;
     int64_t commit_max_retry_wait = 10 * 1000;
+    bool realtime_enabled = false;
     int64_t realtime_read_view_ttl_millis = 5 * 60 * 1000;
+    StatisticsMode realtime_store_statistics_mode = StatisticsMode::NONE;
 
     std::shared_ptr<FileFormat> file_format;
     std::shared_ptr<FileSystem> file_system;
@@ -805,12 +808,6 @@ struct CoreOptions::Impl {
         std::string scan_timestamp_str;
         PAIMON_RETURN_NOT_OK(parser.Parse(Options::SCAN_TIMESTAMP, &scan_timestamp_str));
         PAIMON_RETURN_NOT_OK(parser.Parse(Options::SCAN_TIMESTAMP_MILLIS, &scan_timestamp_millis));
-        PAIMON_RETURN_NOT_OK(parser.ParseTimeDuration(Options::REALTIME_READ_VIEW_TTL,
-                                                      &realtime_read_view_ttl_millis));
-        if (realtime_read_view_ttl_millis <= 0) {
-            return Status::Invalid(
-                fmt::format("{} must be positive", Options::REALTIME_READ_VIEW_TTL));
-        }
         if (scan_timestamp_millis != std::nullopt && !scan_timestamp_str.empty()) {
             return Status::Invalid(
                 "scan.timestamp-millis and scan.timestamp cannot be set at the same time");
@@ -838,6 +835,34 @@ struct CoreOptions::Impl {
         // Parse scan.tag-name - optional tag name for "from-snapshot" scan mode
         PAIMON_RETURN_NOT_OK(parser.Parse(Options::SCAN_TAG_NAME, &scan_tag_name));
         return Status::OK();
+    }
+
+    // Parse statistics collected by real-time stores.
+    Status ParseRealtimeStoreStatisticsMode(const ConfigParser& parser) {
+        std::string statistics_mode = "none";
+        PAIMON_RETURN_NOT_OK(parser.Parse(Options::REALTIME_STORE_STATS_MODE, &statistics_mode));
+        statistics_mode = StringUtils::ToLowerCase(statistics_mode);
+        if (statistics_mode == "none") {
+            realtime_store_statistics_mode = StatisticsMode::NONE;
+        } else if (statistics_mode == "full") {
+            realtime_store_statistics_mode = StatisticsMode::FULL;
+        } else {
+            return Status::Invalid(
+                fmt::format("{} must be 'none' or 'full'", Options::REALTIME_STORE_STATS_MODE));
+        }
+        return Status::OK();
+    }
+
+    // Parse real-time write and read configurations.
+    Status ParseRealtimeOptions(const ConfigParser& parser) {
+        PAIMON_RETURN_NOT_OK(parser.Parse<bool>(Options::REALTIME_ENABLED, &realtime_enabled));
+        PAIMON_RETURN_NOT_OK(parser.ParseTimeDuration(Options::REALTIME_READ_VIEW_TTL,
+                                                      &realtime_read_view_ttl_millis));
+        if (realtime_read_view_ttl_millis <= 0) {
+            return Status::Invalid(
+                fmt::format("{} must be positive", Options::REALTIME_READ_VIEW_TTL));
+        }
+        return ParseRealtimeStoreStatisticsMode(parser);
     }
 
     // Parse index-related configurations: file index, global index.
@@ -1053,6 +1078,7 @@ Result<CoreOptions> CoreOptions::FromMap(
     PAIMON_RETURN_NOT_OK(impl->ParseCommitOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseMergeAndSequenceOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseDeletionVectorOptions(parser));
+    PAIMON_RETURN_NOT_OK(impl->ParseRealtimeOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseScanAndBranchOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseIndexOptions(parser));
     PAIMON_RETURN_NOT_OK(impl->ParseCompactionOptions(parser));
@@ -1165,8 +1191,16 @@ std::optional<int64_t> CoreOptions::GetScanTimestampMillis() const {
     return impl_->scan_timestamp_millis;
 }
 
+bool CoreOptions::RealtimeEnabled() const {
+    return impl_->realtime_enabled;
+}
+
 int64_t CoreOptions::GetRealtimeReadViewTtlMillis() const {
     return impl_->realtime_read_view_ttl_millis;
+}
+
+StatisticsMode CoreOptions::GetRealtimeStoreStatisticsMode() const {
+    return impl_->realtime_store_statistics_mode;
 }
 
 int32_t CoreOptions::GetScanManifestEntryCacheMaxSnapshots() const {

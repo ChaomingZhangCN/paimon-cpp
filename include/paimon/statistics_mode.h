@@ -19,18 +19,14 @@
 
 #pragma once
 
-#include "paimon/realtime/realtime_store.h"
-
 namespace paimon {
 
-/// Factory for Paimon's default Arrow-backed `RealtimeStore`.
-class PAIMON_EXPORT ArrowRealtimeStoreFactory : public RealtimeStoreFactory {
- public:
-    /// Creates an Arrow-backed store for one partition and bucket.
-    Result<std::shared_ptr<RealtimeStore>> Create(
-        std::unique_ptr<::ArrowSchema> write_schema, StatisticsMode statistics_mode,
-        const std::map<std::string, std::string>& options,
-        const std::shared_ptr<MemoryPool>& memory_pool) override;
+/// Controls the amount of statistics collected for metadata pruning.
+enum class StatisticsMode {
+    /// Do not collect statistics.
+    NONE,
+    /// Collect statistics for all supported fields.
+    FULL,
 };
 
 }  // namespace paimon
