@@ -105,6 +105,25 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeAtomicType) {
     ASSERT_TRUE(result.value()->Equals(data_type));
 }
 
+TEST(NestedProjectionUtilsTest, PruneDataTypeRejectsVectorDimensionChange) {
+    auto data_type = arrow::fixed_size_list(arrow::float32(), 3);
+    auto read_type = arrow::fixed_size_list(arrow::float32(), 5);
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "VECTOR type mismatch during schema evolution: data "
+                        "fixed_size_list<item: float>[3] vs read fixed_size_list<item: float>[5]");
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeRejectsNestedVectorDimensionChange) {
+    auto data_type =
+        arrow::struct_({MakeField("embedding", arrow::fixed_size_list(arrow::float32(), 3), 1)});
+    auto read_type =
+        arrow::struct_({MakeField("embedding", arrow::fixed_size_list(arrow::float32(), 5), 1)});
+
+    ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
+                        "VECTOR type mismatch during schema evolution");
+}
+
 TEST(NestedProjectionUtilsTest, PruneDataTypeStructPruneSubset) {
     // data: STRUCT<x:INT(id=1), y:STRING(id=2), z:DOUBLE(id=3)>
     // read: STRUCT<x:INT(id=1)>

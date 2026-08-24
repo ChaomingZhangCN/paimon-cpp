@@ -164,6 +164,13 @@ Result<bool> EqualWithFieldIds(const std::shared_ptr<arrow::DataType>& a,
     if (a->id() != b->id() || a->num_fields() != b->num_fields()) {
         return false;
     }
+    if (a->id() == arrow::Type::FIXED_SIZE_LIST) {
+        const auto& vector_a = checked_cast<const arrow::FixedSizeListType&>(*a);
+        const auto& vector_b = checked_cast<const arrow::FixedSizeListType&>(*b);
+        if (vector_a.list_size() != vector_b.list_size()) {
+            return false;
+        }
+    }
     if (a->num_fields() == 0) {
         return a->Equals(*b);
     }
@@ -190,6 +197,27 @@ Result<bool> EqualWithFieldIds(const std::shared_ptr<arrow::DataType>& a,
         }
     }
     return true;
+}
+
+Status ValidateVectorEvolution(const std::shared_ptr<arrow::DataType>& read_type,
+                               const std::shared_ptr<arrow::DataType>& data_type) {
+    bool read_is_vector = read_type->id() == arrow::Type::FIXED_SIZE_LIST;
+    bool data_is_vector = data_type->id() == arrow::Type::FIXED_SIZE_LIST;
+    if (!read_is_vector && !data_is_vector) {
+        return Status::OK();
+    }
+    if (read_is_vector && data_is_vector) {
+        const auto& read_vector = checked_cast<const arrow::FixedSizeListType&>(*read_type);
+        const auto& data_vector = checked_cast<const arrow::FixedSizeListType&>(*data_type);
+        if (read_vector.list_size() == data_vector.list_size() &&
+            read_vector.value_type()->Equals(data_vector.value_type())) {
+            return Status::OK();
+        }
+    }
+    return Status::Invalid(
+        fmt::format("VECTOR type mismatch during schema evolution: data {} vs "
+                    "read {}",
+                    data_type->ToString(), read_type->ToString()));
 }
 
 /// Whether `read_type` is `data_type` with variant columns replaced by their variant-access
@@ -238,6 +266,7 @@ Result<bool> IsVariantAccessSubstitution(const std::shared_ptr<arrow::DataType>&
 Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
     const std::shared_ptr<arrow::DataType>& read_type,
     const std::shared_ptr<arrow::DataType>& data_type, const char* container) {
+    PAIMON_RETURN_NOT_OK(ValidateVectorEvolution(read_type, data_type));
     PAIMON_ASSIGN_OR_RAISE(bool same, EqualWithFieldIds(read_type, data_type));
     if (same) {
         return data_type;
@@ -315,6 +344,7 @@ Result<std::shared_ptr<arrow::DataType>> PruneRepeatedItemType(
 Result<std::optional<std::shared_ptr<arrow::DataType>>> NestedProjectionUtils::PruneDataType(
     const std::shared_ptr<arrow::DataType>& read_type,
     const std::shared_ptr<arrow::DataType>& data_type) {
+    PAIMON_RETURN_NOT_OK(ValidateVectorEvolution(read_type, data_type));
     // Identical types (including paimon field IDs) need no pruning.
     PAIMON_ASSIGN_OR_RAISE(bool same, EqualWithFieldIds(read_type, data_type));
     if (same) {

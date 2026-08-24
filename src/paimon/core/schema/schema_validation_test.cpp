@@ -71,6 +71,35 @@ TEST(SchemaValidationTest, TestVectorType) {
     ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
                         "in primary key field embedding is unsupported");
 
+    ASSERT_OK_AND_ASSIGN(
+        table_schema, TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{"embedding"},
+                                          /*primary_keys=*/{}, parquet_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "in partition field embedding is unsupported");
+
+    std::map<std::string, std::string> bucket_key_options = {
+        {Options::BUCKET, "1"},
+        {Options::BUCKET_KEY, "embedding"},
+        {Options::FILE_FORMAT, "parquet"},
+    };
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},
+                                             /*primary_keys=*/{}, bucket_key_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "Nested type cannot be in bucket-key");
+
+    std::map<std::string, std::string> sequence_field_options = {
+        {Options::BUCKET, "1"},
+        {Options::BUCKET_KEY, "id"},
+        {Options::FILE_FORMAT, "parquet"},
+        {Options::SEQUENCE_FIELD, "embedding"},
+    };
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},
+                                             /*primary_keys=*/{"id"}, sequence_field_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "VECTOR field 'embedding' cannot be used as a sequence field.");
+
     primary_key_options[Options::FILE_FORMAT] = "parquet";
     ASSERT_OK_AND_ASSIGN(table_schema,
                          TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},
@@ -99,14 +128,12 @@ TEST(SchemaValidationTest, TestVectorType) {
                          TableSchema::Create(/*schema_id=*/0, schema,
                                              /*partition_keys=*/{},
                                              /*primary_keys=*/{}, data_evolution_options));
-    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
-                        "VECTOR fields in data-evolution tables are not implemented yet.");
+    ASSERT_OK(SchemaValidation::ValidateTableSchema(*table_schema));
     ASSERT_OK_AND_ASSIGN(table_schema,
                          TableSchema::Create(/*schema_id=*/0, nested_schema,
                                              /*partition_keys=*/{},
                                              /*primary_keys=*/{}, data_evolution_options));
-    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
-                        "VECTOR fields in data-evolution tables are not implemented yet.");
+    ASSERT_OK(SchemaValidation::ValidateTableSchema(*table_schema));
 }
 
 TEST(SchemaValidationTest, TestRowTracking) {

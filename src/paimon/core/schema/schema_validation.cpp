@@ -423,6 +423,11 @@ Status SchemaValidation::ValidateSequenceField(const TableSchema& schema,
             PAIMON_RETURN_NOT_OK(Preconditions::CheckState(
                 std::find(field_names.begin(), field_names.end(), field) != field_names.end(),
                 fmt::format("Sequence field: '{}' cannot be found in table schema.", field)));
+            PAIMON_ASSIGN_OR_RAISE(DataField sequence_data_field, schema.GetField(field));
+            if (VectorUtils::ContainsVectorField(sequence_data_field.ArrowField())) {
+                return Status::Invalid(
+                    fmt::format("VECTOR field '{}' cannot be used as a sequence field.", field));
+            }
 
             PAIMON_ASSIGN_OR_RAISE(std::optional<std::string> agg_func,
                                    options.GetFieldAggFunc(field));
@@ -677,10 +682,6 @@ Status SchemaValidation::ValidateVectorFields(const TableSchema& schema,
     if (!schema.PrimaryKeys().empty()) {
         return Status::NotImplemented(
             "VECTOR fields in primary-key tables are not implemented yet.");
-    }
-    if (options.DataEvolutionEnabled()) {
-        return Status::NotImplemented(
-            "VECTOR fields in data-evolution tables are not implemented yet.");
     }
     PAIMON_RETURN_NOT_OK(
         ValidateVectorFileFormat(Options::FILE_FORMAT, options.GetFileFormat()->Identifier()));

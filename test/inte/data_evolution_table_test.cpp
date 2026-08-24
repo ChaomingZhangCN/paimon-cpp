@@ -1641,6 +1641,102 @@ TEST_P(DataEvolutionTableTest, TestPartitionWithPredicate) {
     }
 }
 
+TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolution) {
+    if (FileFormat() != "parquet") {
+        GTEST_SKIP() << "VECTOR currently only supports Parquet data files";
+    }
+
+    auto retained_vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto dropped_vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::int64(), /*nullable=*/false), 2);
+    auto added_vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float64(), /*nullable=*/false), 2);
+    arrow::FieldVector fields_v0 = {
+        arrow::field("id", arrow::int32()),
+        arrow::field("retained_embedding", retained_vector_type),
+        arrow::field("dropped_embedding", dropped_vector_type),
+    };
+    std::map<std::string, std::string> options = {
+        {Options::MANIFEST_FORMAT, "orc"},       {Options::FILE_FORMAT, "parquet"},
+        {Options::FILE_SYSTEM, "local"},         {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
+    };
+    CreateTable(fields_v0, /*partition_keys=*/{}, options);
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+
+    auto initial_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_v0), R"([
+        [1, [1.0, 2.0, 3.0], [10, 11]],
+        [2, null, [20, 21]]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::shared_ptr<CommitMessage>> initial_commit_msgs,
+        WriteArray(table_path, arrow::schema(fields_v0)->field_names(), initial_array));
+    ASSERT_OK(Commit(table_path, initial_commit_msgs));
+
+    // Drop one VECTOR column and add another. Files written with schema 0 must still expose the
+    // retained VECTOR and null-fill the newly added one.
+    arrow::FieldVector fields_v1 = {
+        fields_v0[0],
+        fields_v0[1],
+        arrow::field("added_embedding", added_vector_type),
+    };
+    ASSERT_OK(TestHelper::WriteNextSchema(
+        dir_->GetFileSystem(), table_path,
+        {DataField(0, fields_v1[0]), DataField(1, fields_v1[1]), DataField(3, fields_v1[2])},
+        /*highest_field_id=*/3, options));
+
+    auto expected_after_evolution = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_v1), R"([
+        [1, [1.0, 2.0, 3.0], null],
+        [2, null, null]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(
+        ScanAndRead(table_path, arrow::schema(fields_v1)->field_names(), expected_after_evolution));
+
+    // A partial write under schema 1 fills the added VECTOR for the same row range. The read
+    // merges it with scalar and VECTOR columns from the schema-0 file.
+    auto added_array = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_v1[2]}), R"([
+        [[100.0, 101.0]],
+        [null]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<CommitMessage>> added_commit_msgs,
+                         WriteArray(table_path, {"added_embedding"}, added_array));
+    SetFirstRowId(/*reset_first_row_id=*/0, added_commit_msgs);
+    ASSERT_OK(Commit(table_path, added_commit_msgs));
+
+    auto expected_after_partial_write = std::dynamic_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_v1), R"([
+        [1, [1.0, 2.0, 3.0], [100.0, 101.0]],
+        [2, null, null]
+    ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields_v1)->field_names(),
+                          expected_after_partial_write));
+
+    // Reusing a field id with a different dimension is not a compatible schema evolution.
+    auto incompatible_vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 5);
+    arrow::FieldVector incompatible_fields = {
+        fields_v1[0],
+        arrow::field("retained_embedding", incompatible_vector_type),
+        fields_v1[2],
+    };
+    ASSERT_OK(TestHelper::WriteNextSchema(
+        dir_->GetFileSystem(), table_path,
+        {DataField(0, incompatible_fields[0]), DataField(1, incompatible_fields[1]),
+         DataField(3, incompatible_fields[2])},
+        /*highest_field_id=*/3, options));
+    ASSERT_NOK_WITH_MSG(ScanAndRead(table_path, arrow::schema(incompatible_fields)->field_names(),
+                                    expected_after_partial_write),
+                        "VECTOR type mismatch during schema evolution");
+}
+
 TEST_P(DataEvolutionTableTest, TestAlterTable) {
     auto file_format = FileFormat();
     if (file_format == "avro") {
