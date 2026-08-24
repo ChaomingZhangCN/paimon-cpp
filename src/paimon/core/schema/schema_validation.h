@@ -46,6 +46,13 @@ class SchemaValidation {
 
     static Status ValidateTableSchema(const TableSchema& schema);
 
+    /// Validates an already constructed next schema against the current table schema.
+    ///
+    /// This checks version and field-id invariants together with type transitions that cannot be
+    /// represented by the read path, including VECTOR dimension and element-type changes.
+    static Status ValidateSchemaEvolution(const TableSchema& current_schema,
+                                          const TableSchema& next_schema);
+
     static bool IsPostponeBucketTable(const TableSchema& schema, int32_t bucket);
 
  private:

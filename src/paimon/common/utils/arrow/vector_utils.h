@@ -49,6 +49,14 @@ class PAIMON_EXPORT VectorUtils {
     /// Rejects VECTOR values whose elements are not fully materialized or contain nulls.
     /// `array` must be the List or FixedSizeList array holding the VECTOR values.
     static Status ValidateVectorElements(const arrow::Array& array);
+
+    /// Validates a type transition involving a top-level VECTOR.
+    ///
+    /// A VECTOR field keeps its element type and dimension throughout schema evolution.
+    /// Adding or dropping a VECTOR is represented by a new or removed field id and therefore
+    /// does not compare the VECTOR against another type here.
+    static Status ValidateVectorTypeEvolution(const std::shared_ptr<arrow::DataType>& previous_type,
+                                              const std::shared_ptr<arrow::DataType>& new_type);
 };
 
 }  // namespace paimon

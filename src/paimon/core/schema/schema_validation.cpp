@@ -126,6 +126,16 @@ Status ValidatePerLevelOption(
     return Status::OK();
 }
 
+Status ValidateVectorComparatorField(const TableSchema& schema, const std::string& field_name,
+                                     const std::string& role) {
+    PAIMON_ASSIGN_OR_RAISE(DataField field, schema.GetField(field_name));
+    if (VectorUtils::ContainsVectorField(field.ArrowField())) {
+        return Status::Invalid(
+            fmt::format("VECTOR field '{}' cannot be used as {}.", field_name, role));
+    }
+    return Status::OK();
+}
+
 }  // namespace
 
 bool SchemaValidation::IsComplexType(const std::shared_ptr<arrow::Field>& field) {
@@ -199,6 +209,46 @@ Status SchemaValidation::ValidateTableSchema(const TableSchema& schema) {
     PAIMON_RETURN_NOT_OK(ValidateBlobFields(schema, options));
     PAIMON_RETURN_NOT_OK(ValidateMapStorageLayout(schema, options));
     PAIMON_RETURN_NOT_OK(ValidateVectorFields(schema, options));
+    return Status::OK();
+}
+
+Status SchemaValidation::ValidateSchemaEvolution(const TableSchema& current_schema,
+                                                 const TableSchema& next_schema) {
+    PAIMON_RETURN_NOT_OK(ValidateTableSchema(next_schema));
+    if (next_schema.Id() != current_schema.Id() + 1) {
+        return Status::Invalid(fmt::format("Next schema id must be {}, but is {}.",
+                                           current_schema.Id() + 1, next_schema.Id()));
+    }
+    if (next_schema.PartitionKeys() != current_schema.PartitionKeys()) {
+        return Status::Invalid("Partition keys cannot be changed by schema evolution.");
+    }
+    if (next_schema.PrimaryKeys() != current_schema.PrimaryKeys()) {
+        return Status::Invalid("Primary keys cannot be changed by schema evolution.");
+    }
+    if (next_schema.HighestFieldId() < current_schema.HighestFieldId()) {
+        return Status::Invalid(fmt::format("Highest field id cannot decrease from {} to {}.",
+                                           current_schema.HighestFieldId(),
+                                           next_schema.HighestFieldId()));
+    }
+
+    std::unordered_map<int32_t, DataField> current_fields;
+    for (const auto& field : current_schema.Fields()) {
+        current_fields.emplace(field.Id(), field);
+    }
+    for (const auto& next_field : next_schema.Fields()) {
+        auto current = current_fields.find(next_field.Id());
+        if (current == current_fields.end()) {
+            if (next_field.Id() <= current_schema.HighestFieldId()) {
+                return Status::Invalid(fmt::format(
+                    "New field '{}' uses id {}, which must be greater than the previous highest "
+                    "field id {}.",
+                    next_field.Name(), next_field.Id(), current_schema.HighestFieldId()));
+            }
+            continue;
+        }
+        PAIMON_RETURN_NOT_OK(
+            VectorUtils::ValidateVectorTypeEvolution(current->second.Type(), next_field.Type()));
+    }
     return Status::OK();
 }
 
@@ -356,6 +406,8 @@ Status SchemaValidation::ValidateSequenceGroup(const TableSchema& schema,
                     fmt::format("The sequence field group: {} can not be found in table schema.",
                                 sequence_field_name));
             }
+            PAIMON_RETURN_NOT_OK(ValidateVectorComparatorField(schema, sequence_field_name,
+                                                               "a sequence-group ordering field"));
         }
 
         for (const auto& field : StringUtils::Split(v, Options::FIELDS_SEPARATOR)) {
@@ -423,11 +475,7 @@ Status SchemaValidation::ValidateSequenceField(const TableSchema& schema,
             PAIMON_RETURN_NOT_OK(Preconditions::CheckState(
                 std::find(field_names.begin(), field_names.end(), field) != field_names.end(),
                 fmt::format("Sequence field: '{}' cannot be found in table schema.", field)));
-            PAIMON_ASSIGN_OR_RAISE(DataField sequence_data_field, schema.GetField(field));
-            if (VectorUtils::ContainsVectorField(sequence_data_field.ArrowField())) {
-                return Status::Invalid(
-                    fmt::format("VECTOR field '{}' cannot be used as a sequence field.", field));
-            }
+            PAIMON_RETURN_NOT_OK(ValidateVectorComparatorField(schema, field, "a sequence field"));
 
             PAIMON_ASSIGN_OR_RAISE(std::optional<std::string> agg_func,
                                    options.GetFieldAggFunc(field));

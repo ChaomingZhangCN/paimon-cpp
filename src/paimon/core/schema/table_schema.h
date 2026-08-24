@@ -38,6 +38,8 @@
 struct ArrowSchema;
 
 namespace paimon {
+class SchemaManager;
+
 /// Schema of a table, including schemaId and fieldId.
 class TableSchema : public DataSchema, public Jsonizable<TableSchema> {
  public:
@@ -125,6 +127,7 @@ class TableSchema : public DataSchema, public Jsonizable<TableSchema> {
     }
 
  private:
+    friend class SchemaManager;
     JSONIZABLE_FRIEND_AND_DEFAULT_CTOR(TableSchema);
 
     static Result<std::unique_ptr<TableSchema>> InitSchema(

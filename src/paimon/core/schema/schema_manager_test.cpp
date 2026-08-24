@@ -24,6 +24,7 @@
 
 #include "arrow/type.h"
 #include "gtest/gtest.h"
+#include "paimon/defs.h"
 #include "paimon/fs/local/local_file_system.h"
 #include "paimon/status.h"
 #include "paimon/testing/utils/testharness.h"
@@ -190,6 +191,57 @@ TEST(SchemaManagerTest, TestCreateTableAlreadyExists) {
 
     // Try to create table where schema already exists
     ASSERT_NOK_WITH_MSG(manager.CreateTable(schema, {}, {}, {}), "Schema in filesystem exists");
+}
+
+TEST(SchemaManagerTest, TestCommitVectorSchemaEvolution) {
+    auto fs = std::make_shared<LocalFileSystem>();
+    auto dir = UniqueTestDirectory::Create();
+    SchemaManager manager(fs, dir->Str());
+
+    auto vector3 =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto vector2 =
+        arrow::fixed_size_list(arrow::field("item", arrow::int64(), /*nullable=*/false), 2);
+    auto schema = arrow::schema({
+        arrow::field("id", arrow::int32()),
+        arrow::field("retained_embedding", vector3),
+        arrow::field("dropped_embedding", vector2),
+    });
+    std::map<std::string, std::string> options = {
+        {Options::BUCKET, "-1"},
+        {Options::FILE_FORMAT, "parquet"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+    };
+    ASSERT_OK_AND_ASSIGN([[maybe_unused]] std::unique_ptr<TableSchema> created,
+                         manager.CreateTable(schema, /*partition_keys=*/{},
+                                             /*primary_keys=*/{}, options));
+
+    auto added_vector =
+        arrow::fixed_size_list(arrow::field("item", arrow::float64(), /*nullable=*/false), 2);
+    std::vector<DataField> evolved_fields = {
+        DataField(0, arrow::field("id", arrow::int32())),
+        DataField(1, arrow::field("retained_embedding", vector3)),
+        DataField(3, arrow::field("added_embedding", added_vector)),
+    };
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<TableSchema> committed,
+                         manager.CommitSchema(evolved_fields, /*highest_field_id=*/3, options));
+    ASSERT_EQ(committed->Id(), 1);
+    ASSERT_NOK(committed->GetField("dropped_embedding"));
+    ASSERT_OK(committed->GetField("added_embedding"));
+
+    std::vector<DataField> incompatible_fields = evolved_fields;
+    incompatible_fields[1] = DataField(
+        1, arrow::field("retained_embedding", arrow::fixed_size_list(arrow::float32(), 5)));
+    ASSERT_NOK_WITH_MSG(manager.CommitSchema(incompatible_fields, /*highest_field_id=*/3, options),
+                        "VECTOR type mismatch during schema evolution");
+
+    incompatible_fields[1] = DataField(
+        1, arrow::field("retained_embedding", arrow::fixed_size_list(arrow::float64(), 3)));
+    ASSERT_NOK_WITH_MSG(manager.CommitSchema(incompatible_fields, /*highest_field_id=*/3, options),
+                        "VECTOR type mismatch during schema evolution");
+    ASSERT_OK_AND_ASSIGN(bool schema_2_exists, manager.SchemaExists(/*id=*/2));
+    ASSERT_FALSE(schema_2_exists);
 }
 
 TEST(SchemaManagerTest, TestListAllIds) {

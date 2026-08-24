@@ -110,8 +110,8 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeRejectsVectorDimensionChange) {
     auto read_type = arrow::fixed_size_list(arrow::float32(), 5);
 
     ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(read_type, data_type),
-                        "VECTOR type mismatch during schema evolution: data "
-                        "fixed_size_list<item: float>[3] vs read fixed_size_list<item: float>[5]");
+                        "VECTOR type mismatch during schema evolution: previous "
+                        "fixed_size_list<item: float>[3] vs new fixed_size_list<item: float>[5]");
 }
 
 TEST(NestedProjectionUtilsTest, PruneDataTypeRejectsNestedVectorDimensionChange) {

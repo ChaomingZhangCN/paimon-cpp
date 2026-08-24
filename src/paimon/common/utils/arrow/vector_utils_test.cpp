@@ -58,6 +58,22 @@ TEST(VectorUtilsTest, TestContainsVector) {
     ASSERT_FALSE(VectorUtils::ContainsVector(nullptr));
 }
 
+TEST(VectorUtilsTest, TestValidateVectorTypeEvolution) {
+    auto vector3 = arrow::fixed_size_list(arrow::float32(), 3);
+    ASSERT_OK(VectorUtils::ValidateVectorTypeEvolution(vector3, vector3));
+    ASSERT_OK(VectorUtils::ValidateVectorTypeEvolution(arrow::int32(), arrow::int64()));
+
+    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateVectorTypeEvolution(
+                            vector3, arrow::fixed_size_list(arrow::float32(), 5)),
+                        "VECTOR type mismatch during schema evolution");
+    ASSERT_NOK_WITH_MSG(VectorUtils::ValidateVectorTypeEvolution(
+                            vector3, arrow::fixed_size_list(arrow::float64(), 3)),
+                        "VECTOR type mismatch during schema evolution");
+    ASSERT_NOK_WITH_MSG(
+        VectorUtils::ValidateVectorTypeEvolution(arrow::list(arrow::float32()), vector3),
+        "VECTOR type mismatch during schema evolution");
+}
+
 TEST(VectorUtilsTest, TestValidateVectorElements) {
     auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
     ASSERT_OK(VectorUtils::ValidateVectorElements(

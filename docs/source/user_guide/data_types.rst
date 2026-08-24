@@ -199,10 +199,12 @@ and `Arrow DataTypes <https://arrow.apache.org/docs/format/Columnar.html#data-ty
        representation on disk and are restored as Arrow ``FixedSizeList``
        values on read. Data-evolution tables may add or drop VECTOR columns and
        continue reading files written with older table schemas. A VECTOR field's
-       element type and dimension cannot be changed through schema evolution.
+       element type and dimension cannot be changed through schema evolution;
+       an incompatible next schema is rejected before it is persisted.
        Primary-key tables containing VECTOR fields are rejected. VECTOR columns
-       also cannot be partition, bucket, or sequence (sorting) fields. Dedicated
-       vector storage is not included yet.
+       also cannot be partition or bucket keys, or comparator-based ordering
+       fields such as sequence and sequence-group fields. Dedicated vector
+       storage is not included yet.
 
        Paimon C++ also reads Parquet files written by Paimon Rust or Python whose
        embedded Arrow schema restores VECTOR columns as ``FixedSizeList``,

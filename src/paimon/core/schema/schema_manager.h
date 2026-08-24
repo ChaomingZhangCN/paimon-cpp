@@ -54,6 +54,15 @@ class SchemaManager {
         const std::vector<std::string>& primary_keys,
         const std::map<std::string, std::string>& options);
 
+    /// Atomically appends a schema version after validating it against the latest schema.
+    ///
+    /// `fields` is the complete next field list. Existing fields retain their field ids, while
+    /// added fields use ids greater than the latest schema's highest field id. Partition keys,
+    /// primary keys, and the table comment are preserved.
+    Result<std::shared_ptr<TableSchema>> CommitSchema(
+        const std::vector<DataField>& fields, int32_t highest_field_id,
+        const std::map<std::string, std::string>& options);
+
     std::string SchemaDirectory() const;
     Result<bool> SchemaExists(int64_t id) const;
     Result<std::vector<int64_t>> ListAllIds() const;

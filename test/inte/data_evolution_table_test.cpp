@@ -1727,14 +1727,29 @@ TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolution) {
         arrow::field("retained_embedding", incompatible_vector_type),
         fields_v1[2],
     };
-    ASSERT_OK(TestHelper::WriteNextSchema(
-        dir_->GetFileSystem(), table_path,
-        {DataField(0, incompatible_fields[0]), DataField(1, incompatible_fields[1]),
-         DataField(3, incompatible_fields[2])},
-        /*highest_field_id=*/3, options));
-    ASSERT_NOK_WITH_MSG(ScanAndRead(table_path, arrow::schema(incompatible_fields)->field_names(),
-                                    expected_after_partial_write),
+    ASSERT_NOK_WITH_MSG(TestHelper::WriteNextSchema(dir_->GetFileSystem(), table_path,
+                                                    {DataField(0, incompatible_fields[0]),
+                                                     DataField(1, incompatible_fields[1]),
+                                                     DataField(3, incompatible_fields[2])},
+                                                    /*highest_field_id=*/3, options),
                         "VECTOR type mismatch during schema evolution");
+
+    // Changing the element type is equally incompatible, even when the dimension is unchanged.
+    auto incompatible_element_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float64(), /*nullable=*/false), 3);
+    incompatible_fields[1] = arrow::field("retained_embedding", incompatible_element_type);
+    ASSERT_NOK_WITH_MSG(TestHelper::WriteNextSchema(dir_->GetFileSystem(), table_path,
+                                                    {DataField(0, incompatible_fields[0]),
+                                                     DataField(1, incompatible_fields[1]),
+                                                     DataField(3, incompatible_fields[2])},
+                                                    /*highest_field_id=*/3, options),
+                        "VECTOR type mismatch during schema evolution");
+
+    SchemaManager schema_manager(dir_->GetFileSystem(), table_path);
+    ASSERT_OK_AND_ASSIGN(bool schema_2_exists, schema_manager.SchemaExists(/*id=*/2));
+    ASSERT_FALSE(schema_2_exists);
+    ASSERT_OK(ScanAndRead(table_path, arrow::schema(fields_v1)->field_names(),
+                          expected_after_partial_write));
 }
 
 TEST_P(DataEvolutionTableTest, TestAlterTable) {

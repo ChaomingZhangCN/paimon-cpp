@@ -112,6 +112,30 @@ bool VectorUtils::ContainsVector(const std::shared_ptr<arrow::Schema>& schema) {
     return false;
 }
 
+Status VectorUtils::ValidateVectorTypeEvolution(
+    const std::shared_ptr<arrow::DataType>& previous_type,
+    const std::shared_ptr<arrow::DataType>& new_type) {
+    if (!previous_type || !new_type) {
+        return Status::Invalid("VECTOR schema evolution types cannot be null.");
+    }
+    bool previous_is_vector = previous_type->id() == arrow::Type::FIXED_SIZE_LIST;
+    bool new_is_vector = new_type->id() == arrow::Type::FIXED_SIZE_LIST;
+    if (!previous_is_vector && !new_is_vector) {
+        return Status::OK();
+    }
+    if (previous_is_vector && new_is_vector) {
+        const auto& previous_vector = checked_cast<const arrow::FixedSizeListType&>(*previous_type);
+        const auto& new_vector = checked_cast<const arrow::FixedSizeListType&>(*new_type);
+        if (previous_vector.list_size() == new_vector.list_size() &&
+            previous_vector.value_type()->Equals(new_vector.value_type())) {
+            return Status::OK();
+        }
+    }
+    return Status::Invalid(
+        fmt::format("VECTOR type mismatch during schema evolution: previous {} vs new {}",
+                    previous_type->ToString(), new_type->ToString()));
+}
+
 Status VectorUtils::ValidateVectorElements(const arrow::Array& array) {
     switch (array.type_id()) {
         case arrow::Type::LIST:

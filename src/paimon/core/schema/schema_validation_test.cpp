@@ -100,6 +100,20 @@ TEST(SchemaValidationTest, TestVectorType) {
     ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
                         "VECTOR field 'embedding' cannot be used as a sequence field.");
 
+    std::map<std::string, std::string> sequence_group_options = {
+        {Options::BUCKET, "1"},
+        {Options::BUCKET_KEY, "id"},
+        {Options::FILE_FORMAT, "parquet"},
+        {Options::MERGE_ENGINE, "partial-update"},
+        {"fields.embedding.sequence-group", "id"},
+    };
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},
+                                             /*primary_keys=*/{"id"}, sequence_group_options));
+    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
+                        "VECTOR field 'embedding' cannot be used as a sequence-group ordering "
+                        "field.");
+
     primary_key_options[Options::FILE_FORMAT] = "parquet";
     ASSERT_OK_AND_ASSIGN(table_schema,
                          TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},

@@ -351,20 +351,10 @@ class TestHelper {
                                   const std::vector<DataField>& fields, int32_t highest_field_id,
                                   const std::map<std::string, std::string>& options) {
         SchemaManager schema_manager(file_system, table_path);
-        PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<TableSchema>> latest_schema_opt,
-                               schema_manager.Latest());
-        if (!latest_schema_opt) {
-            return Status::Invalid("table schema does not exist");
-        }
-        auto next_schema = std::make_shared<TableSchema>(*latest_schema_opt.value());
-        next_schema->id_ = latest_schema_opt.value()->Id() + 1;
-        next_schema->fields_ = fields;
-        next_schema->highest_field_id_ = highest_field_id;
-        next_schema->options_ = options;
-        PAIMON_ASSIGN_OR_RAISE(std::string schema_content, next_schema->ToJsonString());
-        std::string schema_path = PathUtil::JoinPath(schema_manager.SchemaDirectory(),
-                                                     fmt::format("schema-{}", next_schema->Id()));
-        return file_system->AtomicStore(schema_path, schema_content);
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<TableSchema> committed_schema,
+                               schema_manager.CommitSchema(fields, highest_field_id, options));
+        (void)committed_schema;
+        return Status::OK();
     }
 
     static void CheckCommitMessages(std::vector<std::shared_ptr<CommitMessage>> expected,

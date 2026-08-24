@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <utility>
 
+#include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/core/schema/schema_validation.h"
 #include "paimon/core/utils/branch_manager.h"
@@ -119,6 +120,31 @@ Result<std::unique_ptr<TableSchema>> SchemaManager::CreateTable(
         }
     }
     return Status::Invalid("create table failed, should not be here");
+}
+
+Result<std::shared_ptr<TableSchema>> SchemaManager::CommitSchema(
+    const std::vector<DataField>& fields, int32_t highest_field_id,
+    const std::map<std::string, std::string>& options) {
+    PAIMON_ASSIGN_OR_RAISE(std::optional<std::shared_ptr<TableSchema>> current_schema, Latest());
+    if (!current_schema) {
+        return Status::NotExist("Cannot commit schema because the table schema does not exist.");
+    }
+
+    const std::shared_ptr<TableSchema>& current = current_schema.value();
+    PAIMON_ASSIGN_OR_RAISE(
+        std::unique_ptr<TableSchema> next_schema,
+        TableSchema::InitSchema(current->Id() + 1, fields, highest_field_id,
+                                current->PartitionKeys(), current->PrimaryKeys(), options,
+                                current->Comment(), DateTimeUtils::GetCurrentUTCTimeUs() / 1000));
+    PAIMON_RETURN_NOT_OK(SchemaValidation::ValidateSchemaEvolution(*current, *next_schema));
+
+    std::string schema_path = ToSchemaPath(next_schema->Id());
+    PAIMON_ASSIGN_OR_RAISE(std::string content, next_schema->ToJsonString());
+    PAIMON_RETURN_NOT_OK(file_system_->AtomicStore(schema_path, content));
+
+    std::shared_ptr<TableSchema> committed_schema(std::move(next_schema));
+    schema_cache_[committed_schema->Id()] = committed_schema;
+    return committed_schema;
 }
 
 }  // namespace paimon
