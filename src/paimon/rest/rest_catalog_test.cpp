@@ -414,7 +414,7 @@ TEST_F(RestCatalogTest, CreateRejectsInvalidOptions) {
     ASSERT_NOK_WITH_MSG(CreateRestCatalog().status(), "'token.provider' must be configured");
 
     options_ = valid_options;
-    options_[CatalogOptions::TOKEN_PROVIDER] = "dlf";
+    options_[CatalogOptions::TOKEN_PROVIDER] = "unsupported";
     Status unsupported_provider = CreateRestCatalog().status();
     ASSERT_TRUE(unsupported_provider.IsNotImplemented()) << unsupported_provider.ToString();
     ASSERT_NOK_WITH_MSG(unsupported_provider, "unsupported token provider");
@@ -991,6 +991,12 @@ TEST(RestApiErrorTest, ErrorToStatus) {
     ASSERT_NOK_WITH_MSG(RestApi::ErrorToStatus(response), "rest request failed with code 429");
     response.code = 418;
     ASSERT_NOK_WITH_MSG(RestApi::ErrorToStatus(response), "rest request failed with code 418");
+
+    response.code = 302;
+    Status signed_redirect = RestApi::ErrorToStatus(response, /*follow_redirects=*/false);
+    ASSERT_NOK_WITH_MSG(signed_redirect, "redirect status 302");
+    ASSERT_NOK_WITH_MSG(signed_redirect, "not followed for signed requests");
+    ASSERT_EQ(302, checked_pointer_cast<RestErrorDetail>(signed_redirect.detail())->GetCode());
 }
 
 TEST(RestApiErrorTest, MalformedSuccessBodyFails) {
