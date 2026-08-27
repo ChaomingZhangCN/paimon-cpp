@@ -7,36 +7,38 @@
  * "License"); you may not use this file except in compliance
  * with the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *   http://www.apache.org/licenses/LICENSE-2.0
  *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
+ * Unless required by applicable law or agreed to in writing,
+ * software distributed under the License is distributed on an
+ * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+ * KIND, either express or implied.  See the License for the
+ * specific language governing permissions and limitations
+ * under the License.
  */
 
-#include "paimon/core/io/data_file_meta_12_serializer.h"
+#include "paimon/core/io/data_file_meta_write_cols_legacy_serializer.h"
 
 #include <cassert>
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <utility>
 
-#include "arrow/api.h"
-#include "paimon/common/data/binary_string.h"
+#include "arrow/type.h"
 #include "paimon/common/data/internal_row.h"
 #include "paimon/common/utils/internal_row_utils.h"
 #include "paimon/common/utils/serialization_utils.h"
 #include "paimon/core/manifest/file_source.h"
 #include "paimon/core/stats/simple_stats.h"
+#include "paimon/data/timestamp.h"
 #include "paimon/status.h"
+
 namespace paimon {
+
 class Bytes;
 class InternalArray;
 
-const std::shared_ptr<arrow::DataType>& DataFileMeta12Serializer::DataType() {
+const std::shared_ptr<arrow::DataType>& DataFileMetaWriteColsLegacySerializer::DataType() {
     static std::shared_ptr<arrow::DataType> schema = arrow::struct_(
         {arrow::field("_FILE_NAME", arrow::utf8(), /*nullable=*/false),
          arrow::field("_FILE_SIZE", arrow::int64(), /*nullable=*/false),
@@ -49,8 +51,8 @@ const std::shared_ptr<arrow::DataType>& DataFileMeta12Serializer::DataType() {
          arrow::field("_MAX_SEQUENCE_NUMBER", arrow::int64(), /*nullable=*/false),
          arrow::field("_SCHEMA_ID", arrow::int64(), /*nullable=*/false),
          arrow::field("_LEVEL", arrow::int32(), /*nullable=*/false),
-
-         arrow::field("_EXTRA_FILES", arrow::list(arrow::field("item", arrow::utf8(), false)),
+         arrow::field("_EXTRA_FILES",
+                      arrow::list(arrow::field("item", arrow::utf8(), /*nullable=*/false)),
                       /*nullable=*/false),
          arrow::field("_CREATION_TIME", arrow::timestamp(arrow::TimeUnit::MILLI),
                       /*nullable=*/true),
@@ -58,18 +60,23 @@ const std::shared_ptr<arrow::DataType>& DataFileMeta12Serializer::DataType() {
          arrow::field("_EMBEDDED_FILE_INDEX", arrow::binary(), /*nullable=*/true),
          arrow::field("_FILE_SOURCE", arrow::int8(), /*nullable=*/true),
          arrow::field("_VALUE_STATS_COLS",
-                      arrow::list(arrow::field("f0", arrow::utf8(), /*nullable=*/false)),
+                      arrow::list(arrow::field("item", arrow::utf8(), /*nullable=*/false)),
                       /*nullable=*/true),
-         arrow::field("_EXTERNAL_PATH", arrow::utf8(), /*nullable=*/true)});
+         arrow::field("_EXTERNAL_PATH", arrow::utf8(), /*nullable=*/true),
+         arrow::field("_FIRST_ROW_ID", arrow::int64(), /*nullable=*/true),
+         arrow::field("_WRITE_COLS",
+                      arrow::list(arrow::field("item", arrow::utf8(), /*nullable=*/false)),
+                      /*nullable=*/true)});
     return schema;
 }
 
-Result<BinaryRow> DataFileMeta12Serializer::ToRow(const std::shared_ptr<DataFileMeta>& meta) const {
+Result<BinaryRow> DataFileMetaWriteColsLegacySerializer::ToRow(
+    const std::shared_ptr<DataFileMeta>&) const {
     assert(false);
-    return Status::Invalid("to row for data file meta 12 serializer is invalid");
+    return Status::Invalid("to row for DataFileMetaWriteColsLegacySerializer is invalid");
 }
 
-Result<std::shared_ptr<DataFileMeta>> DataFileMeta12Serializer::FromRow(
+Result<std::shared_ptr<DataFileMeta>> DataFileMetaWriteColsLegacySerializer::FromRow(
     const InternalRow& row) const {
     auto file_name = row.GetString(0);
     auto file_size = row.GetLong(1);
@@ -117,6 +124,20 @@ Result<std::shared_ptr<DataFileMeta>> DataFileMeta12Serializer::FromRow(
     if (!row.IsNullAt(17)) {
         external_path = row.GetString(17).ToString();
     }
+    std::optional<int64_t> first_row_id;
+    if (!row.IsNullAt(18)) {
+        first_row_id = row.GetLong(18);
+    }
+
+    std::optional<std::vector<std::string>> write_cols;
+    if (!row.IsNullAt(19)) {
+        std::shared_ptr<InternalArray> array = row.GetArray(19);
+        if (array == nullptr) {
+            return Status::Invalid("invalid write cols");
+        }
+        write_cols = InternalRowUtils::FromNotNullStringArrayData(array.get());
+    }
+
     PAIMON_ASSIGN_OR_RAISE(BinaryRow min_values, SerializationUtils::DeserializeBinaryRow(min_key));
     PAIMON_ASSIGN_OR_RAISE(BinaryRow max_values, SerializationUtils::DeserializeBinaryRow(max_key));
     PAIMON_ASSIGN_OR_RAISE(SimpleStats key_stats,
@@ -128,7 +149,7 @@ Result<std::shared_ptr<DataFileMeta>> DataFileMeta12Serializer::FromRow(
         min_sequence_number, max_sequence_number, schema_id, level,
         InternalRowUtils::FromStringArrayData(extra_files.get()), creation_time, delete_row_count,
         embedded_file_index, file_source, std::optional<std::vector<std::string>>(value_stats_cols),
-        external_path, /*first_row_id=*/std::nullopt, /*write_cols=*/std::nullopt,
+        external_path, first_row_id, write_cols,
         /*column_max_sequence_numbers=*/std::nullopt);
 }
 
