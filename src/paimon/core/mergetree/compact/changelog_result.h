@@ -19,17 +19,17 @@
 
 #pragma once
 
+#include <optional>
+#include <vector>
+
+#include "paimon/core/key_value.h"
+
 namespace paimon {
-/// Scan which part of the snapshot.
-enum class ScanMode {
-    /// Scan complete data files of a snapshot.
-    ALL = 0,
 
-    /// Only scan newly changed files of a snapshot.
-    DELTA = 1,
-
-    /// Only scan changelog files of a snapshot.
-    CHANGELOG = 2
+/// The result of merging all records with the same primary key while producing changelog.
+struct ChangelogResult {
+    std::optional<KeyValue> result;
+    std::vector<KeyValue> changelogs;
 };
 
 }  // namespace paimon

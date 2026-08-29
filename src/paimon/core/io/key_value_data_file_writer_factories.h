@@ -19,39 +19,38 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "paimon/common/data/shredding/shredding_write_plan_factory.h"
-#include "paimon/core/io/key_value_data_file_writer_factory.h"
+#include "paimon/core/io/data_file_meta.h"
+#include "paimon/core/io/single_file_writer_factory.h"
+#include "paimon/core/key_value.h"
+#include "paimon/core/manifest/file_source.h"
+#include "paimon/result.h"
+
+namespace arrow {
+class Schema;
+}  // namespace arrow
 
 namespace paimon {
 
+class CoreOptions;
 class DataFilePathFactory;
 class MemoryPool;
 
-/// Creates key-value data file writers that rewrite logical batches into a physical (shredded)
-/// layout as planned by a `ShreddingWritePlanFactory` (MAP shared-shredding or VARIANT
-/// shredding, configured or inferred).
-class ShreddingKeyValueDataFileWriterFactory : public KeyValueDataFileWriterFactory {
+/// Creates the appropriate key-value data file writer factory for the configured write schema.
+class KeyValueDataFileWriterFactories {
  public:
-    ShreddingKeyValueDataFileWriterFactory(
+    using WriterFactory = SingleFileWriterFactory<KeyValueBatch, std::shared_ptr<DataFileMeta>>;
+
+    static Result<std::shared_ptr<WriterFactory>> Create(
         const CoreOptions& options, int64_t schema_id,
         const std::shared_ptr<arrow::Schema>& write_schema, int32_t level, FileSource file_source,
         const std::vector<std::string>& primary_keys,
         const std::shared_ptr<DataFilePathFactory>& path_factory, bool create_stats_extractor,
-        const std::shared_ptr<ShreddingWritePlanFactory>& plan_factory, bool is_changelog,
-        const std::shared_ptr<MemoryPool>& pool);
-
-    Result<std::unique_ptr<SingleFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>>
-    CreateWriter() const override;
-
- private:
-    Result<std::unique_ptr<SingleFileWriter<KeyValueBatch, std::shared_ptr<DataFileMeta>>>>
-    CreateShreddedWriter(const std::shared_ptr<ShreddingBatchConverter>& converter) const;
-
-    std::shared_ptr<ShreddingWritePlanFactory> plan_factory_;
+        bool is_changelog, const std::shared_ptr<MemoryPool>& pool);
 };
 
 }  // namespace paimon
