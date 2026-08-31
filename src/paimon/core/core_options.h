@@ -40,6 +40,7 @@
 #include "paimon/format/file_format.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/result.h"
+#include "paimon/statistics_mode.h"
 #include "paimon/table/source/startup_mode.h"
 #include "paimon/type_fwd.h"
 #include "paimon/visibility.h"
@@ -106,7 +107,10 @@ class PAIMON_EXPORT CoreOptions {
     int64_t GetSourceSplitOpenFileCost() const;
     std::optional<int64_t> GetScanSnapshotId() const;
     std::optional<int64_t> GetScanTimestampMillis() const;
+    bool RealtimeEnabled() const;
     int64_t GetRealtimeReadViewTtlMillis() const;
+    /// Returns the statistics mode used by the real-time store.
+    StatisticsMode GetRealtimeStoreStatisticsMode() const;
     int32_t GetScanManifestEntryCacheMaxSnapshots() const;
     bool ScanManifestEntryLazyDecodeEnabled() const;
 
@@ -203,6 +207,11 @@ class PAIMON_EXPORT CoreOptions {
     bool DeletionVectorsBitmap64() const;
     int64_t DeletionVectorTargetFileSize() const;
     ChangelogProducer GetChangelogProducer() const;
+    bool ChangelogRowDeduplicate() const;
+    const std::vector<std::string>& GetChangelogRowDeduplicateIgnoreFields() const;
+    std::string ChangelogFilePrefix() const;
+    std::shared_ptr<FileFormat> GetChangelogFileFormat() const;
+    std::optional<std::string> GetChangelogFileCompression() const;
     LookupStrategy GetLookupStrategy() const;
 
     bool NeedLookup() const;
@@ -225,6 +234,8 @@ class PAIMON_EXPORT CoreOptions {
     bool EnableAdaptivePrefetchStrategy() const;
 
     std::string DataFilePrefix() const;
+
+    bool PrefetchIoMetricsEnabled() const;
 
     bool IndexFileInDataFileDir() const;
 

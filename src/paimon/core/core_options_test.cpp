@@ -29,6 +29,7 @@
 #include "paimon/core/options/expire_config.h"
 #include "paimon/defs.h"
 #include "paimon/fs/local/local_file_system.h"
+#include "paimon/statistics_mode.h"
 #include "paimon/testing/mock/mock_file_system.h"
 #include "paimon/testing/utils/testharness.h"
 #include "paimon/testing/utils/timezone_guard.h"
@@ -38,6 +39,7 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_OK_AND_ASSIGN(CoreOptions core_options, CoreOptions::FromMap({}));
     ASSERT_EQ(core_options.GetManifestFormat()->Identifier(), "avro");
     ASSERT_EQ(core_options.GetFileFormat()->Identifier(), "parquet");
+    ASSERT_EQ(nullptr, core_options.GetChangelogFileFormat());
     ASSERT_EQ(core_options.GetWriteFileFormat(0)->Identifier(), "parquet");
     ASSERT_EQ(core_options.GetWriteFileFormat(3)->Identifier(), "parquet");
     ASSERT_TRUE(core_options.GetFileSystem());
@@ -54,7 +56,10 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_EQ("__DEFAULT_PARTITION__", core_options.GetPartitionDefaultName());
     ASSERT_EQ(std::nullopt, core_options.GetScanSnapshotId());
     ASSERT_EQ(5 * 60 * 1000, core_options.GetRealtimeReadViewTtlMillis());
+    ASSERT_FALSE(core_options.RealtimeEnabled());
+    ASSERT_EQ(StatisticsMode::NONE, core_options.GetRealtimeStoreStatisticsMode());
     ASSERT_EQ("zstd", core_options.GetFileCompression());
+    ASSERT_EQ(std::nullopt, core_options.GetChangelogFileCompression());
     ASSERT_EQ("zstd", core_options.GetWriteFileCompression(0));
     ASSERT_EQ("zstd", core_options.GetWriteFileCompression(3));
     ASSERT_EQ("zstd", core_options.GetManifestCompression());
@@ -122,6 +127,9 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_FALSE(core_options.DeletionVectorsBitmap64());
     ASSERT_EQ(2 * 1024 * 1024, core_options.DeletionVectorTargetFileSize());
     ASSERT_EQ(ChangelogProducer::NONE, core_options.GetChangelogProducer());
+    ASSERT_FALSE(core_options.ChangelogRowDeduplicate());
+    ASSERT_TRUE(core_options.GetChangelogRowDeduplicateIgnoreFields().empty());
+    ASSERT_EQ("changelog-", core_options.ChangelogFilePrefix());
     ASSERT_FALSE(core_options.NeedLookup());
     ASSERT_FALSE(core_options.PrepareCommitWaitCompaction());
     LookupStrategy expected_lookup_strategy = {/*is_first_row=*/false,
@@ -139,6 +147,7 @@ TEST(CoreOptionsTest, TestDefaultValue) {
     ASSERT_EQ(std::nullopt, core_options.GetDataFileExternalPaths());
     ASSERT_EQ(ExternalPathStrategy::NONE, core_options.GetExternalPathStrategy());
     ASSERT_TRUE(core_options.EnableAdaptivePrefetchStrategy());
+    ASSERT_FALSE(core_options.PrefetchIoMetricsEnabled());
     ASSERT_EQ(core_options.DataFilePrefix(), "data-");
     ASSERT_FALSE(core_options.IndexFileInDataFileDir());
     ASSERT_FALSE(core_options.RowTrackingEnabled());
@@ -188,6 +197,7 @@ TEST(CoreOptionsTest, TestFromMap) {
     std::map<std::string, std::string> options = {
         {Options::FILE_SYSTEM, "Local"},
         {Options::FILE_FORMAT, "ORC"},
+        {Options::CHANGELOG_FILE_FORMAT, "avro"},
         {Options::MANIFEST_FORMAT, "avRo"},
         {Options::BUCKET, "3"},
         {Options::PAGE_SIZE, "128 kb"},
@@ -220,6 +230,7 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::SCAN_MODE, "from-snapshot-full"},
         {Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS, "7"},
         {Options::SCAN_MANIFEST_ENTRY_LAZY_DECODE_ENABLED, "false"},
+        {Options::PREFETCH_IO_METRICS_ENABLED, "true"},
         {Options::SNAPSHOT_NUM_RETAINED_MIN, "15"},
         {Options::SNAPSHOT_NUM_RETAINED_MAX, "30"},
         {Options::SNAPSHOT_EXPIRE_LIMIT, "20"},
@@ -243,6 +254,10 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::DELETION_VECTOR_BITMAP64, "true"},
         {Options::DELETION_VECTOR_INDEX_FILE_TARGET_SIZE, "4MB"},
         {Options::CHANGELOG_PRODUCER, "full-compaction"},
+        {Options::CHANGELOG_PRODUCER_ROW_DEDUPLICATE, "true"},
+        {Options::CHANGELOG_PRODUCER_ROW_DEDUPLICATE_IGNORE_FIELDS, "f0, f2"},
+        {Options::CHANGELOG_FILE_PREFIX, "test-changelog-"},
+        {Options::CHANGELOG_FILE_COMPRESSION, "lz4"},
         {Options::FORCE_LOOKUP, "true"},
         {"fields.g_1,g_3.sequence-group", "c,d"},
         {Options::AGGREGATION_REMOVE_RECORD_ON_DELETE, "true"},
@@ -308,6 +323,7 @@ TEST(CoreOptionsTest, TestFromMap) {
         {Options::LOOKUP_REMOTE_LEVEL_THRESHOLD, "2"},
         {Options::TABLE_READ_SEQUENCE_NUMBER_ENABLED, "true"},
         {Options::KEY_VALUE_SEQUENCE_NUMBER_ENABLED, "true"},
+        {Options::REALTIME_ENABLED, "true"},
         {Options::BUCKET_FUNCTION_TYPE, "mod"},
         {"fields.metrics.map.storage-layout", "shared-shredding"},
         {"fields.metrics.map.shared-shredding.max-columns", "128"},
@@ -318,6 +334,7 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_TRUE(fs);
 
     ASSERT_EQ(core_options.GetFileFormat()->Identifier(), "orc");
+    ASSERT_EQ(core_options.GetChangelogFileFormat()->Identifier(), "avro");
     ASSERT_EQ(core_options.GetWriteFileFormat(0)->Identifier(), "avro");
     ASSERT_EQ(core_options.GetWriteFileFormat(1)->Identifier(), "orc");
     ASSERT_EQ(core_options.GetWriteFileFormat(3)->Identifier(), "parquet");
@@ -358,6 +375,7 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_EQ(5, core_options.GetScanSnapshotId().value_or(-1));
     ASSERT_EQ(7, core_options.GetScanManifestEntryCacheMaxSnapshots());
     ASSERT_FALSE(core_options.ScanManifestEntryLazyDecodeEnabled());
+    ASSERT_TRUE(core_options.PrefetchIoMetricsEnabled());
     ExpireConfig expire_config = core_options.GetExpireConfig();
     ASSERT_EQ(15, expire_config.GetSnapshotRetainMin());
     ASSERT_EQ(30, expire_config.GetSnapshotRetainMax());
@@ -386,6 +404,11 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_TRUE(core_options.DeletionVectorsBitmap64());
     ASSERT_EQ(4 * 1024 * 1024, core_options.DeletionVectorTargetFileSize());
     ASSERT_EQ(ChangelogProducer::FULL_COMPACTION, core_options.GetChangelogProducer());
+    ASSERT_TRUE(core_options.ChangelogRowDeduplicate());
+    ASSERT_EQ(std::vector<std::string>({"f0", "f2"}),
+              core_options.GetChangelogRowDeduplicateIgnoreFields());
+    ASSERT_EQ("test-changelog-", core_options.ChangelogFilePrefix());
+    ASSERT_EQ(std::optional<std::string>("lz4"), core_options.GetChangelogFileCompression());
     ASSERT_TRUE(core_options.NeedLookup());
     ASSERT_TRUE(core_options.PrepareCommitWaitCompaction());
     LookupStrategy expected_lookup_strategy = {/*is_first_row=*/false,
@@ -469,6 +492,7 @@ TEST(CoreOptionsTest, TestFromMap) {
     ASSERT_EQ(10L * 1024 * 1024 * 1024, core_options.GetLookupCacheMaxDiskSize());
     ASSERT_TRUE(core_options.TableReadSequenceNumberEnabled());
     ASSERT_TRUE(core_options.KeyValueSequenceNumberEnabled());
+    ASSERT_TRUE(core_options.RealtimeEnabled());
     ASSERT_TRUE(core_options.LookupRemoteFileEnabled());
     ASSERT_EQ(core_options.GetLookupRemoteLevelThreshold(), 2);
     ASSERT_EQ(BucketFunctionType::MOD, core_options.GetBucketFunctionType());
@@ -498,6 +522,7 @@ TEST(CoreOptionsTest, TestInvalidCase) {
                         "invalid lookup mode: invalid");
     ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::LOOKUP_COMPACT_MAX_INTERVAL, "invalid"}}),
                         "Invalid Config [lookup-compact.max-interval: invalid]");
+    ASSERT_NOK(CoreOptions::FromMap({{Options::REALTIME_ENABLED, "invalid"}}));
     ASSERT_NOK_WITH_MSG(
         CoreOptions::FromMap({{Options::SCAN_MANIFEST_ENTRY_CACHE_MAX_SNAPSHOTS, "-1"}}),
         "scan.manifest-entry-cache.max-snapshots must be non-negative");
@@ -808,6 +833,19 @@ TEST(CoreOptionsTest, TestRealtimeReadViewTtlMillis) {
     ASSERT_EQ(1234, core_options.GetRealtimeReadViewTtlMillis());
     ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::REALTIME_READ_VIEW_TTL, "0 ms"}}),
                         "realtime.read-view-ttl must be positive");
+}
+
+TEST(CoreOptionsTest, TestRealtimeStoreStatisticsMode) {
+    ASSERT_OK_AND_ASSIGN(CoreOptions full_options,
+                         CoreOptions::FromMap({{Options::REALTIME_STORE_STATS_MODE, "full"}}));
+    ASSERT_EQ(StatisticsMode::FULL, full_options.GetRealtimeStoreStatisticsMode());
+
+    ASSERT_OK_AND_ASSIGN(CoreOptions none_options,
+                         CoreOptions::FromMap({{Options::REALTIME_STORE_STATS_MODE, "none"}}));
+    ASSERT_EQ(StatisticsMode::NONE, none_options.GetRealtimeStoreStatisticsMode());
+
+    ASSERT_NOK_WITH_MSG(CoreOptions::FromMap({{Options::REALTIME_STORE_STATS_MODE, "invalid"}}),
+                        "realtime.store.stats-mode must be 'none' or 'full'");
 }
 
 TEST(CoreOptionsTest, TestScanTimestampMillisExplicitMode) {
