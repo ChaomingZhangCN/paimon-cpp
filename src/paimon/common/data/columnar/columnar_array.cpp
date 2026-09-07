@@ -71,7 +71,7 @@ std::shared_ptr<InternalArray> ColumnarArray::GetArray(int32_t pos) const {
         auto fixed_size_list_array = checked_cast<const arrow::FixedSizeListArray*>(array_);
         auto fixed_size_list_type =
             checked_pointer_cast<arrow::FixedSizeListType>(fixed_size_list_array->type());
-        int32_t offset = static_cast<int32_t>(fixed_size_list_array->value_offset(offset_ + pos));
+        auto offset = static_cast<int32_t>(fixed_size_list_array->value_offset(offset_ + pos));
         return std::make_shared<ColumnarArray>(fixed_size_list_array->values().get(), pool_, offset,
                                                fixed_size_list_type->list_size());
     }
