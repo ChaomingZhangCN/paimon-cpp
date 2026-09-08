@@ -106,6 +106,60 @@ TEST(NestedProjectionUtilsTest, PruneDataTypeAtomicType) {
     ASSERT_TRUE(result.value()->Equals(data_type));
 }
 
+TEST(NestedProjectionUtilsTest, PruneDataTypeVector) {
+    auto data_type = arrow::fixed_size_list(arrow::float32(), 3);
+    auto read_type =
+        arrow::fixed_size_list(arrow::field("element", arrow::float32(), /*nullable=*/false), 3);
+    ASSERT_OK_AND_ASSIGN(auto result, NestedProjectionUtils::PruneDataType(read_type, data_type));
+    ASSERT_TRUE(result.has_value());
+    ASSERT_TRUE(result.value()->Equals(data_type));
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeRejectsIncompatibleVectorEvolution) {
+    auto vector_type = arrow::fixed_size_list(arrow::float32(), 3);
+    std::vector<std::shared_ptr<arrow::DataType>> incompatible_types = {
+        arrow::fixed_size_list(arrow::float32(), 5),
+        arrow::fixed_size_list(arrow::float64(), 3),
+        arrow::list(arrow::float32()),
+        arrow::int32(),
+    };
+    for (const auto& incompatible_type : incompatible_types) {
+        SCOPED_TRACE(incompatible_type->ToString());
+        ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(incompatible_type, vector_type),
+                            "VECTOR type mismatch during schema evolution");
+        ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(vector_type, incompatible_type),
+                            "VECTOR type mismatch during schema evolution");
+    }
+}
+
+TEST(NestedProjectionUtilsTest, PruneDataTypeRejectsNestedVectorEvolution) {
+    auto data_vector = arrow::fixed_size_list(arrow::float32(), 3);
+    for (const auto& read_vector : {arrow::fixed_size_list(arrow::float32(), 5),
+                                    arrow::fixed_size_list(arrow::float64(), 3)}) {
+        SCOPED_TRACE(read_vector->ToString());
+        ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(
+                                arrow::struct_({MakeField("embedding", read_vector, 1)}),
+                                arrow::struct_({MakeField("embedding", data_vector, 1)})),
+                            "VECTOR type mismatch during schema evolution");
+        ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(arrow::list(read_vector),
+                                                                 arrow::list(data_vector)),
+                            "VECTOR type mismatch during schema evolution");
+        ASSERT_NOK_WITH_MSG(
+            NestedProjectionUtils::PruneDataType(arrow::map(arrow::utf8(), read_vector),
+                                                 arrow::map(arrow::utf8(), data_vector)),
+            "VECTOR type mismatch during schema evolution");
+        auto read_struct = arrow::struct_({MakeField("embedding", read_vector, 1)});
+        auto data_struct = arrow::struct_({MakeField("embedding", data_vector, 1)});
+        ASSERT_NOK_WITH_MSG(NestedProjectionUtils::PruneDataType(arrow::list(read_struct),
+                                                                 arrow::list(data_struct)),
+                            "VECTOR type mismatch during schema evolution");
+        ASSERT_NOK_WITH_MSG(
+            NestedProjectionUtils::PruneDataType(arrow::map(arrow::utf8(), read_struct),
+                                                 arrow::map(arrow::utf8(), data_struct)),
+            "VECTOR type mismatch during schema evolution");
+    }
+}
+
 TEST(NestedProjectionUtilsTest, PruneDataTypeStructPruneSubset) {
     // data: STRUCT<x:INT(id=1), y:STRING(id=2), z:DOUBLE(id=3)>
     // read: STRUCT<x:INT(id=1)>

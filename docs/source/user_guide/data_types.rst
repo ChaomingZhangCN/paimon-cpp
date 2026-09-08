@@ -197,8 +197,11 @@ and `Arrow DataTypes <https://arrow.apache.org/docs/format/Columnar.html#data-ty
        Paimon C++ supports VECTOR value columns in append-only and primary-key
        tables backed by Parquet data files. They use the standard Parquet LIST
        representation on disk and are restored as Arrow ``FixedSizeList``
-       values on read. VECTOR is not supported in data-evolution tables. VECTOR
-       columns cannot be primary, partition, or bucket keys, nor comparator-based
+       values on read. Row-tracking append-only tables with data evolution also
+       support full-row and partial-column VECTOR writes, including reads across
+       schema versions that add or drop VECTOR columns. Changing a VECTOR's
+       dimension or element type is not supported. VECTOR columns cannot be
+       primary, partition, or bucket keys, nor comparator-based
        ordering fields such as sequence and sequence-group fields. Dedicated
        vector storage is not included yet.
 

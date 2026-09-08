@@ -156,14 +156,19 @@ TEST(SchemaValidationTest, TestVectorType) {
                          TableSchema::Create(/*schema_id=*/0, schema,
                                              /*partition_keys=*/{},
                                              /*primary_keys=*/{}, data_evolution_options));
-    ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
-                        "VECTOR fields in data-evolution tables are not implemented yet.");
+    ASSERT_OK(SchemaValidation::ValidateTableSchema(*table_schema));
     ASSERT_OK_AND_ASSIGN(
         table_schema,
         TableSchema::Create(/*schema_id=*/0, nested_schema,
                             /*partition_keys=*/{}, /*primary_keys=*/{}, data_evolution_options));
+    ASSERT_OK(SchemaValidation::ValidateTableSchema(*table_schema));
+
+    data_evolution_options[Options::FILE_FORMAT] = "orc";
+    ASSERT_OK_AND_ASSIGN(table_schema,
+                         TableSchema::Create(/*schema_id=*/0, schema, /*partition_keys=*/{},
+                                             /*primary_keys=*/{}, data_evolution_options));
     ASSERT_NOK_WITH_MSG(SchemaValidation::ValidateTableSchema(*table_schema),
-                        "VECTOR fields in data-evolution tables are not implemented yet.");
+                        "VECTOR currently only supports parquet data files");
 }
 
 #ifdef PAIMON_ENABLE_MOSAIC
