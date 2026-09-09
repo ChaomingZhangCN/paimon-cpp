@@ -26,6 +26,7 @@
 #include "paimon/common/io/cache/lru_cache.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
+#include "paimon/common/utils/checked_cast.h"
 #include "paimon/common/utils/date_time_utils.h"
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
@@ -1671,7 +1672,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
     CreateTable(fields, /*partition_keys=*/{}, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
     auto field_names = arrow::schema(fields)->field_names();
-    auto initial_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto initial_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [1, [1, 2, 3], "a"],
             [2, null, "b"],
@@ -1685,7 +1686,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
     ASSERT_OK(Commit(table_path, initial_msgs));
     ASSERT_OK(ScanAndRead(table_path, field_names, initial_array));
 
-    auto appended_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto appended_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [6, [16, 17, 18], "f"], [7, null, "g"]
         ])")
@@ -1695,7 +1696,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
     ASSERT_OK(Commit(table_path, appended_msgs));
 
     // Replace only the first row range, including transitions to and from NULL VECTOR values.
-    auto updated_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto updated_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[1]}), R"([
             [null], [[4, 5, 6]], [[70, 80, 90]], [null], [[13, 14, 15]]
         ])")
@@ -1704,7 +1705,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
                          WriteArray(table_path, {"embedding"}, updated_array));
     SetFirstRowId(/*reset_first_row_id=*/0, update_msgs);
     ASSERT_OK(Commit(table_path, update_msgs));
-    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto expected_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [1, null, "a"],
             [2, [4, 5, 6], "b"],
@@ -1717,7 +1718,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
             .ValueOrDie());
     ASSERT_OK(ScanAndRead(table_path, field_names, expected_array));
 
-    auto projected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto projected_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[1]}), R"([
             [[4, 5, 6]], [[70, 80, 90]], [null]
         ])")
@@ -1725,7 +1726,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
     ASSERT_OK(ScanAndRead(table_path, {"embedding"}, projected_array, /*predicate=*/nullptr,
                           /*row_ranges=*/{Range(1, 3)}));
 
-    auto null_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto null_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[1]}), R"([
             [null], [null], [null], [null], [null]
         ])")
@@ -1734,7 +1735,7 @@ TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
                          WriteArray(table_path, {"embedding"}, null_array));
     SetFirstRowId(/*reset_first_row_id=*/0, null_msgs);
     ASSERT_OK(Commit(table_path, null_msgs));
-    auto expected_null_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto expected_null_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [1, null, "a"], [2, null, "b"], [3, null, "c"], [4, null, "d"],
             [5, null, "e"], [6, [16, 17, 18], "f"], [7, null, "g"]
@@ -1764,7 +1765,7 @@ TEST_P(DataEvolutionTableTest, TestNestedVectorReadWrite) {
     };
     CreateTable(fields, /*partition_keys=*/{}, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
-    auto initial_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto initial_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [1, [[1, 2, 3], "a"]], [2, [null, "b"]], [3, null]
         ])")
@@ -1774,7 +1775,7 @@ TEST_P(DataEvolutionTableTest, TestNestedVectorReadWrite) {
     ASSERT_OK(Commit(table_path, initial_msgs));
     ASSERT_OK(ScanAndRead(table_path, {"id", "payload"}, initial_array));
 
-    auto updated_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto updated_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields[1]}), R"([
             [null], [[[4, 5, 6], "updated"]], [[null, "c"]]
         ])")
@@ -1783,7 +1784,7 @@ TEST_P(DataEvolutionTableTest, TestNestedVectorReadWrite) {
                          WriteArray(table_path, {"payload"}, updated_array));
     SetFirstRowId(/*reset_first_row_id=*/0, update_msgs);
     ASSERT_OK(Commit(table_path, update_msgs));
-    auto expected_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto expected_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [1, null], [2, [[4, 5, 6], "updated"]], [3, [null, "c"]]
         ])")
@@ -1816,7 +1817,7 @@ TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolution) {
     };
     CreateTable(fields_v0, /*partition_keys=*/{}, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
-    auto initial_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto initial_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_v0), R"([
             [1, [1, 2, 3], [10, 11]], [2, null, [20, 21]]
         ])")
@@ -1832,7 +1833,7 @@ TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolution) {
         dir_->GetFileSystem(), table_path,
         {DataField(0, fields_v1[0]), DataField(1, fields_v1[1]), DataField(3, fields_v1[2])},
         /*highest_field_id=*/3, options));
-    auto expected_after_evolution = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto expected_after_evolution = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_v1), R"([
             [1, [1, 2, 3], null], [2, null, null]
         ])")
@@ -1840,7 +1841,7 @@ TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolution) {
     ASSERT_OK(
         ScanAndRead(table_path, arrow::schema(fields_v1)->field_names(), expected_after_evolution));
 
-    auto added_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto added_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_({fields_v1[2]}), R"([
             [[100, 101]], [null]
         ])")
@@ -1849,7 +1850,7 @@ TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolution) {
                          WriteArray(table_path, {"added_embedding"}, added_array));
     SetFirstRowId(/*reset_first_row_id=*/0, added_msgs);
     ASSERT_OK(Commit(table_path, added_msgs));
-    auto expected_after_partial_write = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto expected_after_partial_write = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields_v1), R"([
             [1, [1, 2, 3], [100, 101]], [2, null, null]
         ])")
@@ -1875,7 +1876,7 @@ TEST_P(DataEvolutionTableTest, TestVectorSchemaEvolutionRejectsTypeChange) {
     };
     CreateTable(fields, /*partition_keys=*/{}, options);
     std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
-    auto initial_array = std::dynamic_pointer_cast<arrow::StructArray>(
+    auto initial_array = checked_pointer_cast<arrow::StructArray>(
         arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
             [1, [1, 2, 3]], [2, null]
         ])")
