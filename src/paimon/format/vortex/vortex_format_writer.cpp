@@ -21,18 +21,52 @@
 
 #include <utility>
 
+#include "arrow/array/data.h"
 #include "arrow/c/bridge.h"
+#include "arrow/compute/api.h"
 #include "arrow/memory_pool.h"
+#include "arrow/scalar.h"
 #include "arrow/type.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
 #include "paimon/common/utils/arrow/status_utils.h"
+#include "paimon/common/utils/arrow/vector_utils.h"
 #include "paimon/core/schema/schema_validation.h"
 #include "paimon/format/vortex/vortex_ffi_util.h"
 #include "paimon/fs/file_system.h"
 
 namespace paimon::vortex {
+namespace {
+
+Result<std::shared_ptr<arrow::ArrayData>> NormalizeVectorNullElements(
+    const std::shared_ptr<arrow::ArrayData>& data, arrow::compute::ExecContext* context) {
+    std::shared_ptr<arrow::ArrayData> normalized = data;
+    for (size_t i = 0; i < data->child_data.size(); ++i) {
+        PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::ArrayData> child,
+                               NormalizeVectorNullElements(data->child_data[i], context));
+        if (data->type->id() == arrow::Type::FIXED_SIZE_LIST && !data->type->field(0)->nullable() &&
+            child->GetNullCount() != 0) {
+            // Null VECTORs may own null element slots. Vortex imports these masked slots too.
+            PAIMON_RETURN_NOT_OK(VectorUtils::ValidateVectorElements(*arrow::MakeArray(data)));
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(std::shared_ptr<arrow::Scalar> zero,
+                                              arrow::MakeScalar(child->type, 0));
+            PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+                arrow::Datum filled,
+                arrow::compute::CallFunction("coalesce", {arrow::MakeArray(child), zero}, context));
+            child = filled.make_array()->data();
+        }
+        if (child != data->child_data[i]) {
+            if (normalized == data) {
+                normalized = data->Copy();
+            }
+            normalized->child_data[i] = child;
+        }
+    }
+    return normalized;
+}
+
+}  // namespace
 
 VortexFormatWriter::VortexFormatWriter(std::shared_ptr<OutputStream> output,
                                        std::shared_ptr<arrow::Schema> schema, VxSessionPtr session,
@@ -103,6 +137,10 @@ Status VortexFormatWriter::AddBatch(::ArrowArray* batch) {
                                       arrow::ImportArray(batch, arrow::struct_(schema_->fields())));
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Array> normalized,
                            ArrowUtils::NormalizeArrayOffsets(imported, arrow_pool_.get()));
+    arrow::compute::ExecContext context(arrow_pool_.get());
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::ArrayData> normalized_data,
+                           NormalizeVectorNullElements(normalized->data(), &context));
+    normalized = arrow::MakeArray(normalized_data);
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*normalized, &rebased_batch));
     // The rebased buffers belong to arrow_pool_, which dies with this writer; keep it alive until
     // Rust releases the exported array.
