@@ -450,6 +450,53 @@ TEST_F(VortexFileFormatTest, WriteThenReadFixedSizeListOfString) {
     AssertReadWithBatchSizes(path, schema, expected, {1, 2, 3, 4});
 }
 
+TEST_F(VortexFileFormatTest, WriteThenReadVectors) {
+    const std::vector<std::shared_ptr<arrow::DataType>> element_types = {
+        arrow::boolean(), arrow::int8(),    arrow::int16(),  arrow::int32(),
+        arrow::int64(),   arrow::float32(), arrow::float64()};
+    for (const auto& element_type : element_types) {
+        SCOPED_TRACE(element_type->ToString());
+        std::string path =
+            PathUtil::JoinPath(directory_->Str(), "vector-" + element_type->ToString() + ".vortex");
+        auto vector_type =
+            arrow::fixed_size_list(arrow::field("item", element_type, /*nullable=*/false), 3);
+        arrow::FieldVector fields = {arrow::field("embedding", vector_type)};
+        auto schema = arrow::schema(fields);
+        std::string json = R"([
+            [[1, 2, 3]], [null], [[4, 5, 6]], [[-1, 0, 1]], [[7, 8, 9]]
+        ])";
+        if (element_type->id() == arrow::Type::BOOL) {
+            json = R"([
+                [[true, false, true]], [null], [[false, true, false]],
+                [[true, true, false]], [[false, false, true]]
+            ])";
+        } else if (element_type->id() == arrow::Type::FLOAT ||
+                   element_type->id() == arrow::Type::DOUBLE) {
+            json = R"([
+                [[1.25, 2.5, 3.75]], [null], [[4.5, 5.25, 6.75]],
+                [[-1.5, 0, 1.5]], [[7.25, 8.5, 9.75]]
+            ])";
+        }
+        std::shared_ptr<arrow::Array> expected =
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), json).ValueOrDie();
+
+        ASSERT_OK(WriteFile(path, schema, expected, /*batch_size=*/2));
+        AssertReadWithBatchSizes(path, schema, expected, {1, 2, 3, 8});
+    }
+}
+
+TEST_F(VortexFileFormatTest, RejectNullVectorElements) {
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto schema = arrow::schema({arrow::field("embedding", vector_type)});
+    auto array = arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema->fields()),
+                                                           R"([[[1, null, 3]]])")
+                     .ValueOrDie();
+    ASSERT_NOK_WITH_MSG(WriteFile(PathUtil::JoinPath(directory_->Str(), "invalid-vector.vortex"),
+                                  schema, array, /*batch_size=*/1),
+                        "VECTOR cannot contain null elements");
+}
+
 // Regression for a struct nested inside a list: the LIST branch recurses into the struct, whose
 // utf8 leaf is a view; the combination must normalize back to list<struct<utf8, int32>>.
 TEST_F(VortexFileFormatTest, WriteThenReadListOfStruct) {
