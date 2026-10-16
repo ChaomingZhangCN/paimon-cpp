@@ -497,6 +497,52 @@ TEST_F(VortexFileFormatTest, RejectNullVectorElements) {
                         "VECTOR cannot contain null elements");
 }
 
+TEST_F(VortexFileFormatTest, WriteThenReadVectorsWithNullAncestors) {
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto vectors = arrow::ipc::internal::json::ArrayFromJSON(
+                       vector_type, R"([[1, null, 3], [4, 5, 6], [7, 8, 9], [10, null, 12]])")
+                       .ValueOrDie();
+    auto validity = arrow::Buffer::FromString(std::string(1, '\x06'));
+    for (bool list_parent : {false, true}) {
+        SCOPED_TRACE(list_parent);
+        std::shared_ptr<arrow::Array> parent;
+        if (list_parent) {
+            auto offsets =
+                arrow::ipc::internal::json::ArrayFromJSON(arrow::int32(), "[0, 1, 2, 3, 4]")
+                    .ValueOrDie();
+            parent = std::make_shared<arrow::ListArray>(arrow::list(vector_type), 4,
+                                                        offsets->data()->buffers[1], vectors,
+                                                        validity, /*null_count=*/2);
+        } else {
+            parent = arrow::StructArray::Make({vectors}, {arrow::field("embedding", vector_type)},
+                                              validity, /*null_count=*/2)
+                         .ValueOrDie();
+        }
+        auto schema = arrow::schema({arrow::field("payload", parent->type())});
+        auto input = arrow::StructArray::Make({parent}, schema->fields()).ValueOrDie();
+        ASSERT_TRUE(input->ValidateFull().ok());
+        auto expected = arrow::ipc::internal::json::ArrayFromJSON(
+                            arrow::struct_(schema->fields()),
+                            R"([[null], [[[4, 5, 6]]], [[[7, 8, 9]]], [null]])")
+                            .ValueOrDie();
+        std::string path =
+            PathUtil::JoinPath(directory_->Str(), list_parent ? "null-list-vector.vortex"
+                                                              : "null-struct-vector.vortex");
+        ASSERT_OK(WriteFile(path, schema, input, /*batch_size=*/2));
+        AssertReadWithBatchSizes(path, schema, expected, {1, 2, 3, 5});
+
+        // The same elements are invalid when their ancestors are visible.
+        auto visible_parent = parent->data()->Copy();
+        visible_parent->buffers[0].reset();
+        visible_parent->SetNullCount(0);
+        input = arrow::StructArray::Make({arrow::MakeArray(visible_parent)}, schema->fields())
+                    .ValueOrDie();
+        ASSERT_NOK_WITH_MSG(WriteFile(path + ".invalid", schema, input, /*batch_size=*/2),
+                            "VECTOR cannot contain null elements");
+    }
+}
+
 // Regression for a struct nested inside a list: the LIST branch recurses into the struct, whose
 // utf8 leaf is a view; the combination must normalize back to list<struct<utf8, int32>>.
 TEST_F(VortexFileFormatTest, WriteThenReadListOfStruct) {

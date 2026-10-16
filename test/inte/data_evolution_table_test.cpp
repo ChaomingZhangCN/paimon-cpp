@@ -1798,6 +1798,78 @@ TEST_P(DataEvolutionTableTest, TestPartitionWithPredicate) {
 }
 
 #ifdef PAIMON_ENABLE_VORTEX
+TEST_P(DataEvolutionTableTest, TestReadJavaDedicatedVectorStore) {
+    if (FileFormat() != "parquet") {
+        GTEST_SKIP() << "The Java fixture uses parquet main files";
+    }
+    const std::string fixture_path = PathUtil::JoinPath(
+        GetDataDir(), "vortex/dedicated_vector_java_compat.db/dedicated_vector_java_compat");
+    const std::string table_path = PathUtil::JoinPath(dir_->Str(), "java_dedicated_vector");
+    // Preserve the Java-produced files: this test only scans and reads the copied table.
+    ASSERT_TRUE(TestUtil::CopyDirectory(fixture_path, table_path));
+
+    // Java DataTypes.FLOAT() serializes the VECTOR element as nullable in schema-0.
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/true), 3);
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
+                                 arrow::field("embedding", vector_type),
+                                 arrow::field("tag", arrow::utf8())};
+    auto expected = checked_pointer_cast<arrow::StructArray>(
+        arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), R"([
+            [1, [1, 2, 3], "a"], [2, null, "b"], [3, [-1, 0, 1], "c"],
+            [4, null, "d"], [5, [7, 8, 9], "e"], [6, [10, 11, 12], "f"]
+        ])")
+            .ValueOrDie());
+    ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, expected));
+    auto normal_projection =
+        arrow::StructArray::Make({expected->field(0), expected->field(2)}, {fields[0], fields[2]})
+            .ValueOrDie();
+    ASSERT_OK(ScanAndRead(table_path, {"id", "tag"}, normal_projection));
+    auto vector_projection =
+        arrow::StructArray::Make({expected->field(1)}, {fields[1]}).ValueOrDie();
+    ASSERT_OK(ScanAndRead(table_path, {"embedding"}, vector_projection));
+
+    // Row ids 1-4 cross the two Java commits and include a null vector from each commit.
+    auto selected_rows = checked_pointer_cast<arrow::StructArray>(expected->Slice(1, 4));
+    ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, selected_rows,
+                          /*predicate=*/nullptr, /*row_ranges=*/{Range(1, 4)}));
+    auto selected_vectors =
+        checked_pointer_cast<arrow::StructArray>(vector_projection->Slice(1, 4));
+    ASSERT_OK(ScanAndRead(table_path, {"embedding"}, selected_vectors,
+                          /*predicate=*/nullptr, /*row_ranges=*/{Range(1, 4)}));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> splits, PlanSplits(table_path));
+    std::map<int64_t, std::vector<std::shared_ptr<DataFileMeta>>> row_groups;
+    for (const auto& split : splits) {
+        auto data_split = std::dynamic_pointer_cast<DataSplitImpl>(split);
+        ASSERT_NE(data_split, nullptr);
+        for (const auto& file : data_split->DataFiles()) {
+            ASSERT_TRUE(file->first_row_id.has_value());
+            row_groups[file->first_row_id.value()].push_back(file);
+        }
+    }
+    ASSERT_EQ(row_groups.size(), 2);
+    ASSERT_EQ(row_groups.count(0), 1);
+    ASSERT_EQ(row_groups.count(3), 1);
+    for (const auto& [first_row_id, files] : row_groups) {
+        SCOPED_TRACE(first_row_id);
+        ASSERT_EQ(files.size(), 2);
+        int32_t vector_file_count = 0;
+        for (const auto& file : files) {
+            ASSERT_EQ(file->row_count, 3);
+            if (VectorStoreUtils::IsVectorStoreFile(file->file_name)) {
+                ++vector_file_count;
+                ASSERT_TRUE(StringUtils::EndsWith(file->file_name, ".vector.vortex"));
+                ASSERT_EQ(file->write_cols, std::vector<std::string>({"embedding"}));
+            } else {
+                ASSERT_TRUE(StringUtils::EndsWith(file->file_name, ".parquet"));
+                ASSERT_EQ(file->write_cols, std::vector<std::string>({"id", "tag"}));
+            }
+        }
+        ASSERT_EQ(vector_file_count, 1);
+    }
+}
+
 TEST_P(DataEvolutionTableTest, TestDedicatedVectorStore) {
     if (FileFormat() != "parquet") {
         GTEST_SKIP() << "Dedicated VECTOR storage requires parquet main files";
