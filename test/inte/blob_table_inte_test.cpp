@@ -1894,12 +1894,37 @@ TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateMultipleLayers) {
     const std::vector<std::string> expected_rows = {
         R"([[1, "a", "update1_0"]])", R"([[2, "b", "blob_1"]])", R"([[3, "c", "blob_2"]])",
         R"([[4, "d", "update2_3"]])"};
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<Plan> unpruned_plan, ScanTable(table_path));
+    ASSERT_EQ(unpruned_plan->Splits().size(), 1);
+    auto unpruned_split = std::dynamic_pointer_cast<DataSplitImpl>(unpruned_plan->Splits()[0]);
+    ASSERT_NE(unpruned_split, nullptr);
+    ASSERT_EQ(unpruned_split->DataFiles().size(), 4);
     for (int32_t i = 0; i < static_cast<int32_t>(expected_rows.size()); i++) {
+        SCOPED_TRACE(i);
         auto expected_single = std::dynamic_pointer_cast<arrow::StructArray>(
             arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(fields), expected_rows[i])
                 .ValueOrDie());
         ASSERT_OK(ScanAndRead(table_path, schema->field_names(), expected_single,
                               /*predicate=*/nullptr, /*row_ranges=*/{Range(i, i)}));
+
+        // Range planning can narrow a read after scanning, leaving unselected BLOB files
+        // in the split. Their sequence layers must still align with the selected rows.
+        auto indexed_split =
+            std::make_shared<IndexedSplitImpl>(unpruned_split, std::vector<Range>{Range(i, i)});
+        ReadContextBuilder read_builder(table_path);
+        read_builder.SetReadFieldNames(schema->field_names()).EnableLateMaterializing(false);
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
+                             TableRead::Create(std::move(read_context)));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> reader,
+                             table_read->CreateReader(indexed_split));
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result,
+                             ReadResultCollector::CollectResult(std::move(reader)));
+        ASSERT_NE(result, nullptr);
+        ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::StructArray> expected_with_row_kind,
+                             PrependRowKindColumn(expected_single));
+        ASSERT_TRUE(result->Equals(arrow::ChunkedArray(expected_with_row_kind)))
+            << result->ToString();
     }
 }
 
