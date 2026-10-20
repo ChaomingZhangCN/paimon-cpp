@@ -205,18 +205,19 @@ and `Arrow DataTypes <https://arrow.apache.org/docs/format/Columnar.html#data-ty
        primary, partition, or bucket keys, nor comparator-based
        ordering fields such as sequence and sequence-group fields.
 
-       With Vortex enabled at build time, ``vector.file.format=vortex`` stores a
-       single top-level VECTOR column in dedicated ``.vector.vortex`` files.
+       ``vector.file.format`` stores a single top-level VECTOR column in dedicated
+       ``.vector.<format>`` files. Supported formats are ``parquet``, ``lance``,
+       and ``vortex``; Lance and Vortex must be enabled at build time.
        This mode requires ``file.format=parquet``, ``bucket=-1``,
        ``row-tracking.enabled=true``, and ``data-evolution.enabled=true``, plus at
        least one ordinary non-partition column. It supports full-row inserts into append-only
        tables. Custom write schemas, partial writes, multiple or nested VECTOR
        columns, and BLOB columns are not supported in this mode.
 
-       Main and VECTOR files cover identical row ranges and roll together when
-       either size target or ``target-file-row-num`` is reached. Configure the
-       VECTOR size target with ``vector.target-file-size``; it defaults to
-       ``target-file-size``. Independent VECTOR file rolling is not supported.
+       VECTOR files roll independently at ``vector.target-file-size``, which
+       defaults to ``target-file-size``. Main files roll at ``target-file-size``
+       or ``target-file-row-num`` and also close the current VECTOR file. One
+       main file can therefore cover the combined row range of several VECTOR files.
 
        Paimon C++ also reads Parquet files written by Paimon Rust or Python whose
        embedded Arrow schema restores VECTOR columns as ``FixedSizeList``,

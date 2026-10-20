@@ -57,6 +57,7 @@
 #include "paimon/core/snapshot.h"
 #include "paimon/core/stats/simple_stats.h"
 #include "paimon/core/table/source/data_split_impl.h"
+#include "paimon/core/table/source/plan_impl.h"
 #include "paimon/core/utils/file_utils.h"
 #include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/data/blob.h"
@@ -1911,15 +1912,10 @@ TEST_P(BlobTableInteTest, TestDataEvolutionBlobPartialUpdateMultipleLayers) {
         // in the split. Their sequence layers must still align with the selected rows.
         auto indexed_split =
             std::make_shared<IndexedSplitImpl>(unpruned_split, std::vector<Range>{Range(i, i)});
-        ReadContextBuilder read_builder(table_path);
-        read_builder.SetReadFieldNames(schema->field_names()).EnableLateMaterializing(false);
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> read_context, read_builder.Finish());
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> table_read,
-                             TableRead::Create(std::move(read_context)));
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> reader,
-                             table_read->CreateReader(indexed_split));
+        auto indexed_plan = std::make_shared<PlanImpl>(
+            unpruned_plan->SnapshotId(), std::vector<std::shared_ptr<Split>>{indexed_split});
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> result,
-                             ReadResultCollector::CollectResult(std::move(reader)));
+                             ReadTable(table_path, schema->field_names(), indexed_plan));
         ASSERT_NE(result, nullptr);
         ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::StructArray> expected_with_row_kind,
                              PrependRowKindColumn(expected_single));

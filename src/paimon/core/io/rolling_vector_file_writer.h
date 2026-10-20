@@ -23,7 +23,7 @@
 
 namespace paimon {
 
-/// Writes normal columns and one VECTOR column to files covering identical row ranges.
+/// Writes normal columns and one VECTOR column, rolling VECTOR files independently.
 class RollingVectorFileWriter
     : public RollingFileWriter<::ArrowArray*, std::shared_ptr<DataFileMeta>> {
  public:
@@ -43,13 +43,15 @@ class RollingVectorFileWriter
     Result<std::vector<std::shared_ptr<DataFileMeta>>> GetResult() override;
 
  private:
-    Status CloseCurrentPair();
+    Status CloseCurrentVectorWriter();
+    Status CloseCurrentMainWriter();
 
     int64_t vector_target_file_size_;
     std::shared_ptr<WriterFactory> vector_factory_;
     std::shared_ptr<arrow::Schema> write_schema_;
     int32_t vector_index_;
     std::unique_ptr<Writer> vector_writer_;
+    std::vector<std::shared_ptr<DataFileMeta>> current_vector_files_;
     bool aborted_ = false;
 };
 

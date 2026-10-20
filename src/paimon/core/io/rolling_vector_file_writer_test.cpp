@@ -20,6 +20,7 @@
 #include "paimon/core/io/rolling_vector_file_writer.h"
 
 #include <limits>
+#include <tuple>
 #include <utility>
 
 #include "arrow/ipc/json_simple.h"
@@ -36,6 +37,9 @@ struct WriterState {
     bool fail_create = false;
     bool fail_write = false;
     bool fail_close = false;
+    bool fail_size = false;
+    bool fail_result = false;
+    int64_t row_count_delta = 0;
     int64_t file_number = 0;
     std::vector<std::string> paths;
 };
@@ -67,13 +71,20 @@ class TestVectorWriter : public RollingVectorFileWriter::Writer {
     }
 
     Result<bool> ReachTargetSize(bool, int64_t target_size) override {
+        if (state_->fail_size) {
+            return Status::IOError("injected size check failure");
+        }
         return rows_ >= target_size;
     }
 
     Result<std::shared_ptr<DataFileMeta>> GetResult() override {
-        return DataFileMeta::ForAppend(
-            PathUtil::GetName(path_), 0, rows_, SimpleStats::EmptyStats(), 0, rows_ - 1, 0,
-            FileSource::Append(), std::nullopt, std::nullopt, std::nullopt, std::nullopt);
+        if (state_->fail_result) {
+            return Status::IOError("injected result failure");
+        }
+        return DataFileMeta::ForAppend(PathUtil::GetName(path_), 0, rows_ + state_->row_count_delta,
+                                       SimpleStats::EmptyStats(), 0, rows_ - 1, 0,
+                                       FileSource::Append(), std::nullopt, std::nullopt,
+                                       std::nullopt, std::nullopt);
     }
 
  private:
@@ -107,83 +118,186 @@ class TestVectorWriterFactory : public RollingVectorFileWriter::WriterFactory {
 
 }  // namespace
 
-TEST(RollingVectorFileWriterTest, VectorTargetRollsBothFiles) {
-    auto dir = UniqueTestDirectory::Create("local");
-    ASSERT_NE(dir, nullptr);
-    std::shared_ptr<FileSystem> fs = dir->GetFileSystem();
-    auto main_state = std::make_shared<WriterState>();
-    auto vector_state = std::make_shared<WriterState>();
-    auto main_factory = std::make_shared<TestVectorWriterFactory>(
-        fs, PathUtil::JoinPath(dir->Str(), "main"), main_state);
-    auto vector_factory = std::make_shared<TestVectorWriterFactory>(
-        fs, PathUtil::JoinPath(dir->Str(), "vector"), vector_state);
-    auto schema = arrow::schema({arrow::field("id", arrow::int32()),
+class RollingVectorFileWriterTest : public ::testing::Test {
+ protected:
+    void SetUp() override {
+        dir_ = UniqueTestDirectory::Create("local");
+        ASSERT_NE(dir_, nullptr);
+        fs_ = dir_->GetFileSystem();
+        main_state_ = std::make_shared<WriterState>();
+        vector_state_ = std::make_shared<WriterState>();
+        schema_ = arrow::schema({arrow::field("id", arrow::int32()),
                                  arrow::field("v", arrow::fixed_size_list(arrow::float32(), 2))});
-    RollingVectorFileWriter writer(1024, std::numeric_limits<int64_t>::max(), 1, main_factory,
-                                   vector_factory, schema, 1);
-    auto array = arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema->fields()),
-                                                           R"([[1, [1, 2]], [2, null]])")
-                     .ValueOrDie();
-    for (int32_t i = 0; i < 2; ++i) {
-        ::ArrowArray batch = {};
-        ASSERT_TRUE(arrow::ExportArray(*array, &batch).ok());
-        ASSERT_OK(writer.Write(&batch));
     }
-    ASSERT_OK(writer.Close());
-    ASSERT_OK(writer.Close());
-    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataFileMeta>> results, writer.GetResult());
-    ASSERT_EQ(results.size(), 4);
-    for (const auto& file : results) {
-        ASSERT_EQ(file->row_count, 2);
-    }
-    writer.Abort();
-    for (const auto& state : {main_state, vector_state}) {
-        ASSERT_EQ(state->paths.size(), 2);
-        for (const auto& path : state->paths) {
-            ASSERT_OK_AND_ASSIGN(bool exists, fs->Exists(path));
-            ASSERT_FALSE(exists);
-        }
-    }
-    ASSERT_NOK(writer.GetResult());
-}
 
-TEST(RollingVectorFileWriterTest, FailureRemovesBothFilesAndEarlierPairs) {
-    for (int32_t failure = 0; failure < 6; ++failure) {
-        SCOPED_TRACE(failure);
-        auto dir = UniqueTestDirectory::Create("local");
-        ASSERT_NE(dir, nullptr);
-        std::shared_ptr<FileSystem> fs = dir->GetFileSystem();
-        auto main_state = std::make_shared<WriterState>();
-        auto vector_state = std::make_shared<WriterState>();
+    std::unique_ptr<RollingVectorFileWriter> NewWriter(
+        int64_t main_size = 1024, int64_t main_rows = std::numeric_limits<int64_t>::max(),
+        int64_t vector_size = 1) const {
         auto main_factory = std::make_shared<TestVectorWriterFactory>(
-            fs, PathUtil::JoinPath(dir->Str(), "main"), main_state);
+            fs_, PathUtil::JoinPath(dir_->Str(), "main"), main_state_);
         auto vector_factory = std::make_shared<TestVectorWriterFactory>(
-            fs, PathUtil::JoinPath(dir->Str(), "vector"), vector_state);
-        auto schema =
-            arrow::schema({arrow::field("id", arrow::int32()),
-                           arrow::field("v", arrow::fixed_size_list(arrow::float32(), 2))});
-        RollingVectorFileWriter writer(1024, 1, 1024, main_factory, vector_factory, schema, 1);
-        auto array = arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema->fields()),
-                                                               R"([[1, [1, 2]]])")
-                         .ValueOrDie();
+            fs_, PathUtil::JoinPath(dir_->Str(), "vector"), vector_state_);
+        return std::make_unique<RollingVectorFileWriter>(main_size, main_rows, vector_size,
+                                                         main_factory, vector_factory, schema_, 1);
+    }
+
+    Status WriteRows(RollingVectorFileWriter* writer, const std::string& json) const {
+        PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(
+            std::shared_ptr<arrow::Array> array,
+            arrow::ipc::internal::json::ArrayFromJSON(arrow::struct_(schema_->fields()), json));
         ::ArrowArray batch = {};
-        ASSERT_TRUE(arrow::ExportArray(*array, &batch).ok());
-        ASSERT_OK(writer.Write(&batch));
-        const auto& failing_state = failure < 3 ? main_state : vector_state;
-        failing_state->fail_create = failure % 3 == 0;
-        failing_state->fail_write = failure % 3 == 1;
-        failing_state->fail_close = failure % 3 == 2;
-        ASSERT_TRUE(arrow::ExportArray(*array, &batch).ok());
-        ASSERT_NOK(writer.Write(&batch));
-        ASSERT_NOK(writer.Close());
-        ASSERT_NOK(writer.GetResult());
-        for (const auto& state : {main_state, vector_state}) {
+        ScopeGuard guard([&]() { ArrowArrayRelease(&batch); });
+        PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*array, &batch));
+        return writer->Write(&batch);
+    }
+
+    void CheckFilesRemoved() const {
+        for (const auto& state : {main_state_, vector_state_}) {
             for (const auto& path : state->paths) {
-                ASSERT_OK_AND_ASSIGN(bool exists, fs->Exists(path));
-                ASSERT_FALSE(exists);
+                ASSERT_OK_AND_ASSIGN(bool exists, fs_->Exists(path));
+                ASSERT_FALSE(exists) << path;
             }
         }
     }
+
+    std::unique_ptr<UniqueTestDirectory> dir_;
+    std::shared_ptr<FileSystem> fs_;
+    std::shared_ptr<WriterState> main_state_;
+    std::shared_ptr<WriterState> vector_state_;
+    std::shared_ptr<arrow::Schema> schema_;
+};
+
+TEST_F(RollingVectorFileWriterTest, VectorTargetRollsIndependently) {
+    auto writer = NewWriter(1024, std::numeric_limits<int64_t>::max(), 2);
+    ASSERT_OK(WriteRows(writer.get(), R"([[1, [1, 2]], [2, null]])"));
+    ASSERT_OK(WriteRows(writer.get(), R"([[3, null], [4, [3, 4]]])"));
+    ASSERT_EQ(main_state_->paths.size(), 1);
+    ASSERT_EQ(vector_state_->paths.size(), 2);
+    ASSERT_OK(WriteRows(writer.get(), R"([[5, null]])"));
+    ASSERT_NOK(writer->GetResult());
+    ASSERT_OK(writer->Close());
+    ASSERT_OK(writer->Close());
+    ASSERT_EQ(writer->RecordCount(), 5);
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataFileMeta>> results, writer->GetResult());
+    ASSERT_EQ(results.size(), 4);
+    ASSERT_EQ(results[0]->file_name, "main0");
+    ASSERT_EQ(results[0]->row_count, 5);
+    for (int32_t i = 0; i < 3; ++i) {
+        ASSERT_EQ(results[i + 1]->file_name, fmt::format("vector{}", i));
+        ASSERT_EQ(results[i + 1]->row_count, i == 2 ? 1 : 2);
+    }
+    ASSERT_EQ(main_state_->paths.size(), 1);
+    ASSERT_EQ(vector_state_->paths.size(), 3);
+    writer->Abort();
+    CheckFilesRemoved();
+    ASSERT_NOK(writer->GetResult());
 }
+
+TEST_F(RollingVectorFileWriterTest, MainSizeTargetClosesCurrentVector) {
+    auto writer = NewWriter(2, std::numeric_limits<int64_t>::max(), 1024);
+    ASSERT_OK(WriteRows(writer.get(), R"([[1, [1, 2]], [2, null]])"));
+    ASSERT_OK(WriteRows(writer.get(), R"([[3, null]])"));
+    ASSERT_OK(writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataFileMeta>> results, writer->GetResult());
+    ASSERT_EQ(results.size(), 4);
+    ASSERT_EQ(results[0]->file_name, "main0");
+    ASSERT_EQ(results[1]->file_name, "vector0");
+    ASSERT_EQ(results[0]->row_count, 2);
+    ASSERT_EQ(results[1]->row_count, 2);
+    ASSERT_EQ(results[2]->file_name, "main1");
+    ASSERT_EQ(results[3]->file_name, "vector1");
+    ASSERT_EQ(results[2]->row_count, 1);
+    ASSERT_EQ(results[3]->row_count, 1);
+}
+
+TEST_F(RollingVectorFileWriterTest, MainRowLimitPreservesVectorOrderAcrossGroups) {
+    auto writer = NewWriter(1024, 3, 2);
+    for (int32_t i = 0; i < 7; ++i) {
+        ASSERT_OK(WriteRows(writer.get(), R"([[1, null]])"));
+    }
+    ASSERT_OK(writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataFileMeta>> results, writer->GetResult());
+    const std::vector<std::string> names = {"main0",   "vector0", "vector1", "main1",
+                                            "vector2", "vector3", "main2",   "vector4"};
+    const std::vector<int64_t> counts = {3, 2, 1, 3, 2, 1, 1, 1};
+    ASSERT_EQ(results.size(), names.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        ASSERT_EQ(results[i]->file_name, names[i]);
+        ASSERT_EQ(results[i]->row_count, counts[i]);
+    }
+}
+
+TEST_F(RollingVectorFileWriterTest, EmptyBatchesDoNotCreateFiles) {
+    auto writer = NewWriter();
+    ASSERT_OK(WriteRows(writer.get(), "[]"));
+    ASSERT_OK(writer->Close());
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataFileMeta>> results, writer->GetResult());
+    ASSERT_TRUE(results.empty());
+    ASSERT_TRUE(main_state_->paths.empty());
+    ASSERT_TRUE(vector_state_->paths.empty());
+}
+
+TEST_F(RollingVectorFileWriterTest, ExactVectorBoundaryDoesNotCreateEmptyTail) {
+    auto writer = NewWriter();
+    ASSERT_OK(WriteRows(writer.get(), R"([[1, null]])"));
+    ASSERT_OK(WriteRows(writer.get(), "[]"));
+    ASSERT_OK(writer->Close());
+    ASSERT_EQ(main_state_->paths.size(), 1);
+    ASSERT_EQ(vector_state_->paths.size(), 1);
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataFileMeta>> results, writer->GetResult());
+    ASSERT_EQ(results.size(), 2);
+    ASSERT_EQ(results[0]->row_count, 1);
+    ASSERT_EQ(results[1]->row_count, 1);
+}
+
+TEST_F(RollingVectorFileWriterTest, AbortRemovesPendingVectorFiles) {
+    auto writer = NewWriter();
+    ASSERT_OK(WriteRows(writer.get(), R"([[1, null]])"));
+    ASSERT_OK(WriteRows(writer.get(), R"([[2, [1, 2]]])"));
+    writer->Abort();
+    CheckFilesRemoved();
+    ASSERT_NOK(writer->Close());
+    ASSERT_NOK(writer->GetResult());
+}
+
+TEST_F(RollingVectorFileWriterTest, RejectsMismatchedTotalRows) {
+    auto writer = NewWriter();
+    vector_state_->row_count_delta = 1;
+    ASSERT_OK(WriteRows(writer.get(), R"([[1, null]])"));
+    ASSERT_NOK_WITH_MSG(writer->Close(), "same total number of rows");
+    CheckFilesRemoved();
+    ASSERT_NOK(writer->GetResult());
+}
+
+class RollingVectorFailureTest : public RollingVectorFileWriterTest,
+                                 public ::testing::WithParamInterface<std::tuple<bool, int32_t>> {};
+
+TEST_P(RollingVectorFailureTest, RemovesEarlierGroupsAndPendingVectors) {
+    const auto [main_failure, failure] = GetParam();
+    auto writer = NewWriter(2);
+    ASSERT_OK(WriteRows(writer.get(), R"([[1, null]])"));
+    ASSERT_OK(WriteRows(writer.get(), R"([[2, [1, 2]]])"));
+    // Keep a main file open with an already closed VECTOR file, except when testing main create.
+    if (!main_failure || failure != 0) {
+        ASSERT_OK(WriteRows(writer.get(), R"([[3, null]])"));
+    }
+    const auto& state = main_failure ? main_state_ : vector_state_;
+    state->fail_create = failure == 0;
+    state->fail_write = failure == 1;
+    state->fail_close = failure == 2;
+    state->fail_size = failure == 3;
+    state->fail_result = failure == 4;
+    if (main_failure && (failure == 2 || failure == 4)) {
+        ASSERT_NOK(writer->Close());
+    } else {
+        ASSERT_NOK(WriteRows(writer.get(), R"([[4, [3, 4]]])"));
+    }
+    ASSERT_NOK(writer->GetResult());
+    ASSERT_NOK(writer->Close());
+    CheckFilesRemoved();
+}
+
+INSTANTIATE_TEST_SUITE_P(MainOrVector, RollingVectorFailureTest,
+                         ::testing::Combine(::testing::Bool(), ::testing::Range(0, 5)));
 
 }  // namespace paimon::test

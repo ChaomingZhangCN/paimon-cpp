@@ -53,6 +53,8 @@ Status RollingVectorFileWriter::Write(::ArrowArray* record) {
     }
     if (!current_writer_) {
         PAIMON_RETURN_NOT_OK(OpenCurrentWriter());
+    }
+    if (!vector_writer_) {
         PAIMON_ASSIGN_OR_RAISE(vector_writer_, vector_factory_->CreateWriter());
     }
     auto rows = checked_pointer_cast<arrow::StructArray>(array);
@@ -88,35 +90,51 @@ Status RollingVectorFileWriter::Write(::ArrowArray* record) {
                            current_writer_->ReachTargetSize(suggested_check, target_file_size_));
     PAIMON_ASSIGN_OR_RAISE(bool vector_full, vector_writer_->ReachTargetSize(
                                                  suggested_check, vector_target_file_size_));
-    if (main_full || vector_full || current_file_record_count_ >= target_file_row_num_) {
-        PAIMON_RETURN_NOT_OK(CloseCurrentPair());
+    if (main_full || current_file_record_count_ >= target_file_row_num_) {
+        PAIMON_RETURN_NOT_OK(CloseCurrentMainWriter());
+    } else if (vector_full) {
+        PAIMON_RETURN_NOT_OK(CloseCurrentVectorWriter());
     }
     guard.Release();
     return Status::OK();
 }
 
-Status RollingVectorFileWriter::CloseCurrentPair() {
+Status RollingVectorFileWriter::CloseCurrentVectorWriter() {
+    if (!vector_writer_) {
+        return Status::OK();
+    }
+    PAIMON_RETURN_NOT_OK(vector_writer_->Close());
+    PAIMON_ASSIGN_OR_RAISE(Writer::AbortExecutor vector_abort, vector_writer_->GetAbortExecutor());
+    closed_writers_.push_back(vector_abort);
+    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFileMeta> vector_meta, vector_writer_->GetResult());
+    current_vector_files_.push_back(vector_meta);
+    metrics_->Merge(vector_writer_->GetMetrics());
+    vector_writer_.reset();
+    return Status::OK();
+}
+
+Status RollingVectorFileWriter::CloseCurrentMainWriter() {
     if (!current_writer_) {
         return Status::OK();
     }
     PAIMON_RETURN_NOT_OK(current_writer_->Close());
     PAIMON_ASSIGN_OR_RAISE(Writer::AbortExecutor main_abort, current_writer_->GetAbortExecutor());
     closed_writers_.push_back(main_abort);
-    PAIMON_RETURN_NOT_OK(vector_writer_->Close());
-    PAIMON_ASSIGN_OR_RAISE(Writer::AbortExecutor vector_abort, vector_writer_->GetAbortExecutor());
-    closed_writers_.push_back(vector_abort);
+    PAIMON_RETURN_NOT_OK(CloseCurrentVectorWriter());
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFileMeta> main_meta, current_writer_->GetResult());
-    PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<DataFileMeta> vector_meta, vector_writer_->GetResult());
-    if (main_meta->row_count != vector_meta->row_count) {
-        return Status::Invalid("Main and VECTOR files must contain the same number of rows");
+    int64_t vector_row_count = 0;
+    for (const auto& vector_meta : current_vector_files_) {
+        vector_row_count += vector_meta->row_count;
     }
-    // Row tracking assigns ids in manifest order: the normal anchor must precede its vector file.
+    if (main_meta->row_count != vector_row_count) {
+        return Status::Invalid("Main and VECTOR files must contain the same total number of rows");
+    }
+    // Row tracking assigns ids in manifest order: emit the main file before its VECTOR files.
     results_.push_back(main_meta);
-    results_.push_back(vector_meta);
+    results_.insert(results_.end(), current_vector_files_.begin(), current_vector_files_.end());
+    current_vector_files_.clear();
     metrics_->Merge(current_writer_->GetMetrics());
-    metrics_->Merge(vector_writer_->GetMetrics());
     current_writer_.reset();
-    vector_writer_.reset();
     current_file_record_count_ = 0;
     return Status::OK();
 }
@@ -128,7 +146,7 @@ Status RollingVectorFileWriter::Close() {
     if (closed_) {
         return Status::OK();
     }
-    Status status = CloseCurrentPair();
+    Status status = CloseCurrentMainWriter();
     if (!status.ok()) {
         Abort();
     }
@@ -144,6 +162,7 @@ void RollingVectorFileWriter::Abort() {
     }
     RollingFileWriter::Abort();
     current_writer_.reset();
+    current_vector_files_.clear();
     closed_writers_.clear();
     results_.clear();
 }

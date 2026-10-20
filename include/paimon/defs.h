@@ -162,12 +162,12 @@ struct PAIMON_EXPORT Options {
     /// "blob.target-file-size" - Target size of a blob file. Default is TARGET_FILE_SIZE.
     static const char BLOB_TARGET_FILE_SIZE[];
 
-    /// "vector.file.format" - Optional dedicated VECTOR storage format. The initial implementation
-    /// supports vortex for a single top-level VECTOR column in row-tracking append-only tables.
+    /// "vector.file.format" - Optional dedicated VECTOR storage format (parquet, lance or vortex)
+    /// for a single top-level VECTOR column in row-tracking append-only tables.
     static const char VECTOR_FILE_FORMAT[];
 
     /// "vector.target-file-size" - Target size of the vector file. Defaults to TARGET_FILE_SIZE.
-    /// Main and vector files currently roll together when either target is reached.
+    /// VECTOR files roll independently; rolling a main file also closes the current VECTOR file.
     static const char VECTOR_TARGET_FILE_SIZE[];
 
     /// "blob.split-by-file-size" - Whether to consider blob file size as a factor when performing

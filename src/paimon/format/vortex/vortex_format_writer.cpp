@@ -28,6 +28,7 @@
 #include "arrow/memory_pool.h"
 #include "arrow/scalar.h"
 #include "arrow/type.h"
+#include "arrow/util/byte_size.h"
 #include "paimon/common/metrics/metrics_impl.h"
 #include "paimon/common/utils/arrow/arrow_utils.h"
 #include "paimon/common/utils/arrow/mem_utils.h"
@@ -40,6 +41,8 @@
 
 namespace paimon::vortex {
 namespace {
+
+constexpr double COMPRESSION_RATIO = 0.25;
 
 Status ValidateVisibleVectorElements(const std::shared_ptr<arrow::Array>& array,
                                      arrow::MemoryPool* pool) {
@@ -180,6 +183,8 @@ Status VortexFormatWriter::AddBatch(::ArrowArray* batch) {
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<arrow::ArrayData> normalized_data,
                            NormalizeVectorNullElements(normalized->data(), &context));
     normalized = arrow::MakeArray(normalized_data);
+    PAIMON_ASSIGN_OR_RAISE_FROM_ARROW(int64_t batch_bytes,
+                                      arrow::util::ReferencedBufferSize(*normalized));
     PAIMON_RETURN_NOT_OK_FROM_ARROW(arrow::ExportArray(*normalized, &rebased_batch));
     // The rebased buffers belong to arrow_pool_, which dies with this writer; keep it alive until
     // Rust releases the exported array.
@@ -199,6 +204,7 @@ Status VortexFormatWriter::AddBatch(::ArrowArray* batch) {
         return VortexCallbackError("push batch to Vortex sink", error,
                                    output_context_->GetCallbackStatus());
     }
+    ffi_bytes_ += batch_bytes;
     return Status::OK();
 }
 
@@ -233,7 +239,8 @@ Result<bool> VortexFormatWriter::ReachTargetSize(bool suggested_check, int64_t t
     if (!suggested_check || output_context_ == nullptr) {
         return false;
     }
-    return output_context_->BytesWritten() >= target_size;
+    // Match Java's estimate: background writes may still be buffered when rolling is checked.
+    return static_cast<int64_t>(ffi_bytes_ * COMPRESSION_RATIO) >= target_size;
 }
 
 std::shared_ptr<Metrics> VortexFormatWriter::GetWriterMetrics() const {

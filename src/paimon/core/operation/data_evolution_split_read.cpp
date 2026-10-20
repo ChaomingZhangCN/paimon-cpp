@@ -839,6 +839,9 @@ Result<std::unique_ptr<BatchReader>> DataEvolutionSplitRead::CreateUnionReader(
     PAIMON_ASSIGN_OR_RAISE(
         std::vector<VectorReadRange> ranges,
         PlanVectorReadRanges(need_merge_files, read_field_ids, file_to_field_ids));
+    // Each range creates a separate field-union reader, reopening a main file that spans ranges.
+    // TODO(ChaomingZhangCN): Keep one main reader and concatenate VECTOR readers for contiguous,
+    // non-overlapping files whose field providers can be merged sequentially.
     std::vector<LazyConcatBatchReader::Source> sources;
     auto split_read =
         std::make_shared<DataEvolutionSplitRead>(path_factory_, context_, pool_, executor_);

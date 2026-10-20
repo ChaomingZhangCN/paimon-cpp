@@ -1269,9 +1269,8 @@ Status SchemaValidation::ValidateVectorStore(const TableSchema& schema,
     if (!vector_format) {
         return Status::OK();
     }
-    if (vector_format->Identifier() != "vortex") {
-        return Status::NotImplemented("Dedicated VECTOR storage currently only supports vortex");
-    }
+    PAIMON_RETURN_NOT_OK(
+        ValidateVectorFileFormat(Options::VECTOR_FILE_FORMAT, vector_format->Identifier()));
     if (!schema.PrimaryKeys().empty()) {
         return Status::NotImplemented("Dedicated VECTOR storage only supports append-only tables");
     }

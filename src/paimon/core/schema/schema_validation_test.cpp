@@ -515,7 +515,6 @@ TEST(SchemaValidationTest, TestLanceDataTypes) {
 }
 #endif
 
-#ifdef PAIMON_ENABLE_VORTEX
 TEST(SchemaValidationTest, TestDedicatedVectorStore) {
     auto vector_type =
         arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
@@ -523,7 +522,7 @@ TEST(SchemaValidationTest, TestDedicatedVectorStore) {
     auto embedding = arrow::field("embedding", vector_type);
     std::map<std::string, std::string> options = {{Options::BUCKET, "-1"},
                                                   {Options::FILE_FORMAT, "parquet"},
-                                                  {Options::VECTOR_FILE_FORMAT, "vortex"},
+                                                  {Options::VECTOR_FILE_FORMAT, "parquet"},
                                                   {Options::ROW_TRACKING_ENABLED, "true"},
                                                   {Options::DATA_EVOLUTION_ENABLED, "true"}};
     auto validate = [&](const arrow::FieldVector& fields,
@@ -557,15 +556,18 @@ TEST(SchemaValidationTest, TestDedicatedVectorStore) {
     invalid_options[Options::DATA_EVOLUTION_ENABLED] = "false";
     ASSERT_NOK_WITH_MSG(validate({id, embedding}, invalid_options),
                         "requires row-tracking.enabled and data-evolution.enabled");
+#ifdef PAIMON_ENABLE_VORTEX
     invalid_options = options;
     invalid_options[Options::FILE_FORMAT] = "vortex";
     ASSERT_NOK_WITH_MSG(validate({id, embedding}, invalid_options), "requires parquet main files");
     invalid_options = options;
     invalid_options[Options::FILE_FORMAT_PER_LEVEL] = "0:vortex";
     ASSERT_NOK_WITH_MSG(validate({id, embedding}, invalid_options), "requires parquet main files");
+#endif
     invalid_options = options;
-    invalid_options[Options::VECTOR_FILE_FORMAT] = "parquet";
-    ASSERT_NOK_WITH_MSG(validate({id, embedding}, invalid_options), "only supports vortex");
+    invalid_options[Options::VECTOR_FILE_FORMAT] = "avro";
+    ASSERT_NOK_WITH_MSG(validate({id, embedding}, invalid_options),
+                        "VECTOR currently only supports parquet/lance/vortex");
     invalid_options = options;
     invalid_options[Options::VECTOR_TARGET_FILE_SIZE] = "0 b";
     ASSERT_NOK_WITH_MSG(validate({id, embedding}, invalid_options), "must be positive");
@@ -576,8 +578,22 @@ TEST(SchemaValidationTest, TestDedicatedVectorStore) {
     options[Options::VECTOR_TARGET_FILE_SIZE] = "1 mb";
     ASSERT_OK_AND_ASSIGN(core_options, CoreOptions::FromMap(options));
     ASSERT_EQ(core_options.GetVectorTargetFileSize(), 1024 * 1024);
+
+    std::vector<std::string> vector_formats = {"parquet"};
+#ifdef PAIMON_ENABLE_LANCE
+    vector_formats.push_back("lance");
+#endif
+#ifdef PAIMON_ENABLE_VORTEX
+    vector_formats.push_back("vortex");
+#endif
+    for (const auto& format : vector_formats) {
+        SCOPED_TRACE(format);
+        options[Options::VECTOR_FILE_FORMAT] = format;
+        ASSERT_OK(validate({id, embedding}, options));
+    }
 }
 
+#ifdef PAIMON_ENABLE_VORTEX
 TEST(SchemaValidationTest, TestVortexVectorType) {
     auto vector_type =
         arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);

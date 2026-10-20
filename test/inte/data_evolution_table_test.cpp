@@ -2022,17 +2022,18 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
     }
 }
 
-TEST_P(DataEvolutionTableTest, TestDedicatedVectorStore) {
-    if (FileFormat() != "parquet") {
-        GTEST_SKIP() << "Dedicated VECTOR storage requires parquet main files";
-    }
+#endif
+
+class DedicatedVectorTableTest : public DataEvolutionTableTest {};
+
+TEST_P(DedicatedVectorTableTest, TestDedicatedVectorStore) {
     auto vector_type =
         arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
     arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
                                  arrow::field("embedding", vector_type),
                                  arrow::field("tag", arrow::utf8())};
     std::map<std::string, std::string> options = {
-        {Options::FILE_FORMAT, "parquet"},       {Options::VECTOR_FILE_FORMAT, "vortex"},
+        {Options::FILE_FORMAT, "parquet"},       {Options::VECTOR_FILE_FORMAT, FileFormat()},
         {Options::FILE_SYSTEM, "local"},         {Options::BUCKET, "-1"},
         {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
         {Options::TARGET_FILE_ROW_NUM, "2"},     {Options::READ_BATCH_SIZE, "2"}};
@@ -2058,7 +2059,8 @@ TEST_P(DataEvolutionTableTest, TestDedicatedVectorStore) {
     ASSERT_EQ(files.size(), 6);
     for (size_t i = 0; i < files.size(); i += 2) {
         ASSERT_FALSE(VectorStoreUtils::IsVectorStoreFile(files[i]->file_name));
-        ASSERT_TRUE(StringUtils::EndsWith(files[i + 1]->file_name, ".vector.vortex"));
+        ASSERT_TRUE(StringUtils::EndsWith(files[i + 1]->file_name,
+                                          fmt::format(".vector.{}", FileFormat())));
         ASSERT_EQ(files[i]->row_count, files[i + 1]->row_count);
         ASSERT_EQ(files[i]->write_cols, std::vector<std::string>({"id", "tag"}));
         ASSERT_EQ(files[i + 1]->write_cols, std::vector<std::string>({"embedding"}));
@@ -2120,7 +2122,117 @@ TEST_P(DataEvolutionTableTest, TestDedicatedVectorStore) {
     ASSERT_NOK_WITH_MSG(FileStoreWrite::Create(std::move(invalid_context)).status(),
                         "requires row-tracking.enabled and data-evolution.enabled");
 }
-#endif
+
+TEST_P(DedicatedVectorTableTest, TestIndependentVectorRolling) {
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    arrow::FieldVector fields = {arrow::field("id", arrow::int32()),
+                                 arrow::field("embedding", vector_type),
+                                 arrow::field("tag", arrow::utf8())};
+    const std::map<std::string, std::string> options = {
+        {Options::FILE_FORMAT, "parquet"},       {Options::VECTOR_FILE_FORMAT, FileFormat()},
+        {Options::FILE_SYSTEM, "local"},         {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::WRITE_ONLY, "true"},           {Options::TARGET_FILE_SIZE, "128 mb"},
+        {Options::TARGET_FILE_ROW_NUM, "2500"},  {Options::VECTOR_TARGET_FILE_SIZE, "1 b"},
+        {Options::WRITE_BATCH_SIZE, "100"},      {Options::READ_BATCH_SIZE, "127"}};
+    CreateTable(fields, /*partition_keys=*/{}, options);
+    const std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    auto input = PrepareBulkData(
+        6001,
+        [](int32_t id) {
+            const std::string vector = id % 1000 == 0 || id % 1000 == 999
+                                           ? "null"
+                                           : fmt::format("[{}, {}, {}]", id, id + 1, id + 2);
+            return fmt::format(R"({}, {}, "row-{}")", id, vector, id);
+        },
+        fields);
+    std::vector<std::shared_ptr<arrow::Array>> batches;
+    for (int64_t offset = 0; offset < input->length(); offset += 1000) {
+        batches.push_back(input->Slice(offset, std::min<int64_t>(1000, input->length() - offset)));
+    }
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<CommitMessage>> messages,
+                         WriteArrays(table_path, {}, {}, batches));
+    ASSERT_EQ(messages.size(), 1);
+    auto message = std::dynamic_pointer_cast<CommitMessageImpl>(messages[0]);
+    ASSERT_NE(message, nullptr);
+    int32_t main_count = 0;
+    int32_t vector_count = 0;
+    int64_t main_rows = 0;
+    int64_t vector_rows = 0;
+    for (const auto& file : message->data_increment_.new_files_) {
+        if (VectorStoreUtils::IsVectorStoreFile(file->file_name)) {
+            ASSERT_GT(main_count, 0);
+            ASSERT_GT(file->row_count, 0);
+            vector_rows += file->row_count;
+            ASSERT_LE(vector_rows, main_rows);
+            ++vector_count;
+        } else {
+            ASSERT_EQ(main_rows, vector_rows);
+            main_rows += file->row_count;
+            ++main_count;
+        }
+    }
+    ASSERT_EQ(main_count, 3);
+    ASSERT_EQ(main_rows, input->length());
+    ASSERT_EQ(vector_rows, main_rows);
+    // Lance checks encoded bytes only; a small file may stay buffered until the main file closes.
+    if (FileFormat() != "lance") {
+        ASSERT_GT(vector_count, main_count);
+    }
+    ASSERT_OK(Commit(table_path, messages));
+
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<Split>> splits, PlanSplits(table_path));
+    std::map<int64_t, std::shared_ptr<DataFileMeta>> main_files;
+    std::map<int64_t, std::shared_ptr<DataFileMeta>> vector_files;
+    for (const auto& split : splits) {
+        auto data_split = std::dynamic_pointer_cast<DataSplitImpl>(split);
+        ASSERT_NE(data_split, nullptr);
+        for (const auto& file : data_split->DataFiles()) {
+            ASSERT_OK_AND_ASSIGN(int64_t first_row_id, file->NonNullFirstRowId());
+            ASSERT_EQ(file->min_sequence_number, 1);
+            ASSERT_EQ(file->max_sequence_number, 1);
+            auto& files =
+                VectorStoreUtils::IsVectorStoreFile(file->file_name) ? vector_files : main_files;
+            ASSERT_TRUE(files.emplace(first_row_id, file).second);
+        }
+    }
+    ASSERT_EQ(main_files.size(), 3);
+    auto vector_file = vector_files.begin();
+    int64_t next_row_id = 0;
+    for (const auto& [first, main] : main_files) {
+        ASSERT_EQ(first, next_row_id);
+        const int64_t end = first + main->row_count;
+        while (next_row_id < end) {
+            ASSERT_NE(vector_file, vector_files.end());
+            ASSERT_EQ(vector_file->first, next_row_id);
+            next_row_id += vector_file->second->row_count;
+            ASSERT_LE(next_row_id, end);
+            ++vector_file;
+        }
+    }
+    ASSERT_EQ(next_row_id, input->length());
+    ASSERT_EQ(vector_file, vector_files.end());
+    ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, input));
+    auto normal_projection =
+        arrow::StructArray::Make({input->field(0), input->field(2)}, {fields[0], fields[2]})
+            .ValueOrDie();
+    ASSERT_OK(ScanAndRead(table_path, {"id", "tag"}, normal_projection));
+    auto vector_projection = arrow::StructArray::Make({input->field(1)}, {fields[1]}).ValueOrDie();
+    ASSERT_OK(ScanAndRead(table_path, {"embedding"}, vector_projection));
+    for (const Range& range : {Range(999, 1001), Range(2999, 3001), Range(5999, 6000)}) {
+        auto expected = checked_pointer_cast<arrow::StructArray>(
+            input->Slice(range.from, range.to - range.from + 1));
+        ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, expected,
+                              /*predicate=*/nullptr, /*row_ranges=*/{range}));
+    }
+
+    ASSERT_OK_AND_ASSIGN(messages, WriteArray(table_path, {}, input->Slice(0, 2)));
+    ASSERT_OK(Commit(table_path, messages));
+    auto appended = checked_pointer_cast<arrow::StructArray>(input->Slice(0, 2));
+    ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, appended,
+                          /*predicate=*/nullptr, /*row_ranges=*/{Range(6001, 6002)}));
+}
 
 TEST_P(DataEvolutionTableTest, TestVectorReadWrite) {
     if (FileFormat() != "parquet" && FileFormat() != "lance") {
@@ -3901,6 +4013,26 @@ std::vector<DataEvolutionTableParam> GetTestValuesForDataEvolutionDvTableTest() 
 
 INSTANTIATE_TEST_SUITE_P(FileFormat, DataEvolutionDvTableTest,
                          ::testing::ValuesIn(GetTestValuesForDataEvolutionDvTableTest()));
+
+std::vector<DataEvolutionTableParam> GetTestValuesForDedicatedVectorTableTest() {
+    std::vector<std::string> formats = {"parquet"};
+#ifdef PAIMON_ENABLE_LANCE
+    formats.push_back("lance");
+#endif
+#ifdef PAIMON_ENABLE_VORTEX
+    formats.push_back("vortex");
+#endif
+    std::vector<DataEvolutionTableParam> values;
+    for (const auto& format : formats) {
+        for (bool enable_cache : {false, true}) {
+            values.emplace_back(format, enable_cache, /*bitmap64=*/false);
+        }
+    }
+    return values;
+}
+
+INSTANTIATE_TEST_SUITE_P(VectorFormat, DedicatedVectorTableTest,
+                         ::testing::ValuesIn(GetTestValuesForDedicatedVectorTableTest()));
 
 INSTANTIATE_TEST_SUITE_P(FileFormat, DataEvolutionTableTest,
                          ::testing::ValuesIn(GetTestValuesForDataEvolutionTableTest()));

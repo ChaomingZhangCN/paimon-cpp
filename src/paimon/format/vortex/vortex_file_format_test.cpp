@@ -816,6 +816,46 @@ TEST_F(VortexFileFormatTest, WriteThenReadSlicedStructColumn) {
     AssertReadWithBatchSizes(path, schema, expected, {1, 2, 4});
 }
 
+TEST_F(VortexFileFormatTest, RollingSizeIncludesBufferedBatches) {
+    const std::string path = PathUtil::JoinPath(directory_->Str(), "rolling-size.vortex");
+    auto vector_type =
+        arrow::fixed_size_list(arrow::field("item", arrow::float32(), /*nullable=*/false), 3);
+    auto schema = arrow::schema({arrow::field("id", arrow::int32(), /*nullable=*/false),
+                                 arrow::field("embedding", vector_type, /*nullable=*/false)});
+    std::shared_ptr<arrow::Array> written =
+        arrow::ipc::internal::json::ArrayFromJSON(
+            arrow::struct_(schema->fields()),
+            R"([[1,[1,2,3]],[2,[2,3,4]],[3,[3,4,5]],[4,[4,5,6]]])")
+            .ValueOrDie();
+    ::ArrowSchema ffi_schema = {};
+    ASSERT_TRUE(arrow::ExportSchema(*schema, &ffi_schema).ok());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<WriterBuilder> writer_builder,
+                         format_->CreateWriterBuilder(&ffi_schema, /*batch_size=*/2));
+    writer_builder->WithMemoryPool(pool_);
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<OutputStream> output,
+                         file_system_->Create(path, /*overwrite=*/false));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<FormatWriter> writer,
+                         writer_builder->Build(output, "zstd"));
+    ASSERT_OK_AND_ASSIGN(bool full, writer->ReachTargetSize(/*suggested_check=*/true, 1));
+    ASSERT_FALSE(full);
+    for (int64_t offset : {0, 2}) {
+        ::ArrowArray ffi_array = {};
+        ASSERT_TRUE(arrow::ExportArray(*written->Slice(offset, 2), &ffi_array).ok());
+        ASSERT_OK(writer->AddBatch(&ffi_array));
+        ASSERT_OK_AND_ASSIGN(full, writer->ReachTargetSize(/*suggested_check=*/false, 1));
+        ASSERT_FALSE(full);
+        // Each two-row slice contributes 32 input bytes; Java estimates a compression ratio of 1/4.
+        const int64_t target = (offset + 2) * 4;
+        ASSERT_OK_AND_ASSIGN(full, writer->ReachTargetSize(/*suggested_check=*/true, target));
+        ASSERT_TRUE(full);
+        ASSERT_OK_AND_ASSIGN(full, writer->ReachTargetSize(/*suggested_check=*/true, target + 1));
+        ASSERT_FALSE(full);
+    }
+    ASSERT_OK(writer->Finish());
+    ASSERT_OK(output->Close());
+    AssertReadWithBatchSizes(path, schema, written, {1, 3});
+}
+
 // Regression: Flush() between batches must be safe (it is serialized with the background writer
 // task's writes on the host OutputStream) and must not lose or reorder any data.
 TEST_F(VortexFileFormatTest, FlushBetweenBatchesThenRead) {
