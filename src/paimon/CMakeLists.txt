@@ -407,6 +407,8 @@ set(PAIMON_CORE_SRCS
     core/realtime/arrow_realtime_store.cpp
     core/realtime/arrow_deduplicate_realtime_store.cpp
     core/realtime/arrow_realtime_store_factory.cpp
+    core/realtime/data_file_key_offset_index_writer.cpp
+    core/realtime/key_offset_index_utils.cpp
     core/realtime/realtime_key_offset_index.cpp
     core/realtime/realtime_offset_file_index_lookup.cpp
     core/realtime/realtime_deduplicate_state.cpp
@@ -707,6 +709,9 @@ if(PAIMON_BUILD_TESTS)
                     common/utils/arrow/mem_utils_test.cpp
                     common/utils/arrow/status_utils_test.cpp
                     common/utils/concurrent_hash_map_test.cpp
+                    common/utils/hash_map_test.cpp
+                    common/utils/dense_hash_table_test.cpp
+                    common/utils/dense_hash_table_file_reader_test.cpp
                     common/utils/projected_row_test.cpp
                     common/utils/projected_array_test.cpp
                     common/utils/bit_set_test.cpp
@@ -876,6 +881,7 @@ if(PAIMON_BUILD_TESTS)
                     core/memory/writer_memory_manager_test.cpp
                     core/realtime/arrow_deduplicate_realtime_store_test.cpp
                     core/realtime/arrow_realtime_store_test.cpp
+                    core/realtime/key_offset_index_utils_test.cpp
                     core/realtime/primary_key_realtime_store_test.cpp
                     core/realtime/realtime_deduplicate_state_test.cpp
                     core/realtime/realtime_key_offset_index_test.cpp
