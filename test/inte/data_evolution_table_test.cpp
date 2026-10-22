@@ -2119,7 +2119,7 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
             << "actual=" << result->ToString() << "\nexpected=" << expected_rows->ToString();
     }
 
-    // Reading sequence numbers must retain the newest provider independently in each range.
+    // Like Java, the normal file supplies sequence numbers even when VECTOR files are newer.
     auto sequence_main = std::make_shared<DataFileMeta>(*main_file);
     sequence_main->AssignSequenceNumber(3, 3);
     std::vector<std::shared_ptr<DataFileMeta>> sequence_files = {sequence_main};
@@ -2130,34 +2130,71 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
         sequence_files.push_back(sequence_vector);
         ++sequence;
     }
+    auto sequence_tail = sequence_files.back();
     DataSplitImpl::Builder sequence_builder(original_split->Partition(), original_split->Bucket(),
                                             original_split->BucketPath(),
                                             std::move(sequence_files));
     ASSERT_OK_AND_ASSIGN(std::shared_ptr<DataSplitImpl> sequence_split,
                          sequence_builder.RawConvertible(false).Build());
     auto tracking = PrepareBulkData(
-        kRowCount,
-        [](int32_t id) { return fmt::format("0, {}, {}", id, std::max(3, 2 + id / 1000)); },
+        kRowCount, [](int32_t id) { return fmt::format("0, {}, 3", id); },
         {SpecialFields::ValueKind().ArrowField(), SpecialFields::RowId().ArrowField(),
          SpecialFields::SequenceNumber().ArrowField()});
-    auto sequence_expected =
-        arrow::StructArray::Make({tracking->field(0), expected->field(0), expected->field(1),
-                                  tracking->field(1), tracking->field(2)},
-                                 {"_VALUE_KIND", "id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"})
-            .ValueOrDie();
-    ReadContextBuilder sequence_read_builder(table_path);
-    sequence_read_builder.SetReadFieldNames({"id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"});
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> sequence_context,
-                         sequence_read_builder.Finish());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> sequence_read,
-                         TableRead::Create(std::move(sequence_context)));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> sequence_reader,
-                         sequence_read->CreateReader(sequence_split));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> sequence_result,
-                         ReadResultCollector::CollectResult(std::move(sequence_reader)));
-    ASSERT_NE(sequence_result, nullptr);
-    ASSERT_TRUE(sequence_result->Equals(arrow::ChunkedArray(sequence_expected)))
-        << sequence_result->ToString();
+    for (bool sequential : {true, false}) {
+        SCOPED_TRACE(sequential);
+        std::shared_ptr<Split> split = sequence_split;
+        std::shared_ptr<arrow::Array> vectors = expected->field(1);
+        if (!sequential) {
+            // A newer VECTOR covering only the tail forces the range-reader fallback.
+            const auto& tail = sequence_tail;
+            ASSERT_GT(tail->max_sequence_number, sequence_main->max_sequence_number);
+            DataSplitImpl::Builder tail_builder(
+                original_split->Partition(), original_split->Bucket(), original_split->BucketPath(),
+                std::vector<std::shared_ptr<DataFileMeta>>{sequence_main, tail});
+            ASSERT_OK_AND_ASSIGN(split, tail_builder.RawConvertible(false).Build());
+            const int64_t first = tail->first_row_id.value();
+            auto missing = arrow::MakeArrayOfNull(vector_type, first).ValueOrDie();
+            vectors = arrow::Concatenate({missing, vectors->Slice(first)}).ValueOrDie();
+        }
+        auto sequence_expected =
+            arrow::StructArray::Make(
+                {tracking->field(0), expected->field(0), vectors, tracking->field(1),
+                 tracking->field(2)},
+                {"_VALUE_KIND", "id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"})
+                .ValueOrDie();
+        for (const std::vector<std::string>& projection :
+             {std::vector<std::string>{"id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"},
+              std::vector<std::string>{"id", "_ROW_ID", "_SEQUENCE_NUMBER"},
+              std::vector<std::string>{"_ROW_ID", "_SEQUENCE_NUMBER"}}) {
+            auto sequence_fs = std::make_shared<CountingLocalFileSystem>();
+            ReadContextBuilder sequence_read_builder(table_path);
+            sequence_read_builder.WithFileSystem(sequence_fs)
+                .EnablePrefetch(false)
+                .SetReadFieldNames(projection);
+            ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> sequence_context,
+                                 sequence_read_builder.Finish());
+            ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> sequence_read,
+                                 TableRead::Create(std::move(sequence_context)));
+            ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> sequence_reader,
+                                 sequence_read->CreateReader(split));
+            ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> sequence_result,
+                                 ReadResultCollector::CollectResult(std::move(sequence_reader)));
+            ASSERT_NE(sequence_result, nullptr);
+            arrow::ArrayVector projected_arrays = {tracking->field(0)};
+            std::vector<std::string> projected_names = {"_VALUE_KIND"};
+            for (const auto& name : projection) {
+                projected_arrays.push_back(sequence_expected->GetFieldByName(name));
+                projected_names.push_back(name);
+            }
+            auto projected_expected =
+                arrow::StructArray::Make(projected_arrays, projected_names).ValueOrDie();
+            ASSERT_TRUE(sequence_result->Equals(arrow::ChunkedArray(projected_expected)))
+                << sequence_result->ToString();
+            if (sequential) {
+                ASSERT_EQ(sequence_fs->OpenCount(main_path), 1);
+            }
+        }
+    }
 }
 
 #endif

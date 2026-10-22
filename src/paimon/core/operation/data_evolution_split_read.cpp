@@ -902,12 +902,8 @@ Result<std::unique_ptr<BatchReader>> DataEvolutionSplitRead::CreateUnionReader(
     if (row_ranges) {
         normalized_ranges = Range::SortAndMergeOverlap(row_ranges.value(), /*adjacent=*/true);
     }
-    std::vector<std::shared_ptr<FieldBunch>> sequential_bunches;
-    // The sequence-number provider can change at each boundary even for disjoint columns.
-    if (read_schema->GetFieldIndex(SpecialFields::SequenceNumber().Name()) == -1) {
-        PAIMON_ASSIGN_OR_RAISE(sequential_bunches,
-                               TryPlanSequentialVectorRead(need_merge_files, file_to_field_ids));
-    }
+    PAIMON_ASSIGN_OR_RAISE(std::vector<std::shared_ptr<FieldBunch>> sequential_bunches,
+                           TryPlanSequentialVectorRead(need_merge_files, file_to_field_ids));
     auto split_read =
         std::make_shared<DataEvolutionSplitRead>(path_factory_, context_, pool_, executor_);
     if (!sequential_bunches.empty()) {
@@ -1018,6 +1014,10 @@ Result<std::unique_ptr<BatchReader>> DataEvolutionSplitRead::CreateFieldUnionRea
     std::vector<int32_t> reader_offsets(all_read_fields.size(), -1);
     // which field index in the reading row
     std::vector<int32_t> field_offsets(all_read_fields.size(), -1);
+    const bool has_normal_file =
+        std::any_of(fields_files.begin(), fields_files.end(), [](const auto& bunch) {
+            return DataEvolutionUtils::IsNormalFile(bunch->Files()[0]->file_name);
+        });
 
     for (int32_t file_idx = 0; file_idx < static_cast<int32_t>(fields_files.size()); file_idx++) {
         const auto& bunch = fields_files[file_idx];
@@ -1036,6 +1036,11 @@ Result<std::unique_ptr<BatchReader>> DataEvolutionSplitRead::CreateFieldUnionRea
              read_field_idx < static_cast<int32_t>(read_field_ids.size()); read_field_idx++) {
             // -1 indicates that the read fields are not matched
             if (reader_offsets[read_field_idx] != -1) {
+                continue;
+            }
+            // Java takes sequence numbers from normal files before dedicated column files.
+            if (has_normal_file && !DataEvolutionUtils::IsNormalFile(first_file->file_name) &&
+                read_field_ids[read_field_idx] == SpecialFields::SequenceNumber().Id()) {
                 continue;
             }
             for (int32_t data_field_id : data_field_ids) {
