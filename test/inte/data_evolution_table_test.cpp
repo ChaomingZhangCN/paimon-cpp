@@ -27,6 +27,7 @@
 #include "gtest/gtest.h"
 #include "paimon/common/factories/io_hook.h"
 #include "paimon/common/io/cache/lru_cache.h"
+#include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/checked_cast.h"
@@ -2019,6 +2020,8 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
                       0);
         }
         ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch first_batch, lazy_reader->NextBatch());
+        ScopeGuard release_first_batch(
+            [&first_batch]() { ReaderUtils::ReleaseReadBatch(std::move(first_batch)); });
         ASSERT_FALSE(BatchReader::IsEofBatch(first_batch));
         if (fail_next_file) {
             auto result = ReadResultCollector::CollectResult(std::move(lazy_reader));
