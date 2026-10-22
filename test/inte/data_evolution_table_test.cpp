@@ -35,9 +35,16 @@
 #include "paimon/common/utils/path_util.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/common/utils/vector_store_utils.h"
+#include "paimon/core/core_options.h"
+#include "paimon/core/global_index/global_index_live_row_filter.h"
 #include "paimon/core/global_index/indexed_split_impl.h"
+#include "paimon/core/operation/file_store_scan.h"
+#include "paimon/core/schema/schema_manager.h"
+#include "paimon/core/snapshot.h"
 #include "paimon/core/table/source/data_split_impl.h"
+#include "paimon/core/utils/snapshot_manager.h"
 #include "paimon/defs.h"
+#include "paimon/executor.h"
 #include "paimon/format/mosaic/mosaic_format_defs.h"
 #include "paimon/fs/file_system.h"
 #include "paimon/fs/local/local_file_system.h"
@@ -197,8 +204,8 @@ class DataEvolutionTableTest : public ::testing::Test,
     /// created with, which a test that later evolves the schema has to pass along.
     /// `extra_options` is merged in for tests that also pin a read batch or split target size.
     std::map<std::string, std::string> CreateDataEvolutionTable(
-        bool deletion_vectors_enabled,
-        const std::map<std::string, std::string>& extra_options = {}) const {
+        bool deletion_vectors_enabled, const std::map<std::string, std::string>& extra_options = {},
+        const std::vector<std::string>& partition_keys = {}) const {
         std::map<std::string, std::string> options = {{Options::FILE_FORMAT, FileFormat()},
                                                       {Options::FILE_SYSTEM, "local"},
                                                       {Options::ROW_TRACKING_ENABLED, "true"},
@@ -209,7 +216,7 @@ class DataEvolutionTableTest : public ::testing::Test,
                             std::get<2>(GetParam()) ? "true" : "false");
         }
         options.insert(extra_options.begin(), extra_options.end());
-        CreateTable(/*partition_keys=*/{}, options);
+        CreateTable(partition_keys, options);
         return options;
     }
 
@@ -3611,6 +3618,72 @@ TEST_P(DataEvolutionDvTableTest, TestGlobalIndexScoresWithSingleFileFiltering) {
 
 TEST_P(DataEvolutionDvTableTest, TestGlobalIndexScoresWithMergedFileFiltering) {
     CheckGlobalIndexScoresWithFiltering(/*merge_files=*/true);
+}
+
+TEST_P(DataEvolutionDvTableTest, TestGlobalIndexLiveRows) {
+    CreateDataEvolutionTable(/*deletion_vectors_enabled=*/true, /*extra_options=*/{},
+                             /*partition_keys=*/{"f1"});
+    std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::shared_ptr<CommitMessage>> group_msgs0,
+        WriteAndCommitGroup(table_path, /*first_row_id=*/0, /*f0_values=*/{0, 1, 2, 3},
+                            /*partition=*/{{"f1", "p0"}}));
+    ASSERT_OK_AND_ASSIGN(
+        std::vector<std::shared_ptr<CommitMessage>> group_msgs1,
+        WriteAndCommitGroup(table_path, /*first_row_id=*/4, /*f0_values=*/{4, 5, 6, 7},
+                            /*partition=*/{{"f1", "p1"}}));
+    ASSERT_OK_AND_ASSIGN(std::vector<std::string> anchor_file_names,
+                         PlannedAnchorFileNames(table_path));
+    ASSERT_EQ(anchor_file_names.size(), 2);
+
+    std::shared_ptr<FileSystem> fs = dir_->GetFileSystem();
+    SchemaManager schema_manager(fs, table_path);
+    ASSERT_OK_AND_ASSIGN(std::optional<std::shared_ptr<TableSchema>> table_schema,
+                         schema_manager.Latest());
+    ASSERT_TRUE(table_schema);
+    ASSERT_OK_AND_ASSIGN(CoreOptions options,
+                         CoreOptions::FromMap(table_schema.value()->Options(), fs));
+    SnapshotManager snapshot_manager(fs, table_path);
+    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot_before_deletion,
+                         snapshot_manager.LatestSnapshot());
+    ASSERT_TRUE(snapshot_before_deletion);
+
+    ASSERT_OK(CommitDeletionVectors(table_path, group_msgs0[0],
+                                    {{anchor_file_names[0], /*deleted_positions=*/{1, 3}}}));
+    ASSERT_OK(CommitDeletionVectors(table_path, group_msgs1[0],
+                                    {{anchor_file_names[1], /*deleted_positions=*/{0}}}));
+    ASSERT_OK_AND_ASSIGN(std::optional<Snapshot> snapshot, snapshot_manager.LatestSnapshot());
+    ASSERT_TRUE(snapshot);
+
+    std::shared_ptr<Executor> executor = CreateDefaultExecutor();
+    auto read_live_rows = [&](const Snapshot& read_snapshot,
+                              const std::shared_ptr<PredicateFilter>& partition_filter) {
+        return GlobalIndexLiveRowFilter::LiveRows(table_path, table_schema.value(), read_snapshot,
+                                                  partition_filter, options, executor,
+                                                  GetDefaultPool());
+    };
+    ASSERT_OK_AND_ASSIGN(std::optional<RoaringBitmap64> live_rows,
+                         read_live_rows(snapshot.value(), /*partition_filter=*/nullptr));
+    ASSERT_TRUE(live_rows);
+    ASSERT_EQ(live_rows.value(), RoaringBitmap64::From({0, 2, 5, 6, 7}));
+
+    auto arrow_schema = DataField::ConvertDataFieldsToArrowSchema(table_schema.value()->Fields());
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<PredicateFilter> p0_filter,
+                         FileStoreScan::CreatePartitionPredicate(
+                             table_schema.value()->PartitionKeys(),
+                             options.GetPartitionDefaultName(), arrow_schema, {{{"f1", "p0"}}}));
+    ASSERT_OK_AND_ASSIGN(live_rows, read_live_rows(snapshot.value(), p0_filter));
+    ASSERT_TRUE(live_rows);
+    ASSERT_EQ(live_rows.value(), RoaringBitmap64::From({0, 2}));
+
+    ASSERT_OK_AND_ASSIGN(live_rows, read_live_rows(snapshot_before_deletion.value(),
+                                                   /*partition_filter=*/nullptr));
+    ASSERT_TRUE(live_rows);
+    ASSERT_EQ(live_rows.value(), RoaringBitmap64::From({0, 1, 2, 3, 4, 5, 6, 7}));
+
+    ASSERT_OK(fs->Delete(PathUtil::JoinPath(table_path, "index")));
+    ASSERT_NOK_WITH_MSG(read_live_rows(snapshot.value(), /*partition_filter=*/nullptr),
+                        "failed to read deletion vector of data file");
 }
 
 TEST_P(DataEvolutionDvTableTest, TestReadWithDeletionVectors) {

@@ -181,6 +181,31 @@ ranges is ranked only by the range that starts first, or ends first if both star
 A shard ignores the ``include_row_ids`` outside the rows it ranks and is not searched if none
 remain. The result iterates rows by ascending row id, not by score.
 
+When ``deletion-vectors.enabled`` and ``row-tracking.enabled`` are set, readers created by
+``GlobalIndexScan`` rank only the rows that are live in the snapshot the scan reads, as Java Paimon
+does, so rows deleted by deletion vectors do not take ``limit`` slots. BM25 statistics still come
+from the whole index. A later snapshot can delete some of the matched rows, so pass one snapshot id
+to both the index scan and the data scan:
+
+.. code-block:: cpp
+
+   PAIMON_ASSIGN_OR_RAISE(
+       std::unique_ptr<paimon::GlobalIndexScan> index_scan,
+       paimon::GlobalIndexScan::Create(table_path, snapshot_id, /*partitions=*/std::nullopt,
+                                       /*options=*/{}, /*file_system=*/nullptr,
+                                       /*executor=*/nullptr, pool));
+   PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<paimon::GlobalIndexReader> reader,
+                          index_scan->CreateReader("f0", "full-text",
+                                                   /*row_range_index=*/std::nullopt));
+   PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<paimon::ScoredGlobalIndexResult> result,
+                          reader->VisitFullTextSearch(std::make_shared<paimon::FullTextSearch>(
+                              "f0", R"({"match":{"query":"paimon lake"}})", /*limit=*/10)));
+
+   paimon::ScanContextBuilder scan_builder(table_path);
+   scan_builder.AddOption(paimon::Options::SCAN_MODE, "from-snapshot")
+       .AddOption(paimon::Options::SCAN_SNAPSHOT_ID, std::to_string(snapshot_id))
+       .SetGlobalIndexResult(result);
+
 **Configuration:**
 
 Table options with the ``full-text.`` prefix are passed to the engine with the prefix removed.
