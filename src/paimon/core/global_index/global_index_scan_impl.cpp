@@ -31,24 +31,25 @@
 #include "paimon/common/global_index/union_global_index_reader.h"
 #include "paimon/common/utils/scope_guard.h"
 #include "paimon/core/global_index/global_index_evaluator_impl.h"
+#include "paimon/core/global_index/global_index_live_row_filter.h"
 #include "paimon/core/index/index_file_handler.h"
 #include "paimon/global_index/bitmap_global_index_result.h"
 #include "paimon/global_index/global_indexer.h"
 #include "paimon/global_index/global_indexer_factory.h"
 
 namespace paimon {
-GlobalIndexScanImpl::GlobalIndexScanImpl(const std::shared_ptr<TableSchema>& table_schema,
-                                         const CoreOptions& options,
-                                         const std::shared_ptr<IndexPathFactory>& path_factory,
-                                         IndexMetaMap&& index_metas,
-                                         const std::shared_ptr<Executor>& executor,
-                                         const std::shared_ptr<MemoryPool>& pool)
+GlobalIndexScanImpl::GlobalIndexScanImpl(
+    const std::shared_ptr<TableSchema>& table_schema, const CoreOptions& options,
+    const std::shared_ptr<IndexPathFactory>& path_factory, IndexMetaMap&& index_metas,
+    LiveRowGlobalIndexReader::LiveRowsSupplier live_rows_supplier,
+    const std::shared_ptr<Executor>& executor, const std::shared_ptr<MemoryPool>& pool)
     : pool_(pool),
       table_schema_(table_schema),
       options_(options),
       index_file_manager_(std::make_shared<GlobalIndexFileManager>(
           options.GetFileSystem(), path_factory, /*checkpoint_path_factory=*/nullptr)),
       index_metas_(std::move(index_metas)),
+      live_rows_supplier_(std::move(live_rows_supplier)),
       executor_(executor) {}
 
 Result<std::unique_ptr<GlobalIndexScanImpl>> GlobalIndexScanImpl::Create(
@@ -122,8 +123,18 @@ Result<std::unique_ptr<GlobalIndexScanImpl>> GlobalIndexScanImpl::Create(
         index_metas[index_meta->index_field_id][index_file_meta->IndexType()][range].push_back(
             index_file_meta);
     }
-    return std::unique_ptr<GlobalIndexScanImpl>(new GlobalIndexScanImpl(
-        table_schema, options, path_factory, std::move(index_metas), final_executor, pool));
+    // Full-text searches rank only the rows live in the snapshot the index is read from.
+    LiveRowGlobalIndexReader::LiveRowsSupplier live_rows_supplier;
+    if (options.DeletionVectorsEnabled()) {
+        live_rows_supplier = LiveRowGlobalIndexReader::CacheLiveRows(
+            [root_path, table_schema, snapshot, partitions, options, final_executor, pool]() {
+                return GlobalIndexLiveRowFilter::LiveRows(
+                    root_path, table_schema, snapshot, partitions, options, final_executor, pool);
+            });
+    }
+    return std::unique_ptr<GlobalIndexScanImpl>(
+        new GlobalIndexScanImpl(table_schema, options, path_factory, std::move(index_metas),
+                                std::move(live_rows_supplier), final_executor, pool));
 }
 
 Result<std::shared_ptr<GlobalIndexEvaluator>> GlobalIndexScanImpl::GetOrCreateIndexEvaluator() {
@@ -235,8 +246,15 @@ Result<std::vector<std::shared_ptr<GlobalIndexReader>>> GlobalIndexScanImpl::Cre
         if (union_readers.empty()) {
             continue;
         }
-        readers.push_back(std::make_shared<UnionGlobalIndexReader>(
-            std::move(union_readers), std::move(row_ranges), std::move(search_ranges), executor_));
+        if (live_rows_supplier_) {
+            readers.push_back(LiveRowGlobalIndexReader::CreateUnion(
+                std::move(union_readers), std::move(row_ranges), std::move(search_ranges),
+                executor_, live_rows_supplier_));
+        } else {
+            readers.push_back(std::make_shared<UnionGlobalIndexReader>(
+                std::move(union_readers), std::move(row_ranges), std::move(search_ranges),
+                executor_));
+        }
     }
     return readers;
 }

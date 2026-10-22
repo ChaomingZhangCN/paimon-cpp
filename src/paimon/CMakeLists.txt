@@ -269,9 +269,11 @@ set(PAIMON_CORE_SRCS
     core/deletionvectors/deletion_vectors_index_file.cpp
     core/deletionvectors/deletion_vector_index_file_writer.cpp
     core/global_index/global_index_evaluator_impl.cpp
+    core/global_index/global_index_live_row_filter.cpp
     core/global_index/global_index_scan.cpp
     core/global_index/global_index_scan_impl.cpp
     core/global_index/global_index_write_task.cpp
+    core/global_index/live_row_global_index_reader.cpp
     core/index/index_file_handler.cpp
     core/index/global_index_meta.cpp
     core/index/index_file_meta_serializer.cpp
@@ -865,6 +867,7 @@ if(PAIMON_BUILD_TESTS)
                     core/global_index/global_index_file_manager_test.cpp
                     core/global_index/global_index_evaluator_impl_test.cpp
                     core/global_index/indexed_split_test.cpp
+                    core/global_index/live_row_global_index_reader_test.cpp
                     core/manifest/file_source_test.cpp
                     core/manifest/file_kind_test.cpp
                     core/manifest/manifest_entry_writer_test.cpp
