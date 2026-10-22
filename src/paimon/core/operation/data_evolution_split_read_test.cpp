@@ -751,6 +751,95 @@ TEST_F(DataEvolutionSplitReadTest, TestPlanIndependentlyRolledVectorReadRanges) 
     ASSERT_EQ(vector1->row_count, 4);
 }
 
+TEST_F(DataEvolutionSplitReadTest, TestPlanSequentialVectorRead) {
+    auto main = CreateNormalFile("main.parquet", 100, 10, 0);
+    auto vector0 = CreateDataFileMeta("vector0.vector.vortex", 100, 3, 1);
+    auto vector1 = CreateDataFileMeta("vector1.vector.vortex", 103, 4, 2);
+    auto vector2 = CreateDataFileMeta("vector2.vector.vortex", 107, 3, 3);
+    for (const auto& file : {vector0, vector1, vector2}) {
+        file->write_cols = std::vector<std::string>{"embedding"};
+    }
+    auto field_ids =
+        [main](const std::shared_ptr<DataFileMeta>& file) -> Result<std::vector<int32_t>> {
+        return file == main ? std::vector<int32_t>{0, 2} : std::vector<int32_t>{1};
+    };
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataEvolutionSplitRead::FieldBunch>> bunches,
+                         DataEvolutionSplitRead::TryPlanSequentialVectorRead(
+                             {vector2, main, vector0, vector1}, field_ids));
+    ASSERT_EQ(bunches.size(), 2);
+    ASSERT_EQ(bunches[0]->Files(), std::vector<std::shared_ptr<DataFileMeta>>{main});
+    ASSERT_EQ(bunches[1]->Files(),
+              (std::vector<std::shared_ptr<DataFileMeta>>{vector0, vector1, vector2}));
+    ASSERT_EQ(bunches[0]->RowCount(), 10);
+    ASSERT_EQ(bunches[1]->RowCount(), 10);
+    ASSERT_EQ(vector1->first_row_id, 103);
+    ASSERT_EQ(vector1->row_count, 4);
+}
+
+TEST_F(DataEvolutionSplitReadTest, TestSequentialVectorReadFallsBackForUnsupportedLayouts) {
+    auto main = CreateNormalFile("main.parquet", 100, 10, 0);
+    auto vector0 = CreateDataFileMeta("vector0.vector.vortex", 100, 4, 1);
+    auto vector1 = CreateDataFileMeta("vector1.vector.vortex", 104, 6, 1);
+    vector0->write_cols = vector1->write_cols = std::vector<std::string>{"embedding"};
+    auto field_ids =
+        [main](const std::shared_ptr<DataFileMeta>& file) -> Result<std::vector<int32_t>> {
+        return file == main ? std::vector<int32_t>{0, 2} : std::vector<int32_t>{1};
+    };
+    auto check_fallback = [&](const std::vector<std::shared_ptr<DataFileMeta>>& files) {
+        ASSERT_OK_AND_ASSIGN(
+            std::vector<std::shared_ptr<DataEvolutionSplitRead::FieldBunch>> bunches,
+            DataEvolutionSplitRead::TryPlanSequentialVectorRead(files, field_ids));
+        ASSERT_TRUE(bunches.empty());
+    };
+    check_fallback({vector0, vector1});
+    check_fallback({main, main, vector0, vector1});
+    check_fallback({main, vector0, vector1, CreateBlobFile("payload", 100, 10, 1, {{"payload"}})});
+    check_fallback({main, vector1});
+    vector1->first_row_id = 103;
+    check_fallback({main, vector0, vector1});
+    vector1->first_row_id = 105;
+    check_fallback({main, vector0, vector1});
+    vector1->first_row_id = 104;
+    vector1->row_count = 7;
+    check_fallback({main, vector0, vector1});
+    vector1->row_count = 6;
+    vector1->schema_id = 1;
+    check_fallback({main, vector0, vector1});
+    vector1->schema_id = 0;
+    vector1->file_name = "vector1.vector.parquet";
+    check_fallback({main, vector0, vector1});
+    vector1->file_name = "vector1.vector.vortex";
+    vector1->write_cols = std::vector<std::string>{"another_embedding"};
+    check_fallback({main, vector0, vector1});
+    vector1->write_cols = vector0->write_cols =
+        std::vector<std::string>{"embedding", "another_embedding"};
+    check_fallback({main, vector0, vector1});
+
+    vector1->write_cols = vector0->write_cols = std::vector<std::string>{"embedding"};
+    auto inline_field_ids =
+        [main](const std::shared_ptr<DataFileMeta>& file) -> Result<std::vector<int32_t>> {
+        return file == main ? std::vector<int32_t>{0, 1, 2} : std::vector<int32_t>{1};
+    };
+    ASSERT_OK_AND_ASSIGN(std::vector<std::shared_ptr<DataEvolutionSplitRead::FieldBunch>> bunches,
+                         DataEvolutionSplitRead::TryPlanSequentialVectorRead(
+                             {main, vector0, vector1}, inline_field_ids));
+    ASSERT_TRUE(bunches.empty());
+}
+
+TEST_F(DataEvolutionSplitReadTest, TestSequentialVectorReadPropagatesMetadataErrors) {
+    auto main = CreateNormalFile("main.parquet", 100, 10, 0);
+    auto vector = CreateDataFileMeta("vector.vector.vortex", 100, 10, 1);
+    vector->write_cols = std::vector<std::string>{"embedding"};
+    auto failed_schema = [](const std::shared_ptr<DataFileMeta>&) -> Result<std::vector<int32_t>> {
+        return Status::IOError("schema unavailable");
+    };
+    auto result =
+        DataEvolutionSplitRead::TryPlanSequentialVectorRead({main, vector}, failed_schema);
+    ASSERT_FALSE(result.ok());
+    ASSERT_TRUE(result.status().IsIOError());
+    ASSERT_NE(result.status().ToString().find("schema unavailable"), std::string::npos);
+}
+
 TEST_F(DataEvolutionSplitReadTest, TestPlanVectorReadRangesPreservesOldPrefixAndSuffix) {
     auto main = CreateNormalFile("main.parquet", 0, 10, 0);
     auto old_vector = CreateDataFileMeta("old.vector.vortex", 0, 10, 1);

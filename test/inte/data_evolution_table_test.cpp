@@ -18,6 +18,8 @@
  */
 #include <algorithm>
 #include <iterator>
+#include <mutex>
+#include <set>
 #include <tuple>
 
 #include "arrow/type.h"
@@ -37,6 +39,7 @@
 #include "paimon/defs.h"
 #include "paimon/format/mosaic/mosaic_format_defs.h"
 #include "paimon/fs/file_system.h"
+#include "paimon/fs/local/local_file_system.h"
 #include "paimon/global_index/bitmap_global_index_result.h"
 #include "paimon/global_index/bitmap_scored_global_index_result.h"
 #include "paimon/global_index/indexed_split.h"
@@ -50,6 +53,36 @@
 #include "paimon/testing/utils/test_helper.h"
 #include "paimon/testing/utils/testharness.h"
 namespace paimon::test {
+namespace {
+class CountingLocalFileSystem : public LocalFileSystem {
+ public:
+    explicit CountingLocalFileSystem(const std::string& failed_path = "")
+        : failed_path_(failed_path) {}
+
+    Result<std::unique_ptr<InputStream>> Open(const std::string& path) const override {
+        {
+            std::scoped_lock lock(mutex_);
+            ++open_counts_[path];
+        }
+        if (path == failed_path_) {
+            return Status::IOError("injected open failure: " + path);
+        }
+        return LocalFileSystem::Open(path);
+    }
+
+    int64_t OpenCount(const std::string& path) const {
+        std::scoped_lock lock(mutex_);
+        auto iter = open_counts_.find(path);
+        return iter == open_counts_.end() ? 0 : iter->second;
+    }
+
+ private:
+    mutable std::mutex mutex_;
+    mutable std::map<std::string, int64_t> open_counts_;
+    std::string failed_path_;
+};
+}  // namespace
+
 using DataEvolutionTableParam = std::tuple<std::string, bool, bool>;
 
 // This is a sdk end-to-end test for data evolution
@@ -1938,6 +1971,71 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
     ASSERT_EQ(main_file->row_count, kRowCount);
     ASSERT_GT(vector_files.size(), 1);
 
+    // Count physical opens during a mixed projection, independently of manifest scanning.
+    auto counting_fs = std::make_shared<CountingLocalFileSystem>();
+    ReadContextBuilder counted_builder(table_path);
+    counted_builder.WithFileSystem(counting_fs)
+        .EnablePrefetch(false)
+        .SetReadFieldNames({"id", "embedding", "tag"});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> counted_context, counted_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> counted_read,
+                         TableRead::Create(std::move(counted_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> counted_reader,
+                         counted_read->CreateReader(splits));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> counted_result,
+                         ReadResultCollector::CollectResult(std::move(counted_reader)));
+    ASSERT_NE(counted_result, nullptr);
+    ASSERT_EQ(counted_result->length(), kRowCount);
+    auto counted_fields = counted_result->Flatten().ValueOrDie();
+    ASSERT_EQ(counted_fields.size(), 4);
+    for (int32_t i = 0; i < 3; ++i) {
+        ASSERT_TRUE(counted_fields[i + 1]->Equals(arrow::ChunkedArray(expected->field(i))));
+    }
+    auto counted_split = std::dynamic_pointer_cast<DataSplitImpl>(splits[0]);
+    ASSERT_EQ(counting_fs->OpenCount(
+                  PathUtil::JoinPath(counted_split->BucketPath(), main_file->file_name)),
+              1);
+
+    // Later files stay unopened on early Close, and an open failure stops at that file.
+    const std::string main_path =
+        PathUtil::JoinPath(counted_split->BucketPath(), main_file->file_name);
+    const std::string failed_path = PathUtil::JoinPath(
+        counted_split->BucketPath(), std::next(vector_files.begin())->second->file_name);
+    for (bool fail_next_file : {false, true}) {
+        auto lazy_fs = std::make_shared<CountingLocalFileSystem>(fail_next_file ? failed_path : "");
+        ReadContextBuilder lazy_builder(table_path);
+        lazy_builder.WithFileSystem(lazy_fs).EnablePrefetch(false).SetReadFieldNames(
+            {"id", "embedding", "tag"});
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> lazy_context, lazy_builder.Finish());
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> lazy_read,
+                             TableRead::Create(std::move(lazy_context)));
+        ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> lazy_reader,
+                             lazy_read->CreateReader(splits));
+        lazy_read.reset();
+        ASSERT_EQ(lazy_fs->OpenCount(main_path), 0);
+        for (const auto& [first, file] : vector_files) {
+            ASSERT_EQ(lazy_fs->OpenCount(
+                          PathUtil::JoinPath(counted_split->BucketPath(), file->file_name)),
+                      0);
+        }
+        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch first_batch, lazy_reader->NextBatch());
+        ASSERT_FALSE(BatchReader::IsEofBatch(first_batch));
+        if (fail_next_file) {
+            auto result = ReadResultCollector::CollectResult(std::move(lazy_reader));
+            ASSERT_FALSE(result.ok());
+            ASSERT_TRUE(result.status().IsIOError());
+            ASSERT_NE(result.status().ToString().find(failed_path), std::string::npos);
+        } else {
+            lazy_reader->Close();
+        }
+        ASSERT_EQ(lazy_fs->OpenCount(main_path), 1);
+        for (const auto& [first, file] : vector_files) {
+            std::string path = PathUtil::JoinPath(counted_split->BucketPath(), file->file_name);
+            int64_t expected_opens = first == 0 || (fail_next_file && path == failed_path) ? 1 : 0;
+            ASSERT_EQ(lazy_fs->OpenCount(path), expected_opens);
+        }
+    }
+
     int64_t next_row_id = 0;
     std::vector<Range> selected_ranges = {Range(0, 0)};
     for (const auto& [first_row_id, file] : vector_files) {
@@ -2020,6 +2118,46 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
         ASSERT_TRUE(result->Equals(arrow::ChunkedArray(expected_rows)))
             << "actual=" << result->ToString() << "\nexpected=" << expected_rows->ToString();
     }
+
+    // Reading sequence numbers must retain the newest provider independently in each range.
+    auto sequence_main = std::make_shared<DataFileMeta>(*main_file);
+    sequence_main->AssignSequenceNumber(3, 3);
+    std::vector<std::shared_ptr<DataFileMeta>> sequence_files = {sequence_main};
+    int64_t sequence = 2;
+    for (const auto& [first, file] : vector_files) {
+        auto sequence_vector = std::make_shared<DataFileMeta>(*file);
+        sequence_vector->AssignSequenceNumber(sequence, sequence);
+        sequence_files.push_back(sequence_vector);
+        ++sequence;
+    }
+    DataSplitImpl::Builder sequence_builder(original_split->Partition(), original_split->Bucket(),
+                                            original_split->BucketPath(),
+                                            std::move(sequence_files));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<DataSplitImpl> sequence_split,
+                         sequence_builder.RawConvertible(false).Build());
+    auto tracking = PrepareBulkData(
+        kRowCount,
+        [](int32_t id) { return fmt::format("0, {}, {}", id, std::max(3, 2 + id / 1000)); },
+        {SpecialFields::ValueKind().ArrowField(), SpecialFields::RowId().ArrowField(),
+         SpecialFields::SequenceNumber().ArrowField()});
+    auto sequence_expected =
+        arrow::StructArray::Make({tracking->field(0), expected->field(0), expected->field(1),
+                                  tracking->field(1), tracking->field(2)},
+                                 {"_VALUE_KIND", "id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"})
+            .ValueOrDie();
+    ReadContextBuilder sequence_read_builder(table_path);
+    sequence_read_builder.SetReadFieldNames({"id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"});
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> sequence_context,
+                         sequence_read_builder.Finish());
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> sequence_read,
+                         TableRead::Create(std::move(sequence_context)));
+    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> sequence_reader,
+                         sequence_read->CreateReader(sequence_split));
+    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> sequence_result,
+                         ReadResultCollector::CollectResult(std::move(sequence_reader)));
+    ASSERT_NE(sequence_result, nullptr);
+    ASSERT_TRUE(sequence_result->Equals(arrow::ChunkedArray(sequence_expected)))
+        << sequence_result->ToString();
 }
 
 #endif
@@ -2130,12 +2268,19 @@ TEST_P(DedicatedVectorTableTest, TestIndependentVectorRolling) {
                                  arrow::field("embedding", vector_type),
                                  arrow::field("tag", arrow::utf8())};
     const std::map<std::string, std::string> options = {
-        {Options::FILE_FORMAT, "parquet"},       {Options::VECTOR_FILE_FORMAT, FileFormat()},
-        {Options::FILE_SYSTEM, "local"},         {Options::BUCKET, "-1"},
-        {Options::ROW_TRACKING_ENABLED, "true"}, {Options::DATA_EVOLUTION_ENABLED, "true"},
-        {Options::WRITE_ONLY, "true"},           {Options::TARGET_FILE_SIZE, "128 mb"},
-        {Options::TARGET_FILE_ROW_NUM, "2500"},  {Options::VECTOR_TARGET_FILE_SIZE, "1 b"},
-        {Options::WRITE_BATCH_SIZE, "100"},      {Options::READ_BATCH_SIZE, "127"}};
+        {Options::FILE_FORMAT, "parquet"},
+        {Options::VECTOR_FILE_FORMAT, FileFormat()},
+        {Options::FILE_SYSTEM, "local"},
+        {Options::BUCKET, "-1"},
+        {Options::ROW_TRACKING_ENABLED, "true"},
+        {Options::DATA_EVOLUTION_ENABLED, "true"},
+        {Options::WRITE_ONLY, "true"},
+        {Options::TARGET_FILE_SIZE, "128 mb"},
+        {Options::TARGET_FILE_ROW_NUM, "2500"},
+        {Options::VECTOR_TARGET_FILE_SIZE, "1 b"},
+        {Options::WRITE_BATCH_SIZE, "100"},
+        {Options::READ_BATCH_SIZE, "127"},
+        {Options::DELETION_VECTORS_ENABLED, "true"}};
     CreateTable(fields, /*partition_keys=*/{}, options);
     const std::string table_path = PathUtil::JoinPath(dir_->Str(), "foo.db/bar");
     auto input = PrepareBulkData(
@@ -2225,6 +2370,48 @@ TEST_P(DedicatedVectorTableTest, TestIndependentVectorRolling) {
             input->Slice(range.from, range.to - range.from + 1));
         ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, expected,
                               /*predicate=*/nullptr, /*row_ranges=*/{range}));
+    }
+
+    // Delete across main/VECTOR boundaries, including a whole VECTOR file and the last row.
+    std::set<int64_t> deleted_ids = {0, 999, 1000, 2499, 2500, 2999, 3000, 4999, 6000};
+    if (FileFormat() != "lance") {
+        const auto& deleted_file = std::next(vector_files.begin())->second;
+        for (int64_t i = 0; i < deleted_file->row_count; ++i) {
+            deleted_ids.insert(deleted_file->first_row_id.value() + i);
+        }
+    }
+    std::map<std::string, std::vector<int64_t>> deleted_positions;
+    for (const auto& [first, file] : main_files) {
+        for (int64_t id : deleted_ids) {
+            if (id >= first && id < first + file->row_count) {
+                deleted_positions[file->file_name].push_back(id - first);
+            }
+        }
+    }
+    ASSERT_OK(CommitDeletionVectors(table_path, messages[0], deleted_positions));
+    for (const std::vector<Range>& selection :
+         {std::vector<Range>{Range(0, 6000)},
+          std::vector<Range>{Range(998, 1002), Range(2498, 2502), Range(5998, 6000)}}) {
+        arrow::ArrayVector surviving_rows;
+        for (const auto& range : selection) {
+            int64_t next = range.from;
+            for (int64_t id : deleted_ids) {
+                if (id < next || id > range.to) {
+                    continue;
+                }
+                if (next < id) {
+                    surviving_rows.push_back(input->Slice(next, id - next));
+                }
+                next = id + 1;
+            }
+            if (next <= range.to) {
+                surviving_rows.push_back(input->Slice(next, range.to - next + 1));
+            }
+        }
+        auto expected = checked_pointer_cast<arrow::StructArray>(
+            arrow::Concatenate(surviving_rows).ValueOrDie());
+        ASSERT_OK(ScanAndRead(table_path, {"id", "embedding", "tag"}, expected,
+                              /*predicate=*/nullptr, selection));
     }
 
     ASSERT_OK_AND_ASSIGN(messages, WriteArray(table_path, {}, input->Slice(0, 2)));
