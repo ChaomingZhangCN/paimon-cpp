@@ -478,6 +478,9 @@ struct PAIMON_EXPORT Options {
     /// manifest. Default value is 500B.
     static const char FILE_INDEX_IN_MANIFEST_THRESHOLD[];
 
+    /// "file-index.format.version" - File index container write version, 1 or 2. Defaults to 1.
+    static const char FILE_INDEX_FORMAT_VERSION[];
+
     /// "data-file.external-paths" - The external paths where the data of this table will be
     /// written, multiple elements separated by commas.
     static const char DATA_FILE_EXTERNAL_PATHS[];
@@ -577,12 +580,6 @@ struct PAIMON_EXPORT Options {
     /// tables at read time. Set to false to preserve serialized BlobViewStruct bytes when
     /// forwarding blob view values to another blob-view table. Default value is "true".
     static const char BLOB_VIEW_RESOLVE_ENABLED[];
-    /// "blob-view-upstream-warehouse" - Warehouse root the upstream table a blob-view field points
-    /// at is resolved from. Since the catalog capabilities are partially missing, cpp paimon cannot
-    /// always obtain it automatically, so it may be configured explicitly. When it is not set, the
-    /// read falls back to the warehouse the downstream table itself lives in, which resolves a
-    /// co-located upstream table. No default value.
-    static const char BLOB_VIEW_UPSTREAM_WAREHOUSE[];
     /// "blob-write-null-on-missing-file" - Whether to write NULL for a descriptor BLOB value,
     /// including an ARRAY<BLOB> element or a MAP<..., BLOB> value, when the referenced file does
     /// not exist at write time.

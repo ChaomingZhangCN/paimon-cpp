@@ -226,6 +226,7 @@ class PAIMON_EXPORT CoreOptions {
     bool PrepareCommitWaitCompaction() const;
     bool FileIndexReadEnabled() const;
     int64_t FileIndexInManifestThreshold() const;
+    int32_t FileIndexFormatVersion() const;
 
     std::map<std::string, std::string> GetFieldsSequenceGroups() const;
     bool PartialUpdateRemoveRecordOnDelete() const;
@@ -304,7 +305,6 @@ class PAIMON_EXPORT CoreOptions {
     const std::vector<std::string>& GetBlobFields() const;
     const std::vector<std::string>& GetBlobDescriptorFields() const;
     const std::vector<std::string>& GetBlobViewFields() const;
-    std::optional<std::string> GetBlobViewUpstreamWarehouse() const;
     bool BlobViewResolveEnabled() const;
     std::vector<std::string> GetBlobInlineFields() const;
 
