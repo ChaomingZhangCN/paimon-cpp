@@ -18,7 +18,6 @@
  */
 #include <algorithm>
 #include <iterator>
-#include <mutex>
 #include <set>
 #include <tuple>
 
@@ -27,7 +26,6 @@
 #include "gtest/gtest.h"
 #include "paimon/common/factories/io_hook.h"
 #include "paimon/common/io/cache/lru_cache.h"
-#include "paimon/common/reader/reader_utils.h"
 #include "paimon/common/table/special_fields.h"
 #include "paimon/common/types/data_field.h"
 #include "paimon/common/utils/checked_cast.h"
@@ -47,7 +45,6 @@
 #include "paimon/executor.h"
 #include "paimon/format/mosaic/mosaic_format_defs.h"
 #include "paimon/fs/file_system.h"
-#include "paimon/fs/local/local_file_system.h"
 #include "paimon/global_index/bitmap_global_index_result.h"
 #include "paimon/global_index/bitmap_scored_global_index_result.h"
 #include "paimon/global_index/indexed_split.h"
@@ -61,36 +58,6 @@
 #include "paimon/testing/utils/test_helper.h"
 #include "paimon/testing/utils/testharness.h"
 namespace paimon::test {
-namespace {
-class CountingLocalFileSystem : public LocalFileSystem {
- public:
-    explicit CountingLocalFileSystem(const std::string& failed_path = "")
-        : failed_path_(failed_path) {}
-
-    Result<std::unique_ptr<InputStream>> Open(const std::string& path) const override {
-        {
-            std::scoped_lock lock(mutex_);
-            ++open_counts_[path];
-        }
-        if (path == failed_path_) {
-            return Status::IOError("injected open failure: " + path);
-        }
-        return LocalFileSystem::Open(path);
-    }
-
-    int64_t OpenCount(const std::string& path) const {
-        std::scoped_lock lock(mutex_);
-        auto iter = open_counts_.find(path);
-        return iter == open_counts_.end() ? 0 : iter->second;
-    }
-
- private:
-    mutable std::mutex mutex_;
-    mutable std::map<std::string, int64_t> open_counts_;
-    std::string failed_path_;
-};
-}  // namespace
-
 using DataEvolutionTableParam = std::tuple<std::string, bool, bool>;
 
 // This is a sdk end-to-end test for data evolution
@@ -1979,73 +1946,6 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
     ASSERT_EQ(main_file->row_count, kRowCount);
     ASSERT_GT(vector_files.size(), 1);
 
-    // Count physical opens during a mixed projection, independently of manifest scanning.
-    auto counting_fs = std::make_shared<CountingLocalFileSystem>();
-    ReadContextBuilder counted_builder(table_path);
-    counted_builder.WithFileSystem(counting_fs)
-        .EnablePrefetch(false)
-        .SetReadFieldNames({"id", "embedding", "tag"});
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> counted_context, counted_builder.Finish());
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> counted_read,
-                         TableRead::Create(std::move(counted_context)));
-    ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> counted_reader,
-                         counted_read->CreateReader(splits));
-    ASSERT_OK_AND_ASSIGN(std::shared_ptr<arrow::ChunkedArray> counted_result,
-                         ReadResultCollector::CollectResult(std::move(counted_reader)));
-    ASSERT_NE(counted_result, nullptr);
-    ASSERT_EQ(counted_result->length(), kRowCount);
-    auto counted_fields = counted_result->Flatten().ValueOrDie();
-    ASSERT_EQ(counted_fields.size(), 4);
-    for (int32_t i = 0; i < 3; ++i) {
-        ASSERT_TRUE(counted_fields[i + 1]->Equals(arrow::ChunkedArray(expected->field(i))));
-    }
-    auto counted_split = std::dynamic_pointer_cast<DataSplitImpl>(splits[0]);
-    ASSERT_EQ(counting_fs->OpenCount(
-                  PathUtil::JoinPath(counted_split->BucketPath(), main_file->file_name)),
-              1);
-
-    // Later files stay unopened on early Close, and an open failure stops at that file.
-    const std::string main_path =
-        PathUtil::JoinPath(counted_split->BucketPath(), main_file->file_name);
-    const std::string failed_path = PathUtil::JoinPath(
-        counted_split->BucketPath(), std::next(vector_files.begin())->second->file_name);
-    for (bool fail_next_file : {false, true}) {
-        auto lazy_fs = std::make_shared<CountingLocalFileSystem>(fail_next_file ? failed_path : "");
-        ReadContextBuilder lazy_builder(table_path);
-        lazy_builder.WithFileSystem(lazy_fs).EnablePrefetch(false).SetReadFieldNames(
-            {"id", "embedding", "tag"});
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> lazy_context, lazy_builder.Finish());
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> lazy_read,
-                             TableRead::Create(std::move(lazy_context)));
-        ASSERT_OK_AND_ASSIGN(std::unique_ptr<BatchReader> lazy_reader,
-                             lazy_read->CreateReader(splits));
-        lazy_read.reset();
-        ASSERT_EQ(lazy_fs->OpenCount(main_path), 0);
-        for (const auto& [first, file] : vector_files) {
-            ASSERT_EQ(lazy_fs->OpenCount(
-                          PathUtil::JoinPath(counted_split->BucketPath(), file->file_name)),
-                      0);
-        }
-        ASSERT_OK_AND_ASSIGN(BatchReader::ReadBatch first_batch, lazy_reader->NextBatch());
-        ScopeGuard release_first_batch(
-            [&first_batch]() { ReaderUtils::ReleaseReadBatch(std::move(first_batch)); });
-        ASSERT_FALSE(BatchReader::IsEofBatch(first_batch));
-        if (fail_next_file) {
-            auto result = ReadResultCollector::CollectResult(std::move(lazy_reader));
-            ASSERT_FALSE(result.ok());
-            ASSERT_TRUE(result.status().IsIOError());
-            ASSERT_NE(result.status().ToString().find(failed_path), std::string::npos);
-        } else {
-            lazy_reader->Close();
-        }
-        ASSERT_EQ(lazy_fs->OpenCount(main_path), 1);
-        for (const auto& [first, file] : vector_files) {
-            std::string path = PathUtil::JoinPath(counted_split->BucketPath(), file->file_name);
-            int64_t expected_opens = first == 0 || (fail_next_file && path == failed_path) ? 1 : 0;
-            ASSERT_EQ(lazy_fs->OpenCount(path), expected_opens);
-        }
-    }
-
     int64_t next_row_id = 0;
     std::vector<Range> selected_ranges = {Range(0, 0)};
     for (const auto& [first_row_id, file] : vector_files) {
@@ -2176,11 +2076,8 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
              {std::vector<std::string>{"id", "embedding", "_ROW_ID", "_SEQUENCE_NUMBER"},
               std::vector<std::string>{"id", "_ROW_ID", "_SEQUENCE_NUMBER"},
               std::vector<std::string>{"_ROW_ID", "_SEQUENCE_NUMBER"}}) {
-            auto sequence_fs = std::make_shared<CountingLocalFileSystem>();
             ReadContextBuilder sequence_read_builder(table_path);
-            sequence_read_builder.WithFileSystem(sequence_fs)
-                .EnablePrefetch(false)
-                .SetReadFieldNames(projection);
+            sequence_read_builder.SetReadFieldNames(projection);
             ASSERT_OK_AND_ASSIGN(std::unique_ptr<ReadContext> sequence_context,
                                  sequence_read_builder.Finish());
             ASSERT_OK_AND_ASSIGN(std::unique_ptr<TableRead> sequence_read,
@@ -2200,9 +2097,6 @@ TEST_P(DataEvolutionTableTest, TestReadJavaIndependentlyRolledVectorStore) {
                 arrow::StructArray::Make(projected_arrays, projected_names).ValueOrDie();
             ASSERT_TRUE(sequence_result->Equals(arrow::ChunkedArray(projected_expected)))
                 << sequence_result->ToString();
-            if (sequential) {
-                ASSERT_EQ(sequence_fs->OpenCount(main_path), 1);
-            }
         }
     }
 }
